@@ -19,6 +19,29 @@ pub struct AppSettings {
     pub language: Option<String>,
     pub auto_copy: bool,
     pub always_on_top: bool,
+    pub engine_mode: String,
+    pub local_engine: String,
+    pub local_model_size: String,
+    pub models_folder: String,
+    pub model_idle_timeout_mins: u32,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            api_base_url: "https://api.openai.com/v1".into(),
+            api_key: String::new(),
+            model: "whisper-1".into(),
+            language: None,
+            auto_copy: true,
+            always_on_top: true,
+            engine_mode: "cloud".into(),
+            local_engine: "whisper_cpu".into(),
+            local_model_size: "base".into(),
+            models_folder: String::new(),
+            model_idle_timeout_mins: 10,
+        }
+    }
 }
 
 pub struct Database {
@@ -129,6 +152,11 @@ impl Database {
             language: get_val("language").filter(|s| !s.is_empty()),
             auto_copy: get_val("auto_copy").map(|v| v != "false" && v != "0").unwrap_or(true),
             always_on_top: get_val("always_on_top").map(|v| v != "false" && v != "0").unwrap_or(true),
+            engine_mode: get_val("engine_mode").unwrap_or_else(|| "cloud".into()),
+            local_engine: get_val("local_engine").unwrap_or_else(|| "whisper_cpu".into()),
+            local_model_size: get_val("local_model_size").unwrap_or_else(|| "base".into()),
+            models_folder: get_val("models_folder").unwrap_or_default(),
+            model_idle_timeout_mins: get_val("model_idle_timeout_mins").and_then(|v| v.parse().ok()).unwrap_or(10),
         })
     }
 
@@ -148,6 +176,11 @@ impl Database {
         set_val("language", settings.language.as_deref().unwrap_or("")).map_err(|e| e.to_string())?;
         set_val("auto_copy", if settings.auto_copy { "true" } else { "false" }).map_err(|e| e.to_string())?;
         set_val("always_on_top", if settings.always_on_top { "true" } else { "false" }).map_err(|e| e.to_string())?;
+        set_val("engine_mode", &settings.engine_mode).map_err(|e| e.to_string())?;
+        set_val("local_engine", &settings.local_engine).map_err(|e| e.to_string())?;
+        set_val("local_model_size", &settings.local_model_size).map_err(|e| e.to_string())?;
+        set_val("models_folder", &settings.models_folder).map_err(|e| e.to_string())?;
+        set_val("model_idle_timeout_mins", &settings.model_idle_timeout_mins.to_string()).map_err(|e| e.to_string())?;
         Ok(())
     }
 }
@@ -181,6 +214,11 @@ mod tests {
         assert_eq!(default_settings.api_base_url, "https://api.openai.com/v1");
         assert_eq!(default_settings.auto_copy, true);
         assert_eq!(default_settings.always_on_top, true);
+        assert_eq!(default_settings.engine_mode, "cloud");
+        assert_eq!(default_settings.local_engine, "whisper_cpu");
+        assert_eq!(default_settings.local_model_size, "base");
+        assert_eq!(default_settings.models_folder, "");
+        assert_eq!(default_settings.model_idle_timeout_mins, 10);
 
         let new_settings = AppSettings {
             api_base_url: "https://api.groq.com/openai/v1".into(),
@@ -189,6 +227,11 @@ mod tests {
             language: Some("en".into()),
             auto_copy: false,
             always_on_top: false,
+            engine_mode: "local".into(),
+            local_engine: "whisper_vulkan".into(),
+            local_model_size: "tiny".into(),
+            models_folder: "/external/models".into(),
+            model_idle_timeout_mins: 5,
         };
         db.save_settings(&new_settings).unwrap();
         let loaded = db.get_settings().unwrap();
@@ -198,6 +241,43 @@ mod tests {
         assert_eq!(loaded.language, Some("en".into()));
         assert_eq!(loaded.auto_copy, false);
         assert_eq!(loaded.always_on_top, false);
+        assert_eq!(loaded.engine_mode, "local");
+        assert_eq!(loaded.local_engine, "whisper_vulkan");
+        assert_eq!(loaded.local_model_size, "tiny");
+        assert_eq!(loaded.models_folder, "/external/models");
+        assert_eq!(loaded.model_idle_timeout_mins, 5);
+    }
+
+    #[test]
+    fn test_db_file_persistence() {
+        let temp_file = std::env::temp_dir().join(format!("lipi_test_persist_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&temp_file);
+
+        {
+            let db = Database::new(&temp_file).unwrap();
+            let mut s = db.get_settings().unwrap();
+            s.engine_mode = "local".into();
+            s.local_engine = "faster_whisper".into();
+            s.local_model_size = "small".into();
+            s.models_folder = "/media/drive/models".into();
+            s.model_idle_timeout_mins = 30;
+            s.api_key = "saved_secret".into();
+            db.save_settings(&s).unwrap();
+        }
+
+        // Reopen database from same file path
+        {
+            let db = Database::new(&temp_file).unwrap();
+            let loaded = db.get_settings().unwrap();
+            assert_eq!(loaded.engine_mode, "local");
+            assert_eq!(loaded.local_engine, "faster_whisper");
+            assert_eq!(loaded.local_model_size, "small");
+            assert_eq!(loaded.models_folder, "/media/drive/models");
+            assert_eq!(loaded.model_idle_timeout_mins, 30);
+            assert_eq!(loaded.api_key, "saved_secret");
+        }
+
+        let _ = std::fs::remove_file(&temp_file);
     }
 }
 
