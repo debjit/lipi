@@ -19,18 +19,19 @@ Lipi is a lightweight, local-first desktop speech-to-text and voice note applica
   - Keeps local models warm in RAM between dictations to prevent latency and eliminate repetitive disk read wear on consumer drives.
   - Configurable idle inactivity auto-unload timeout (2m, 5m, 10m, 30m, or Never) to free system memory when idle.
   - Manual "Release RAM Now" controls and live RAM status tracking.
-- 🪟 **Mini Floating Mode**:
+- 🪟 **Mini Floating Mode & Window State Persistence**:
   - Shrink Lipi into an unobtrusive, always-on-top floating pill widget for seamless dictation while multitasking (`Alt + M`).
-- ⌨️ **Global Keyboard Shortcut**:
-  - Press `Alt + R` anywhere in the app to toggle recording immediately.
-- 📝 **Local Notes Management**:
-  - All transcribed notes are stored locally in an embedded SQLite database (`lipi.db`). Search, edit, and copy anytime.
-- 📋 **Auto-Copy to Clipboard**:
-  - Instantly copies completed transcripts to your system clipboard ready to paste into any editor or workflow.
-- 📋 **Activity & Diagnostic Logs**:
-  - Built-in logging card with error inspect, expandable server traces, and one-click diagnostic report copying.
-- 🤖 **Future LLM Pipeline (Coming Soon)**:
-  - Dedicated architecture for chaining ASR transcripts into LLMs for punctuation cleanup, bullet summaries, action-item extraction, and translation.
+  - Automatically remembers and restores window coordinates `(x, y)`, dimensions, and maximized state across app sessions and mode transitions.
+- 📜 **Smart History Sidebar**:
+  - Distraction-free editing: History is hidden by default in compact/windowed mode and opens by default in full screen.
+  - Window resizing never interrupts workflow or auto-hides/shows the sidebar—toggle visibility anytime via the `☰` button.
+- ⏱️ **Extended & Custom Request Timeouts**:
+  - Robust 3-minute (180s) minimum timeout prevents premature connection drops during long audio processing.
+  - Configurable custom timeout in Settings (with 3m, 5m, 10m quick pills) applied across both ASR transcription and LLM transformations.
+- 🤖 **LLM Post-Processing & Voice Presets**:
+  - Automatic speech transformation, grammar rectification, summarization, and translation via OpenAI-compatible endpoints (Cloudflare Workers AI, Groq, OpenAI, Ollama, vLLM).
+  - Open Markdown-based presets (`presets/*.md`) with frontmatter metadata and live editing.
+  - Optional auto-mode: transcribes, transforms with LLM, and copies to clipboard in a single stroke.
 
 ---
 
@@ -109,9 +110,20 @@ Lipi provides a modular full-page Settings dashboard organized into four tabs:
 - **RAM Supervisor**:
   - Configure idle unload timeout (2 min, 5 min, 10 min default, 30 min, or Never).
   - Live RAM usage monitor and manual unload button.
+- **Request Timeout**:
+  - Unified timeout control with 3m (180s default/minimum), 5m, and 10m quick selectors or custom seconds input.
 
-### 2. 🤖 LLM (Coming Soon)
-- Preview for upcoming AI post-processing features: grammar and punctuation polish, action items & bullet summaries, multilingual translation, and local/cloud LLM connectivity (Ollama, Groq, OpenAI).
+### 2. 🤖 LLM (Post-Processing & Rectification)
+- **Configured Providers**:
+  - Add and manage multiple AI endpoints: **Cloudflare Workers AI**, **Groq Cloud**, **OpenAI**, and **Custom / Local** (Ollama, vLLM, Speaches).
+  - Live model directory lookup via `/models` endpoints with curated fallbacks.
+- **Voice Presets & Markdown Prompt Engine**:
+  - Switch transformation instructions on the fly: Grammar Fix, Professional Tone, Casual, Concise Summary, Bullet Points, or custom.
+  - Presets are stored as open `.md` files with YAML frontmatter in `presets/`—editable via your favorite text editor.
+- **Auto-Transform Mode**:
+  - Immediately post-process transcribed speech with your active LLM preset when recording stops.
+- **Request Timeout**:
+  - Shared timeout limit ensuring LLMs have adequate time for large generation tasks.
 
 ### 3. ⚙ Preferences
 - **Language Code**: Optional ISO-639-1 code (e.g., `en`, `bn`, `es`, `hi`) or empty for auto-detection.
@@ -129,19 +141,22 @@ Lipi provides a modular full-page Settings dashboard organized into four tabs:
 ```
 lipi/
 ├── src/                      # React frontend (Vite + TypeScript)
-│   ├── App.tsx               # Main UI, settings tabs, shortcut handling, logs
-│   ├── App.css               # Styling, themes, mini wizard, settings tabs
+│   ├── App.tsx               # Main UI, dual editor, settings tabs, shortcuts
+│   ├── App.css               # Responsive styling, mini wizard, settings themes
 │   └── main.tsx              # React root entry
 ├── src-tauri/                # Tauri Rust application
 │   ├── src/
-│   │   ├── audio.rs          # CPAL audio recording & resampling
-│   │   ├── db.rs             # SQLite storage for notes & settings
-│   │   ├── engine.rs         # Local Whisper execution & RAM supervisor
-│   │   ├── models.rs         # Model weights download & runner management
-│   │   ├── transcribe.rs     # Remote API client (Groq, Cloudflare, OpenAI)
-│   │   ├── lib.rs            # Tauri commands & AppState
+│   │   ├── audio.rs          # CPAL audio recording & linear resampling
+│   │   ├── db.rs             # SQLite storage (notes, app settings, window state)
+│   │   ├── engine.rs         # Local Whisper runner & RAM supervisor
+│   │   ├── env_config.rs     # Multi-provider LLM configuration & .env sync
+│   │   ├── llm.rs            # LLM API client & chat completions
+│   │   ├── models.rs         # Hugging Face download & binary setup
+│   │   ├── presets.rs        # Markdown voice preset manager
+│   │   ├── transcribe.rs     # Cloud ASR client (Groq, Cloudflare, OpenAI)
+│   │   ├── lib.rs            # Tauri commands, lifecycle events, window state
 │   │   └── main.rs           # Application entry
-│   ├── Cargo.toml            # Rust dependencies & metadata
+│   ├── Cargo.toml            # Rust dependencies & optimization profiles
 │   └── tauri.conf.json       # Tauri configuration & window settings
 ├── package.json              # Frontend dependencies & scripts
 └── README.md

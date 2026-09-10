@@ -68,6 +68,7 @@ pub async fn transcribe_audio(
     api_key: &str,
     model: &str,
     language: Option<&str>,
+    timeout_secs: u64,
 ) -> Result<String, String> {
     let trimmed_base = base_url.trim();
     if trimmed_base.is_empty() {
@@ -79,6 +80,7 @@ pub async fn transcribe_audio(
     }
 
     let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs.max(180)))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
