@@ -23,6 +23,34 @@ interface AppSettings {
   local_model_size: "tiny" | "base" | "small";
   models_folder?: string;
   model_idle_timeout_mins?: number;
+  request_timeout_secs?: number;
+}
+
+interface LlmProvider {
+  id: string;
+  name: string;
+  provider_type: "cloudflare" | "groq" | "openai" | "custom";
+  api_key: string;
+  account_id: string;
+  base_url: string;
+}
+
+interface PromptPreset {
+  id: string;
+  label: string;
+  prompt: string;
+}
+
+interface LlmSettings {
+  enabled: boolean;
+  active_provider_id: string;
+  model: string;
+  voice_preset: string;
+  custom_prompt: string;
+  auto_mode: boolean;
+  providers: LlmProvider[];
+  presets: PromptPreset[];
+  request_timeout_secs?: number;
 }
 
 interface ModelStatus {
@@ -168,6 +196,15 @@ function getActivePreset(url: string): ProviderPreset {
   return PROVIDER_PRESETS[4];
 }
 
+function isFullScreenMode(): boolean {
+  if (typeof window === "undefined" || !window.screen) return false;
+  if (window.screen.availWidth < 1200) return false;
+  return (
+    window.innerWidth >= window.screen.availWidth - 40 &&
+    window.innerHeight >= window.screen.availHeight - 80
+  );
+}
+
 export default function App() {
   const [notes, setNotes] = useState<Note[]>([]);
   const [activeNoteId, setActiveNoteId] = useState<number | null>(null);
@@ -178,7 +215,7 @@ export default function App() {
   const [copiedNotification, setCopiedNotification] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(() => isFullScreenMode());
   const [activeView, setActiveView] = useState<"notes" | "settings">("notes");
   const [miniMode, setMiniMode] = useState(false);
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
@@ -201,9 +238,95 @@ export default function App() {
     local_model_size: "base",
     models_folder: "",
     model_idle_timeout_mins: 10,
+    request_timeout_secs: 180,
   });
 
   const activePreset = getActivePreset(settings.api_base_url);
+
+  const DEFAULT_PRESETS: PromptPreset[] = [
+    {
+      id: "grammar_fix",
+      label: "✍️ Fix Grammar & Typos",
+      prompt:
+        "You are an expert copyeditor. Fix all grammatical mistakes, spelling errors, punctuation mistakes, and typos in the transcribed speech text. Strictly preserve the original tone, vocabulary, and meaning. Do not add any conversational remarks, explanations, or quotes. Output ONLY the corrected text.",
+    },
+    {
+      id: "professional",
+      label: "💼 Professional Tone",
+      prompt:
+        "You are an executive communications editor. Rewrite the transcribed speech text into clear, polished, professional business language while preserving all original facts and substance. Do not add commentary, pleasantries, or introductory remarks. Output ONLY the rewritten text.",
+    },
+    {
+      id: "casual",
+      label: "☕ Casual & Friendly",
+      prompt:
+        "Rewrite the transcribed speech text into a friendly, relaxed, conversational tone. Smooth out awkward spoken hesitations while keeping the speaker's personality. Do not add commentary or pleasantries. Output ONLY the rewritten text.",
+    },
+    {
+      id: "concise",
+      label: "⚡ Concise Summary",
+      prompt:
+        "Condense the transcribed speech text into a punchy, high-impact summary. Eliminate filler words, redundancies, and rambling. Do not add commentary. Output ONLY the concise text.",
+    },
+    {
+      id: "bullets",
+      label: "📌 Bullet Points",
+      prompt:
+        "Extract the core points, key details, and action items from the transcribed speech text into a structured Markdown bullet list. Do not add commentary. Output ONLY the bullet points.",
+    },
+  ];
+
+  const [llmSettings, setLlmSettings] = useState<LlmSettings>({
+    enabled: false,
+    active_provider_id: "CLOUDFLARE_DEFAULT",
+    model: "@cf/meta/llama-3.1-8b-instruct",
+    voice_preset: "grammar_fix",
+    custom_prompt: "",
+    auto_mode: false,
+    providers: [
+      {
+        id: "CLOUDFLARE_DEFAULT",
+        name: "Cloudflare Workers AI",
+        provider_type: "cloudflare",
+        api_key: "",
+        account_id: "",
+        base_url: "",
+      },
+      {
+        id: "GROQ_DEFAULT",
+        name: "Groq Cloud",
+        provider_type: "groq",
+        api_key: "",
+        account_id: "",
+        base_url: "https://api.groq.com/openai/v1",
+      },
+    ],
+    presets: DEFAULT_PRESETS,
+    request_timeout_secs: 180,
+  });
+  const llmSettingsRef = useRef(llmSettings);
+  llmSettingsRef.current = llmSettings;
+
+  const [editingPresetId, setEditingPresetId] = useState<string | null>(null);
+  const [isAddingPreset, setIsAddingPreset] = useState<boolean>(false);
+  const [presetForm, setPresetForm] = useState<{ id: string; label: string; prompt: string }>({
+    id: "",
+    label: "",
+    prompt: "",
+  });
+
+  const [rawTranscript, setRawTranscript] = useState("");
+  const rawTranscriptRef = useRef(rawTranscript);
+  rawTranscriptRef.current = rawTranscript;
+
+  const [llmResult, setLlmResult] = useState("");
+  const [isTransforming, setIsTransforming] = useState(false);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [showAdvancedUrl, setShowAdvancedUrl] = useState(false);
+  const [editingProviderId, setEditingProviderId] = useState<string>("CLOUDFLARE_DEFAULT");
+  const [navOverflowOpen, setNavOverflowOpen] = useState(false);
+  const navOverflowRef = useRef<HTMLDivElement>(null);
 
   const [logs, setLogs] = useState<LogEntry[]>(() => {
     try {
@@ -279,6 +402,7 @@ export default function App() {
   useEffect(() => {
     loadNotes();
     loadSettings();
+    loadLlmSettings();
   }, []);
 
   useEffect(() => {
@@ -457,6 +581,24 @@ export default function App() {
     return () => clearInterval(interval);
   }, [activeView]);
 
+  // Click outside to close nav overflow dropdown
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (
+        navOverflowRef.current &&
+        !navOverflowRef.current.contains(e.target as Node)
+      ) {
+        setNavOverflowOpen(false);
+      }
+    }
+    if (navOverflowOpen) {
+      document.addEventListener("mousedown", handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [navOverflowOpen]);
+
   async function loadNotes() {
     try {
       const list: Note[] = await invoke("get_notes");
@@ -507,6 +649,269 @@ export default function App() {
     }
   }
 
+  async function loadLlmSettings() {
+    try {
+      const cfg: LlmSettings = await invoke("get_llm_config");
+      const normalized: LlmSettings = {
+        ...cfg,
+        presets: cfg.presets && cfg.presets.length > 0 ? cfg.presets : DEFAULT_PRESETS,
+      };
+      setLlmSettings(normalized);
+      llmSettingsRef.current = normalized;
+      if (cfg.active_provider_id) {
+        setEditingProviderId(cfg.active_provider_id);
+      }
+    } catch (e) {
+      console.error("Failed loading LLM config:", e);
+    }
+  }
+
+  async function updateAndSaveLlmSettings(patch: Partial<LlmSettings>) {
+    const next: LlmSettings = { ...llmSettingsRef.current, ...patch };
+    setLlmSettings(next);
+    llmSettingsRef.current = next;
+    try {
+      await invoke("save_llm_config", { config: next });
+    } catch (e) {
+      console.error("Failed saving LLM config:", e);
+      setErrorMsg(String(e));
+    }
+  }
+
+  function handleStartAddPreset() {
+    setEditingPresetId(null);
+    setIsAddingPreset(true);
+    setPresetForm({ id: "", label: "", prompt: "" });
+  }
+
+  function handleStartEditPreset(p: PromptPreset) {
+    setIsAddingPreset(false);
+    setEditingPresetId(p.id);
+    setPresetForm({ id: p.id, label: p.label, prompt: p.prompt });
+  }
+
+  function handleCancelPresetForm() {
+    setIsAddingPreset(false);
+    setEditingPresetId(null);
+    setPresetForm({ id: "", label: "", prompt: "" });
+  }
+
+  async function handleSavePresetForm() {
+    const label = presetForm.label.trim();
+    const prompt = presetForm.prompt.trim();
+    if (!label) {
+      setErrorMsg("Preset name cannot be empty.");
+      return;
+    }
+    if (!prompt) {
+      setErrorMsg("Preset instruction prompt cannot be empty.");
+      return;
+    }
+
+    const currentPresets =
+      llmSettingsRef.current.presets && llmSettingsRef.current.presets.length > 0
+        ? llmSettingsRef.current.presets
+        : DEFAULT_PRESETS;
+
+    if (isAddingPreset) {
+      let id = presetForm.id.trim() || label.toLowerCase().replace(/[^a-z0-9]/g, "_");
+      id = id.replace(/^_+|_+$/g, "") || `preset_${Date.now()}`;
+      if (currentPresets.some((p) => p.id === id)) {
+        id = `${id}_${Date.now().toString().slice(-4)}`;
+      }
+      const newPreset: PromptPreset = { id, label, prompt };
+      const updated = [...currentPresets, newPreset];
+      await updateAndSaveLlmSettings({ presets: updated, voice_preset: newPreset.id });
+    } else if (editingPresetId) {
+      const updated = currentPresets.map((p) =>
+        p.id === editingPresetId ? { ...p, label, prompt } : p
+      );
+      await updateAndSaveLlmSettings({ presets: updated });
+    }
+    handleCancelPresetForm();
+  }
+
+  async function handleDeletePreset(idToDelete: string) {
+    const currentPresets =
+      llmSettingsRef.current.presets && llmSettingsRef.current.presets.length > 0
+        ? llmSettingsRef.current.presets
+        : DEFAULT_PRESETS;
+
+    if (currentPresets.length <= 1) {
+      setErrorMsg("You must keep at least one preset.");
+      return;
+    }
+    const updated = currentPresets.filter((p) => p.id !== idToDelete);
+    let newVoicePreset = llmSettingsRef.current.voice_preset;
+    if (newVoicePreset === idToDelete) {
+      newVoicePreset = updated[0]?.id || "custom";
+    }
+    await updateAndSaveLlmSettings({ presets: updated, voice_preset: newVoicePreset });
+    try {
+      await invoke("delete_preset_markdown", { id: idToDelete });
+    } catch (e) {
+      console.error("Failed deleting preset markdown file:", e);
+    }
+    if (editingPresetId === idToDelete) {
+      handleCancelPresetForm();
+    }
+  }
+
+  async function handleRestoreDefaultPresets() {
+    try {
+      const defaults: PromptPreset[] = await invoke("restore_presets_defaults");
+      await updateAndSaveLlmSettings({
+        presets: defaults,
+        voice_preset: "grammar_fix",
+      });
+      showToast("✓ Presets restored to defaults");
+    } catch (e) {
+      console.error(e);
+      await updateAndSaveLlmSettings({
+        presets: DEFAULT_PRESETS,
+        voice_preset: "grammar_fix",
+      });
+    }
+    handleCancelPresetForm();
+  }
+
+  async function handleFetchModels(providerId?: string) {
+    const targetId = providerId || llmSettingsRef.current.active_provider_id;
+    setIsFetchingModels(true);
+    setErrorMsg(null);
+    try {
+      const models: string[] = await invoke("fetch_llm_models", { providerId: targetId });
+      setAvailableModels(models);
+      showToast(`✓ Loaded ${models.length} available models`);
+    } catch (err: any) {
+      setErrorMsg(String(err));
+    } finally {
+      setIsFetchingModels(false);
+    }
+  }
+
+  function handleUpdateProvider(id: string, patch: Partial<LlmProvider>) {
+    const updated = llmSettingsRef.current.providers.map((p) =>
+      p.id === id ? { ...p, ...patch } : p
+    );
+    updateAndSaveLlmSettings({ providers: updated });
+  }
+
+  function handleAddProvider(type: "cloudflare" | "groq" | "openai" | "custom") {
+    const rand = Math.floor(1000 + Math.random() * 9000);
+    const newId =
+      type === "cloudflare"
+        ? `CLOUDFLARE_${rand}`
+        : type === "groq"
+        ? `GROQ_${rand}`
+        : type === "openai"
+        ? `OPENAI_${rand}`
+        : `CUSTOM_${rand}`;
+
+    const newName =
+      type === "cloudflare"
+        ? `Cloudflare ${rand}`
+        : type === "groq"
+        ? `Groq Cloud ${rand}`
+        : type === "openai"
+        ? `OpenAI ${rand}`
+        : `Custom Provider ${rand}`;
+
+    const newProvider: LlmProvider = {
+      id: newId,
+      name: newName,
+      provider_type: type,
+      api_key: "",
+      account_id: "",
+      base_url:
+        type === "groq"
+          ? "https://api.groq.com/openai/v1"
+          : type === "openai"
+          ? "https://api.openai.com/v1"
+          : type === "custom"
+          ? "http://localhost:11434/v1"
+          : "",
+    };
+
+    const nextProviders = [...llmSettingsRef.current.providers, newProvider];
+    updateAndSaveLlmSettings({
+      providers: nextProviders,
+      active_provider_id: newId,
+    });
+    setEditingProviderId(newId);
+  }
+
+  function handleDeleteProvider(id: string) {
+    if (llmSettingsRef.current.providers.length <= 1) {
+      showToast("Cannot delete the only configured provider");
+      return;
+    }
+    const filtered = llmSettingsRef.current.providers.filter((p) => p.id !== id);
+    const nextActive =
+      llmSettingsRef.current.active_provider_id === id
+        ? filtered[0].id
+        : llmSettingsRef.current.active_provider_id;
+
+    updateAndSaveLlmSettings({
+      providers: filtered,
+      active_provider_id: nextActive,
+    });
+    setEditingProviderId(nextActive);
+  }
+
+  async function handleTransform(textOverride?: string, _isAuto = false) {
+    const text = (textOverride !== undefined ? textOverride : rawTranscriptRef.current).trim();
+    if (!text) {
+      showToast("No transcription to transform. Speak or type first.");
+      return;
+    }
+
+    setIsTransforming(true);
+    setErrorMsg(null);
+    try {
+      const transformed: string = await invoke("transform_with_llm", {
+        text,
+        providerId: llmSettingsRef.current.active_provider_id,
+        model: llmSettingsRef.current.model,
+        preset: llmSettingsRef.current.voice_preset,
+        customPrompt: llmSettingsRef.current.custom_prompt || undefined,
+      });
+
+      setLlmResult(transformed);
+
+      const activeId = activeIdRef.current;
+      await persistNote(transformed, activeId);
+
+      addLog({
+        level: "success",
+        title: "LLM Transformation Succeeded",
+        engine: `LLM (${llmSettingsRef.current.voice_preset})`,
+        model: llmSettingsRef.current.model,
+        message: `Transformed ${text.split(/\s+/).filter(Boolean).length} words -> ${transformed.split(/\s+/).filter(Boolean).length} words`,
+        details: `Raw Input:\n${text}\n\nTransformed Output:\n${transformed}`,
+      });
+
+      if (settingsRef.current.auto_copy) {
+        await copyText(transformed);
+      } else {
+        showToast("✓ Transformed with LLM!");
+      }
+    } catch (err: any) {
+      const errStr = String(err);
+      setErrorMsg(errStr);
+      addLog({
+        level: "error",
+        title: "LLM Transformation Failed",
+        engine: "LLM",
+        model: llmSettingsRef.current.model,
+        message: errStr,
+        details: `Timestamp: ${new Date().toISOString()}\nModel: ${llmSettingsRef.current.model}\nError:\n${errStr}`,
+      });
+    } finally {
+      setIsTransforming(false);
+    }
+  }
+
   async function loadSettings() {
     try {
       const s: AppSettings = await invoke("get_settings");
@@ -515,6 +920,7 @@ export default function App() {
       await invoke("set_always_on_top", { alwaysOnTop: s.always_on_top });
       await refreshModelStatus(s.local_engine, s.local_model_size);
       await refreshMemoryStatus();
+      await loadLlmSettings();
     } catch (e) {
       console.error("Failed to load settings:", e);
     }
@@ -538,12 +944,18 @@ export default function App() {
   function openSettings(tab: "asr" | "llm" | "preferences" | "logs" = "asr") {
     setSettingsNavTab(tab);
     loadSettings();
+    loadLlmSettings();
     refreshModelStatus();
     refreshMemoryStatus();
     setActiveView("settings");
   }
 
-  function closeSettings() {
+  async function closeSettings() {
+    try {
+      await invoke("save_llm_config", { config: llmSettingsRef.current });
+    } catch (e) {
+      console.warn("Failed saving LLM config on close:", e);
+    }
     setActiveView("notes");
   }
 
@@ -588,28 +1000,58 @@ export default function App() {
       try {
         const transcript: string = await invoke("stop_recording_and_transcribe");
         if (transcript) {
-          // 1. Always append to active note & persist to SQLite first
-          const current = activeContentRef.current;
-          const nextContent = current ? `${current.trim()} ${transcript}` : transcript;
-          setContent(nextContent);
-          await persistNote(nextContent, activeIdRef.current);
+          if (llmSettingsRef.current.enabled) {
+            // Dual-field multi-clip accumulation
+            const currentRaw = rawTranscriptRef.current;
+            const nextRaw = currentRaw ? `${currentRaw.trim()} ${transcript}` : transcript;
+            setRawTranscript(nextRaw);
+            rawTranscriptRef.current = nextRaw;
+            setContent(nextRaw);
+            await persistNote(nextRaw, activeIdRef.current);
 
-          // 2. Add success diagnostic log
-          addLog({
-            level: "success",
-            title: "Transcription Successful",
-            engine: settingsRef.current.engine_mode === "cloud" ? "Remote API" : `Local (${settingsRef.current.local_engine})`,
-            model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
-            endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
-            message: `Transcribed ${transcript.trim().split(/\s+/).filter(Boolean).length} words.`,
-            details: `Result: "${transcript.slice(0, 200)}${transcript.length > 200 ? "..." : ""}"`,
-          });
+            addLog({
+              level: "success",
+              title: "Transcription Successful",
+              engine: settingsRef.current.engine_mode === "cloud" ? "Remote API" : `Local (${settingsRef.current.local_engine})`,
+              model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
+              endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
+              message: `Transcribed ${transcript.trim().split(/\s+/).filter(Boolean).length} words.`,
+              details: `Result: "${transcript.slice(0, 200)}${transcript.length > 200 ? "..." : ""}"`,
+            });
 
-          // 3. Copy to clipboard if option enabled
-          if (settingsRef.current.auto_copy) {
-            await copyText(transcript);
+            if (llmSettingsRef.current.auto_mode) {
+              await handleTransform(nextRaw, true);
+            } else {
+              if (settingsRef.current.auto_copy) {
+                await copyText(transcript);
+              } else {
+                showToast("✓ Transcribed to raw buffer!");
+              }
+            }
           } else {
-            showToast("✓ Transcribed!");
+            // Standard scratchpad behavior
+            const current = activeContentRef.current;
+            const nextContent = current ? `${current.trim()} ${transcript}` : transcript;
+            setContent(nextContent);
+            setRawTranscript(nextContent);
+            rawTranscriptRef.current = nextContent;
+            await persistNote(nextContent, activeIdRef.current);
+
+            addLog({
+              level: "success",
+              title: "Transcription Successful",
+              engine: settingsRef.current.engine_mode === "cloud" ? "Remote API" : `Local (${settingsRef.current.local_engine})`,
+              model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
+              endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
+              message: `Transcribed ${transcript.trim().split(/\s+/).filter(Boolean).length} words.`,
+              details: `Result: "${transcript.slice(0, 200)}${transcript.length > 200 ? "..." : ""}"`,
+            });
+
+            if (settingsRef.current.auto_copy) {
+              await copyText(transcript);
+            } else {
+              showToast("✓ Transcribed!");
+            }
           }
         }
       } catch (err: any) {
@@ -643,6 +1085,8 @@ export default function App() {
 
   function handleContentChange(val: string) {
     setContent(val);
+    setRawTranscript(val);
+    rawTranscriptRef.current = val;
   }
 
   async function handleBlurSave() {
@@ -657,13 +1101,22 @@ export default function App() {
     }
     setActiveNoteId(null);
     setContent("");
+    setRawTranscript("");
+    rawTranscriptRef.current = "";
+    setLlmResult("");
     setErrorMsg(null);
   }
 
   function handleSelectNote(note: Note) {
     setActiveNoteId(note.id);
     setContent(note.content);
+    setRawTranscript(note.content);
+    rawTranscriptRef.current = note.content;
+    setLlmResult("");
     setErrorMsg(null);
+    if (typeof window !== "undefined" && window.innerWidth <= 768) {
+      setSidebarOpen(false);
+    }
   }
 
   async function handleDeleteNote(e: React.MouseEvent, id: number) {
@@ -717,6 +1170,7 @@ export default function App() {
     try {
       await invoke("save_settings", { settings });
       settingsRef.current = settings;
+      await invoke("save_llm_config", { config: llmSettingsRef.current });
       showToast("✓ Settings saved!");
       setActiveView("notes");
     } catch (err: any) {
@@ -824,58 +1278,67 @@ export default function App() {
 
       {/* Sidebar: History (Only visible in Notes view) */}
       {activeView === "notes" && (
-        <aside className={`sidebar ${sidebarOpen ? "" : "closed"}`}>
-          <div className="sidebar-header">
-            <span className="sidebar-title">History ({notes.length})</span>
-            <button
-              className="btn-icon"
-              onClick={handleNewNote}
-              title="New blank note"
-            >
-              +
-            </button>
-          </div>
+        <>
+          <aside className={`sidebar ${sidebarOpen ? "" : "closed"}`}>
+            <div className="sidebar-header">
+              <span className="sidebar-title">History ({notes.length})</span>
+              <button
+                className="btn-icon"
+                onClick={handleNewNote}
+                title="New blank note"
+              >
+                +
+              </button>
+            </div>
 
-          <div className="history-list">
-            {notes.length === 0 ? (
-              <div className="history-empty">No notes yet. Record or write one!</div>
-            ) : (
-              notes.map((note) => (
-                <div
-                  key={note.id}
-                  className={`history-item ${activeNoteId === note.id ? "active" : ""}`}
-                  onClick={() => handleSelectNote(note)}
-                >
-                  <div className="history-item-top">
-                    <span className="history-item-title">{note.title}</span>
-                    <span className="history-item-time">{formatDate(note.updated_at)}</span>
-                  </div>
-                  <div className="history-item-preview">{note.content || "Empty note"}</div>
+            <div className="history-list">
+              {notes.length === 0 ? (
+                <div className="history-empty">No notes yet. Record or write one!</div>
+              ) : (
+                notes.map((note) => (
+                  <div
+                    key={note.id}
+                    className={`history-item ${activeNoteId === note.id ? "active" : ""}`}
+                    onClick={() => handleSelectNote(note)}
+                  >
+                    <div className="history-item-top">
+                      <span className="history-item-title">{note.title}</span>
+                      <span className="history-item-time">{formatDate(note.updated_at)}</span>
+                    </div>
+                    <div className="history-item-preview">{note.content || "Empty note"}</div>
 
-                  <div className="history-actions">
-                    <button
-                      className="btn-icon"
-                      title="Copy note"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        copyText(note.content, note.id);
-                      }}
-                    >
-                      {copiedId === note.id ? "✓" : "📋"}
-                    </button>
-                    <button
-                      className="btn-icon"
-                      title="Delete note"
-                      onClick={(e) => handleDeleteNote(e, note.id)}
-                    >
-                      ✕
-                    </button>
+                    <div className="history-actions">
+                      <button
+                        className="btn-icon"
+                        title="Copy note"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          copyText(note.content, note.id);
+                        }}
+                      >
+                        {copiedId === note.id ? "✓" : "📋"}
+                      </button>
+                      <button
+                        className="btn-icon"
+                        title="Delete note"
+                        onClick={(e) => handleDeleteNote(e, note.id)}
+                      >
+                        ✕
+                      </button>
+                    </div>
                   </div>
-                </div>
-              ))
-            )}
-          </div>
-        </aside>
+                ))
+              )}
+            </div>
+          </aside>
+          {sidebarOpen && (
+            <div
+              className="sidebar-backdrop"
+              onClick={() => setSidebarOpen(false)}
+              aria-hidden="true"
+            />
+          )}
+        </>
       )}
 
       {/* Main Content Area: Switch between Notes Scratchpad and Full-Page Settings */}
@@ -921,10 +1384,12 @@ export default function App() {
             <button
               type="button"
               className={`settings-nav-tab ${settingsNavTab === "llm" ? "active" : ""}`}
-              onClick={() => setSettingsNavTab("llm")}
+              onClick={() => {
+                setSettingsNavTab("llm");
+                loadLlmSettings();
+              }}
             >
-              🤖 LLM
-              <span className="coming-soon-chip">Coming Soon</span>
+              🤖 LLM {llmSettings.enabled ? "(ON)" : ""}
             </button>
             <button
               type="button"
@@ -1127,6 +1592,55 @@ export default function App() {
                         : activePreset.id === "cloudflare"
                         ? "Supports: '@cf/openai/whisper', '@cf/openai/whisper-large-v3-turbo', '@cf/openai/whisper-tiny-en'."
                         : "e.g. 'whisper-1' (OpenAI / local standard)."}
+                    </span>
+                  </div>
+
+                  <div className="form-group" style={{ marginTop: "12px", paddingTop: "12px", borderTop: "1px solid var(--border)" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                      <label className="form-label" style={{ margin: 0 }}>Request Timeout (applies to both ASR &amp; LLM)</label>
+                      <span style={{ fontSize: "12px", color: "var(--text-secondary)", fontWeight: 500 }}>
+                        {Math.floor((settings.request_timeout_secs || 180) / 60)}m {(settings.request_timeout_secs || 180) % 60}s ({settings.request_timeout_secs || 180}s)
+                      </span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
+                      <input
+                        type="number"
+                        min={180}
+                        step={30}
+                        className="form-input"
+                        style={{ width: "110px" }}
+                        value={settings.request_timeout_secs || 180}
+                        onChange={(e) => {
+                          const val = Math.max(180, parseInt(e.target.value, 10) || 180);
+                          updateAndSaveSettings({ request_timeout_secs: val });
+                          updateAndSaveLlmSettings({ request_timeout_secs: val });
+                        }}
+                      />
+                      <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+                        seconds (min 180s / 3 min)
+                      </span>
+                    </div>
+                    <div className="timeout-pills">
+                      {[
+                        { label: "3 min (180s)", val: 180 },
+                        { label: "5 min (300s)", val: 300 },
+                        { label: "10 min (600s)", val: 600 },
+                      ].map((opt) => (
+                        <button
+                          key={opt.val}
+                          type="button"
+                          className={`timeout-pill ${(settings.request_timeout_secs || 180) === opt.val ? "active" : ""}`}
+                          onClick={() => {
+                            updateAndSaveSettings({ request_timeout_secs: opt.val });
+                            updateAndSaveLlmSettings({ request_timeout_secs: opt.val });
+                          }}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                    <span className="form-hint" style={{ marginTop: "6px", display: "block" }}>
+                      Custom timeout for network requests. Configured timeout applies to both speech transcription (ASR) and LLM rectification requests.
                     </span>
                   </div>
                 </div>
@@ -1454,88 +1968,830 @@ export default function App() {
                 </div>
               </>
             )}
-              </>
-            )}
 
-            {/* Section: LLM Post-Processing (Preview) */}
-            {settingsNavTab === "llm" && (
-              <div className="settings-section-card">
-                <div className="settings-section-heading">
-                  <span>LLM Post-Processing</span>
-                  <span className="coming-soon-chip">In Development</span>
-                </div>
-                <div className="llm-preview-card">
-                  <div className="llm-preview-header">
-                    <span className="llm-preview-icon">🤖</span>
-                    <div>
-                      <h4 style={{ margin: "0 0 4px 0", fontSize: "14px", color: "var(--text-primary)" }}>
-                        AI Speech Enhancement &amp; Transformations
-                      </h4>
-                      <p style={{ margin: 0, fontSize: "12px", color: "var(--text-secondary)", lineHeight: 1.4 }}>
-                        Lipi will soon support chaining transcribed text with Large Language Models (LLMs) to automatically format, clean, synthesize, and translate your voice notes.
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="llm-features-grid">
-                    <div className="llm-feature-item">
-                      <span className="llm-feature-bullet">✨</span>
-                      <div>
-                        <strong>Punctuation &amp; Grammar Polish</strong>
-                        <p>Turn raw spoken streams into structured paragraphs with proper casing and punctuation.</p>
-                      </div>
-                    </div>
-
-                    <div className="llm-feature-item">
-                      <span className="llm-feature-bullet">📝</span>
-                      <div>
-                        <strong>Action Items &amp; Summaries</strong>
-                        <p>Automatically extract key action items, tasks, and concise bullet summaries from recordings.</p>
-                      </div>
-                    </div>
-
-                    <div className="llm-feature-item">
-                      <span className="llm-feature-bullet">🌐</span>
-                      <div>
-                        <strong>Multilingual Translation &amp; Tone</strong>
-                        <p>Translate spoken speech into other languages or rephrase drafts into professional email tone.</p>
-                      </div>
-                    </div>
-
-                    <div className="llm-feature-item">
-                      <span className="llm-feature-bullet">⚡</span>
-                      <div>
-                        <strong>Local &amp; Cloud LLM Providers</strong>
-                        <p>Configurable with local models (Ollama, llama.cpp) and cloud APIs (Groq, Cloudflare, OpenAI).</p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
+            {/* Speech Recognition Language Options Card */}
+            <div className="settings-section-card">
+              <div className="settings-section-heading">
+                <span>Speech Recognition Language</span>
               </div>
-            )}
 
-            {/* Section 3: General Audio & Transcription Preferences */}
-            {settingsNavTab === "preferences" && (
-              <div className="settings-section-card">
-                <div className="settings-section-heading">
-                  <span>Preferences</span>
-                </div>
+              <div className="form-group">
+                <label className="form-label">Spoken Language</label>
+                <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
+                  <select
+                    className="form-input form-select"
+                    style={{ maxWidth: "260px" }}
+                    value={
+                      [
+                        "",
+                        "en",
+                        "bn",
+                        "hi",
+                        "es",
+                        "fr",
+                        "de",
+                        "zh",
+                        "ja",
+                        "ar",
+                        "pt",
+                        "ru",
+                        "it",
+                        "ko",
+                      ].includes(settings.language || "")
+                        ? settings.language || ""
+                        : "custom"
+                    }
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val !== "custom") {
+                        setSettings({ ...settings, language: val });
+                        updateAndSaveSettings({ language: val });
+                      }
+                    }}
+                  >
+                    <option value="">🌐 Auto-Detect (Multilingual)</option>
+                    <option value="en">🇺🇸 English (en)</option>
+                    <option value="bn">🇧🇩 Bengali / বাংলা (bn)</option>
+                    <option value="hi">🇮🇳 Hindi / हिन्दी (hi)</option>
+                    <option value="es">🇪🇸 Spanish / Español (es)</option>
+                    <option value="fr">🇫🇷 French / Français (fr)</option>
+                    <option value="de">🇩🇪 German / Deutsch (de)</option>
+                    <option value="zh">🇨🇳 Chinese / 中文 (zh)</option>
+                    <option value="ja">🇯🇵 Japanese / 日本語 (ja)</option>
+                    <option value="ar">🇸🇦 Arabic / العربية (ar)</option>
+                    <option value="pt">🇵🇹 Portuguese / Português (pt)</option>
+                    <option value="ru">🇷🇺 Russian / Русский (ru)</option>
+                    <option value="it">🇮🇹 Italian / Italiano (it)</option>
+                    <option value="ko">🇰🇷 Korean / 한국어 (ko)</option>
+                    <option value="custom">🛠 Custom ISO Code...</option>
+                  </select>
 
-                <div className="form-group">
-                  <label className="form-label">Language Code (Optional)</label>
                   <input
                     type="text"
                     className="form-input"
-                    placeholder="en (leave empty for auto-detect)"
+                    style={{ maxWidth: "160px" }}
+                    placeholder="ISO code (e.g. en, bn)"
                     value={settings.language || ""}
                     onChange={(e) =>
                       setSettings({ ...settings, language: e.target.value })
                     }
                     onBlur={() => updateAndSaveSettings({ language: settings.language })}
                   />
-                  <span className="form-hint">
-                    e.g., 'en' for English, 'es' for Spanish, 'hi' for Hindi, 'bn' for Bengali, or leave blank for automatic detection.
+                </div>
+                <span className="form-hint">
+                  Explicitly choosing your spoken language avoids Whisper's automatic language detection step, reducing latency and avoiding mistaken language detection on short utterances.
+                </span>
+              </div>
+
+              <div className="language-quick-chips">
+                {[
+                  { code: "", label: "Auto-detect" },
+                  { code: "en", label: "English" },
+                  { code: "bn", label: "Bengali (বাংলা)" },
+                  { code: "hi", label: "Hindi (हिन्दी)" },
+                  { code: "es", label: "Spanish" },
+                  { code: "fr", label: "French" },
+                  { code: "de", label: "German" },
+                  { code: "zh", label: "Chinese" },
+                  { code: "ja", label: "Japanese" },
+                ].map((lang) => {
+                  const isSel = (settings.language || "") === lang.code;
+                  return (
+                    <button
+                      key={lang.code || "auto"}
+                      type="button"
+                      className={`provider-chip ${isSel ? "active" : ""}`}
+                      style={{ fontSize: "11px", padding: "3px 8px" }}
+                      onClick={() => {
+                        setSettings({ ...settings, language: lang.code });
+                        updateAndSaveSettings({ language: lang.code });
+                      }}
+                    >
+                      {lang.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </>
+        )}
+
+            {/* Section: LLM Post-Processing */}
+            {settingsNavTab === "llm" && (
+              <>
+                <div className="settings-section-card">
+                <div className="settings-section-heading" style={{ justifyContent: "space-between" }}>
+                  <span>LLM Post-Processing &amp; Rectification</span>
+                  <span className={`badge-pill ${llmSettings.enabled ? "installed" : "missing"}`}>
+                    {llmSettings.enabled ? "Active" : "Disabled"}
                   </span>
+                </div>
+
+                <div className="form-group" style={{ marginBottom: "16px" }}>
+                  <label className="checkbox-label" style={{ fontWeight: 600, fontSize: "14px" }}>
+                    <input
+                      type="checkbox"
+                      className="checkbox-input"
+                      checked={llmSettings.enabled}
+                      onChange={(e) => updateAndSaveLlmSettings({ enabled: e.target.checked })}
+                    />
+                    <span>Enable LLM Speech Transformation &amp; Grammar Rectification</span>
+                  </label>
+                  <span className="form-hint" style={{ marginLeft: "26px" }}>
+                    Transforms your speech using an OpenAI-compatible endpoint. Supports Cloudflare Workers AI, Groq, OpenAI, and local models.
+                  </span>
+                </div>
+
+                {llmSettings.enabled && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                    {/* Provider Selection */}
+                    <div className="form-group">
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                        <label className="form-label" style={{ margin: 0 }}>Configured Providers</label>
+                        <div style={{ display: "flex", gap: "6px" }}>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => handleAddProvider("cloudflare")}
+                            title="Add a Cloudflare Workers AI account"
+                          >
+                            + Cloudflare
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => handleAddProvider("groq")}
+                            title="Add a Groq account"
+                          >
+                            + Groq
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => handleAddProvider("openai")}
+                            title="Add an OpenAI account"
+                          >
+                            + OpenAI
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => handleAddProvider("custom")}
+                            title="Add a Custom / Local Ollama / vLLM endpoint"
+                          >
+                            + Custom
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="llm-provider-list">
+                        {llmSettings.providers.map((p) => {
+                          const isSelected = editingProviderId === p.id;
+                          const isActive = llmSettings.active_provider_id === p.id;
+                          return (
+                            <div
+                              key={p.id}
+                              className={`llm-provider-card ${isSelected ? "active" : ""}`}
+                              onClick={() => setEditingProviderId(p.id)}
+                            >
+                              <div className="llm-provider-info">
+                                <span className="llm-provider-icon">
+                                  {p.provider_type === "cloudflare" ? "☁" : p.provider_type === "groq" ? "⚡" : p.provider_type === "openai" ? "🤖" : "⚙"}
+                                </span>
+                                <div>
+                                  <div className="llm-provider-name">{p.name}</div>
+                                  <div className="llm-provider-type">{p.provider_type}</div>
+                                </div>
+                              </div>
+                              <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                                {isActive ? (
+                                  <span className="badge-pill installed">Active</span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary btn-sm"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      updateAndSaveLlmSettings({ active_provider_id: p.id });
+                                      setEditingProviderId(p.id);
+                                    }}
+                                  >
+                                    Use this
+                                  </button>
+                                )}
+                                {llmSettings.providers.length > 1 && (
+                                  <button
+                                    type="button"
+                                    className="btn-icon"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleDeleteProvider(p.id);
+                                    }}
+                                    title="Delete provider"
+                                  >
+                                    ✕
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Active / Selected Provider Credentials */}
+                    {(() => {
+                      const cur = llmSettings.providers.find((p) => p.id === editingProviderId) || llmSettings.providers[0];
+                      if (!cur) return null;
+                      return (
+                        <div style={{ background: "var(--bg-primary)", padding: "14px", borderRadius: "8px", border: "1px solid var(--border)", display: "flex", flexDirection: "column", gap: "12px" }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <span style={{ fontSize: "13px", fontWeight: 600 }}>
+                              Configure {cur.name} Credentials
+                            </span>
+                            {cur.id !== llmSettings.active_provider_id && (
+                              <button
+                                type="button"
+                                className="btn btn-secondary btn-sm"
+                                onClick={() => updateAndSaveLlmSettings({ active_provider_id: cur.id })}
+                              >
+                                Set as Active Provider
+                              </button>
+                            )}
+                          </div>
+
+                          <div className="form-group">
+                            <label className="form-label">Provider Label</label>
+                            <input
+                              type="text"
+                              className="form-input"
+                              value={cur.name}
+                              onChange={(e) => handleUpdateProvider(cur.id, { name: e.target.value })}
+                            />
+                          </div>
+
+                          {cur.provider_type === "cloudflare" && (
+                            <>
+                              <div className="preset-alert info">
+                                ℹ️ <strong>Cloudflare Workers AI:</strong> Audio &amp; LLM are handled via your Cloudflare account. Enter only your Account ID and API Token.
+                              </div>
+
+                              <div className="form-group">
+                                <label className="form-label">Cloudflare Account ID (User ID)</label>
+                                <input
+                                  type="text"
+                                  className="form-input"
+                                  placeholder="e.g. c3a0b12984ef... (found in Cloudflare Dashboard)"
+                                  value={cur.account_id}
+                                  onChange={(e) => handleUpdateProvider(cur.id, { account_id: e.target.value })}
+                                />
+                                <span className="form-hint">
+                                  Found in Cloudflare Dashboard &rarr; Workers &amp; Pages overview (right sidebar).
+                                </span>
+                              </div>
+
+                              <div className="form-group">
+                                <label className="form-label">Cloudflare API Token</label>
+                                <input
+                                  type="password"
+                                  className="form-input"
+                                  placeholder="Cloudflare API Token with Workers AI Read permissions"
+                                  value={cur.api_key}
+                                  onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                                />
+                                <span className="form-hint">
+                                  Stored securely in local .env configuration.
+                                </span>
+                              </div>
+
+                              <div style={{ marginTop: "4px" }}>
+                                <button
+                                  type="button"
+                                  className="btn-icon"
+                                  style={{ fontSize: "11px", color: "var(--text-secondary)", display: "inline-flex", gap: "4px", padding: 0 }}
+                                  onClick={() => setShowAdvancedUrl(!showAdvancedUrl)}
+                                >
+                                  {showAdvancedUrl ? "▼ Hide Advanced Base URL" : "▶ Show Advanced Base URL"}
+                                </button>
+                                {showAdvancedUrl && (
+                                  <div className="form-group" style={{ marginTop: "8px" }}>
+                                    <label className="form-label">Custom Base URL Override (Optional)</label>
+                                    <input
+                                      type="text"
+                                      className="form-input"
+                                      placeholder={`Default: https://api.cloudflare.com/client/v4/accounts/${cur.account_id || "<account_id>"}/ai/v1`}
+                                      value={cur.base_url}
+                                      onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
+                                    />
+                                  </div>
+                                )}
+                              </div>
+                            </>
+                          )}
+
+                          {cur.provider_type === "groq" && (
+                            <div className="form-group">
+                              <label className="form-label">Groq API Key</label>
+                              <input
+                                type="password"
+                                className="form-input"
+                                placeholder="gsk_..."
+                                value={cur.api_key}
+                                onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                              />
+                              <span className="form-hint">From console.groq.com/keys.</span>
+                            </div>
+                          )}
+
+                          {cur.provider_type === "openai" && (
+                            <div className="form-group">
+                              <label className="form-label">OpenAI API Key</label>
+                              <input
+                                type="password"
+                                className="form-input"
+                                placeholder="sk-..."
+                                value={cur.api_key}
+                                onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                              />
+                            </div>
+                          )}
+
+                          {cur.provider_type === "custom" && (
+                            <>
+                              <div className="form-group">
+                                <label className="form-label">Base URL</label>
+                                <input
+                                  type="text"
+                                  className="form-input"
+                                  placeholder="http://localhost:11434/v1 or http://localhost:8000/v1"
+                                  value={cur.base_url}
+                                  onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
+                                />
+                              </div>
+                              <div className="form-group">
+                                <label className="form-label">API Key / Token (Optional)</label>
+                                <input
+                                  type="password"
+                                  className="form-input"
+                                  placeholder="Bearer token if required by server"
+                                  value={cur.api_key}
+                                  onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                                />
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      );
+                    })()}
+
+                    {/* Model Selection with Fetch Models */}
+                    <div className="form-group">
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                        <label className="form-label" style={{ margin: 0 }}>Model Name</label>
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => handleFetchModels()}
+                          disabled={isFetchingModels}
+                          title="Query provider /models endpoint for available models"
+                        >
+                          {isFetchingModels ? "🔄 Fetching..." : "🔄 Fetch Available Models"}
+                        </button>
+                      </div>
+
+                      <div className="input-with-button">
+                        <input
+                          type="text"
+                          className="form-input"
+                          placeholder="@cf/meta/llama-3.1-8b-instruct or llama-3.3-70b-versatile"
+                          value={llmSettings.model}
+                          onChange={(e) => updateAndSaveLlmSettings({ model: e.target.value })}
+                          list="available-models-list"
+                        />
+                        {availableModels.length > 0 && (
+                          <datalist id="available-models-list">
+                            {availableModels.map((m) => (
+                              <option key={m} value={m} />
+                            ))}
+                          </datalist>
+                        )}
+                      </div>
+
+                      <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
+                        {(editingProviderId.includes("cloudflare")
+                          ? [
+                              { id: "@cf/meta/llama-3.1-8b-instruct", label: "Llama 3.1 8B (Fast)" },
+                              { id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", label: "Llama 3.3 70B (Quality)" },
+                              { id: "@cf/qwen/qwen2.5-7b-instruct", label: "Qwen 2.5 7B" },
+                              { id: "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", label: "DeepSeek R1 32B" },
+                            ]
+                          : editingProviderId.includes("groq")
+                          ? [
+                              { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B (Fast)" },
+                              { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B (Instant)" },
+                              { id: "mixtral-8x7b-32768", label: "Mixtral 8x7B" },
+                            ]
+                          : [
+                              { id: "gpt-4o-mini", label: "GPT-4o Mini" },
+                              { id: "gpt-4o", label: "GPT-4o" },
+                            ]
+                        ).map((item) => (
+                          <button
+                            key={item.id}
+                            type="button"
+                            className={`provider-chip ${llmSettings.model === item.id ? "active" : ""}`}
+                            style={{ fontSize: "11px", padding: "3px 8px" }}
+                            onClick={() => updateAndSaveLlmSettings({ model: item.id })}
+                          >
+                            {item.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Default Voice / Rectify Preset */}
+                    <div className="form-group">
+                      <label className="form-label">Default Voice / Rectification Preset</label>
+                      <select
+                        className="form-input form-select"
+                        value={llmSettings.voice_preset}
+                        onChange={(e) => updateAndSaveLlmSettings({ voice_preset: e.target.value })}
+                      >
+                        {(llmSettings.presets || DEFAULT_PRESETS).map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.label}
+                          </option>
+                        ))}
+                        <option value="custom">🛠 Custom Instructions (Ad-hoc)</option>
+                      </select>
+                    </div>
+
+                    {llmSettings.voice_preset === "custom" && (
+                      <div className="form-group">
+                        <label className="form-label">Ad-Hoc Custom Prompt Instructions</label>
+                        <textarea
+                          className="form-input"
+                          rows={3}
+                          placeholder="e.g. You are an editor. Rewrite the text into bullet points..."
+                          value={llmSettings.custom_prompt}
+                          onChange={(e) =>
+                            setLlmSettings({ ...llmSettings, custom_prompt: e.target.value })
+                          }
+                          onBlur={() =>
+                            updateAndSaveLlmSettings({ custom_prompt: llmSettings.custom_prompt })
+                          }
+                        />
+                        <span className="form-hint">
+                          Used whenever 'Custom Instructions' is selected in the workspace.
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Auto Mode Setting */}
+                    <div className="form-group">
+                      <label className="checkbox-label">
+                        <input
+                          type="checkbox"
+                          className="checkbox-input"
+                          checked={llmSettings.auto_mode}
+                          onChange={(e) => updateAndSaveLlmSettings({ auto_mode: e.target.checked })}
+                        />
+                        <span>Auto-transform immediately when recording stops</span>
+                      </label>
+                      <span className="form-hint" style={{ marginLeft: "26px" }}>
+                        When enabled, audio is transcribed then immediately corrected by LLM and copied to clipboard. When disabled, you can manually review and edit raw text before clicking Transform.
+                      </span>
+                    </div>
+
+                    {/* Request Timeout Setting */}
+                    <div className="form-group" style={{ marginTop: "8px", paddingTop: "12px", borderTop: "1px solid var(--border)" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                        <label className="form-label" style={{ margin: 0 }}>Request Timeout (applies to both ASR &amp; LLM)</label>
+                        <span style={{ fontSize: "12px", color: "var(--text-secondary)", fontWeight: 500 }}>
+                          {Math.floor((llmSettings.request_timeout_secs || 180) / 60)}m {(llmSettings.request_timeout_secs || 180) % 60}s ({llmSettings.request_timeout_secs || 180}s)
+                        </span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
+                        <input
+                          type="number"
+                          min={180}
+                          step={30}
+                          className="form-input"
+                          style={{ width: "110px" }}
+                          value={llmSettings.request_timeout_secs || 180}
+                          onChange={(e) => {
+                            const val = Math.max(180, parseInt(e.target.value, 10) || 180);
+                            updateAndSaveLlmSettings({ request_timeout_secs: val });
+                            updateAndSaveSettings({ request_timeout_secs: val });
+                          }}
+                        />
+                        <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+                          seconds (min 180s / 3 min)
+                        </span>
+                      </div>
+                      <div className="timeout-pills">
+                        {[
+                          { label: "3 min (180s)", val: 180 },
+                          { label: "5 min (300s)", val: 300 },
+                          { label: "10 min (600s)", val: 600 },
+                        ].map((opt) => (
+                          <button
+                            key={opt.val}
+                            type="button"
+                            className={`timeout-pill ${(llmSettings.request_timeout_secs || 180) === opt.val ? "active" : ""}`}
+                            onClick={() => {
+                              updateAndSaveLlmSettings({ request_timeout_secs: opt.val });
+                              updateAndSaveSettings({ request_timeout_secs: opt.val });
+                            }}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                      <span className="form-hint" style={{ marginTop: "6px", display: "block" }}>
+                        Custom timeout for network requests. Configured timeout applies to both speech transcription (ASR) and LLM rectification requests.
+                      </span>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Presets & Conversions Manager - Dedicated Card */}
+              <div className="settings-section-card">
+                <div className="settings-section-heading" style={{ justifyContent: "space-between" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span>Voice Presets &amp; Conversion Instructions</span>
+                    <span className="badge-pill installed" style={{ fontSize: "10px" }}>
+                      {(llmSettings.presets || DEFAULT_PRESETS).length} Presets
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", gap: "6px" }}>
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ fontSize: "11px", padding: "4px 8px" }}
+                      onClick={async () => {
+                        try {
+                          await invoke("open_presets_folder");
+                        } catch (err: any) {
+                          setErrorMsg("Failed opening presets folder: " + String(err));
+                        }
+                      }}
+                      title="Open presets directory in your file explorer to view or edit Markdown preset files directly"
+                    >
+                      📂 Open Folder
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ fontSize: "11px", padding: "4px 8px" }}
+                      onClick={handleRestoreDefaultPresets}
+                      title="Reset all presets back to built-in defaults"
+                    >
+                      🔄 Restore Defaults
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      style={{ fontSize: "11px", padding: "4px 10px" }}
+                      onClick={handleStartAddPreset}
+                    >
+                      ➕ Add Preset
+                    </button>
+                  </div>
+                </div>
+
+                <span className="form-hint" style={{ marginBottom: "12px", display: "block" }}>
+                  Stored as open Markdown (<code>.md</code>) files with YAML frontmatter in <code>presets/</code>. A hidden <code>.guide.md</code> provides formatting instructions.
+                </span>
+
+                {/* Inline Formatted Add Preset Form */}
+                {isAddingPreset && (
+                  <div className="preset-form-card">
+                    <div className="preset-form-header">
+                      <div className="preset-form-title">
+                        <span className="preset-form-icon">➕</span>
+                        <div>
+                          <h4>Create Custom Conversion Preset</h4>
+                          <span className="form-hint">Saves directly into your local Markdown presets directory</span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="btn-icon"
+                        onClick={handleCancelPresetForm}
+                        title="Cancel"
+                      >
+                        ✕
+                      </button>
+                    </div>
+
+                    <div className="preset-form-body">
+                      <div className="preset-form-row">
+                        <div className="form-group flex-1">
+                          <label className="form-label">
+                            Preset Name / Label <span className="required-mark">*</span>
+                          </label>
+                          <input
+                            type="text"
+                            className="form-input"
+                            placeholder="e.g. 🇧🇩 Bengali Formal, 📝 Meeting Minutes, 📧 Executive Email"
+                            value={presetForm.label}
+                            onChange={(e) => setPresetForm({ ...presetForm, label: e.target.value })}
+                            autoFocus
+                          />
+                        </div>
+
+                        <div className="form-group preset-id-col">
+                          <label className="form-label">File Slug</label>
+                          <input
+                            type="text"
+                            className="form-input font-mono"
+                            placeholder="auto-slug"
+                            value={
+                              presetForm.label
+                                .toLowerCase()
+                                .replace(/[^a-z0-9_-]/g, "_")
+                                .replace(/_+/g, "_")
+                                .replace(/^_|_$/g, "") || "custom_preset"
+                            }
+                            disabled
+                            title="Generated filename: <slug>.md"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="form-group">
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <label className="form-label">
+                            System Instruction / Transformation Prompt <span className="required-mark">*</span>
+                          </label>
+                          <span className="form-hint" style={{ margin: 0 }}>
+                            {presetForm.prompt.length} chars
+                          </span>
+                        </div>
+                        <textarea
+                          className="form-input preset-prompt-textarea"
+                          rows={5}
+                          placeholder="You are an expert copyeditor. Rewrite the transcribed speech text into clear, polished language while preserving all original facts and substance. Output ONLY the rewritten text without commentary, pleasantries, or introductory remarks."
+                          value={presetForm.prompt}
+                          onChange={(e) => setPresetForm({ ...presetForm, prompt: e.target.value })}
+                        />
+                        <div className="preset-prompt-hints">
+                          <span>💡 Lipi passes the raw transcription to this prompt. The LLM response fills the Result pane.</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="preset-form-footer">
+                      <button type="button" className="btn btn-secondary" onClick={handleCancelPresetForm}>
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        onClick={handleSavePresetForm}
+                        disabled={!presetForm.label.trim() || !presetForm.prompt.trim()}
+                      >
+                        💾 Save Preset
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Presets List */}
+                <div className="llm-presets-container">
+                  {(llmSettings.presets || DEFAULT_PRESETS).map((p) => {
+                    const isEditing = editingPresetId === p.id;
+                    return (
+                      <div key={p.id} className="llm-preset-card">
+                        {isEditing ? (
+                          <div className="preset-form-card" style={{ margin: 0 }}>
+                            <div className="preset-form-header">
+                              <div className="preset-form-title">
+                                <span className="preset-form-icon">✏️</span>
+                                <div>
+                                  <h4>Edit Preset: {p.label}</h4>
+                                  <span className="form-hint">File: presets/{p.id}.md</span>
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                className="btn-icon"
+                                onClick={handleCancelPresetForm}
+                                title="Cancel"
+                              >
+                                ✕
+                              </button>
+                            </div>
+
+                            <div className="preset-form-body">
+                              <div className="form-group">
+                                <label className="form-label">
+                                  Preset Name / Label <span className="required-mark">*</span>
+                                </label>
+                                <input
+                                  type="text"
+                                  className="form-input"
+                                  value={presetForm.label}
+                                  onChange={(e) => setPresetForm({ ...presetForm, label: e.target.value })}
+                                />
+                              </div>
+
+                              <div className="form-group">
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                  <label className="form-label">
+                                    System Instruction / Transformation Prompt <span className="required-mark">*</span>
+                                  </label>
+                                  <span className="form-hint" style={{ margin: 0 }}>
+                                    {presetForm.prompt.length} chars
+                                  </span>
+                                </div>
+                                <textarea
+                                  className="form-input preset-prompt-textarea"
+                                  rows={5}
+                                  value={presetForm.prompt}
+                                  onChange={(e) => setPresetForm({ ...presetForm, prompt: e.target.value })}
+                                />
+                              </div>
+                            </div>
+
+                            <div className="preset-form-footer">
+                              <button type="button" className="btn btn-secondary" onClick={handleCancelPresetForm}>
+                                Cancel
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-primary"
+                                onClick={handleSavePresetForm}
+                                disabled={!presetForm.label.trim() || !presetForm.prompt.trim()}
+                              >
+                                ✓ Update Preset
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="llm-preset-header">
+                              <div className="llm-preset-title">
+                                <span>{p.label}</span>
+                                <span className="llm-preset-id-badge">{p.id}.md</span>
+                                {llmSettings.voice_preset === p.id && (
+                                  <span style={{ fontSize: "10px", color: "var(--accent)", fontWeight: 600 }}>
+                                    ✓ Active in Workspace
+                                  </span>
+                                )}
+                              </div>
+                              <div className="llm-preset-actions">
+                                {llmSettings.voice_preset !== p.id && (
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary"
+                                    style={{ fontSize: "11px", padding: "3px 8px" }}
+                                    onClick={() => updateAndSaveLlmSettings({ voice_preset: p.id })}
+                                    title="Set as active preset in workspace"
+                                  >
+                                    Use
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary"
+                                  style={{ fontSize: "11px", padding: "3px 8px" }}
+                                  onClick={() => handleStartEditPreset(p)}
+                                  title="Edit this preset"
+                                >
+                                  ✏️ Edit
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn btn-danger"
+                                  style={{ fontSize: "11px", padding: "3px 8px" }}
+                                  onClick={() => handleDeletePreset(p.id)}
+                                  title="Delete this preset"
+                                >
+                                  🗑️
+                                </button>
+                              </div>
+                            </div>
+                            <div className="llm-preset-prompt-preview">
+                              {p.prompt}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </>
+          )}
+
+            {/* Section 3: General Audio & Transcription Preferences */}
+            {settingsNavTab === "preferences" && (
+              <div className="settings-section-card">
+                <div className="settings-section-heading">
+                  <span>Preferences</span>
                 </div>
 
                 <div className="form-group">
@@ -1680,7 +2936,7 @@ export default function App() {
               {isRecording && (
                 <div className="badge-status badge-recording">
                   <span className="dot pulse"></span>
-                  <span>Recording {formatTimer(recordSeconds)}</span>
+                  <span>Rec {formatTimer(recordSeconds)}</span>
                 </div>
               )}
               {isTranscribing && (
@@ -1703,39 +2959,194 @@ export default function App() {
               >
                 {settings.engine_mode === "local" ? (
                   <span>
-                    ⚡ {settings.local_engine === "whisper_cpu"
+                    ⚡ <span className="badge-text-full">{settings.local_engine === "whisper_cpu"
                       ? "Whisper CPU"
                       : settings.local_engine === "faster_whisper"
                       ? "Faster-Whisper"
                       : "Vulkan GPU"}{" "}
-                    ({settings.local_model_size})
+                    ({settings.local_model_size})</span>
+                    <span className="badge-text-short">Local</span>
                   </span>
                 ) : (
-                  <span>🌐 API ({settings.model || "OpenAI-Compatible"})</span>
+                  <span>
+                    🌐 <span className="badge-text-full">API ({settings.model || "OpenAI-Compatible"})</span>
+                    <span className="badge-text-short">API</span>
+                  </span>
                 )}
               </div>
+
+              {llmSettings.enabled && (
+                <div
+                  className="badge-engine badge-llm"
+                  onClick={() => openSettings("llm")}
+                  title="Click to configure LLM post-processing in Settings"
+                  style={{ background: "rgba(99, 102, 241, 0.15)", borderColor: "rgba(99, 102, 241, 0.35)" }}
+                >
+                  <span>
+                    🤖 <span className="badge-text-full">LLM: {llmSettings.voice_preset.replace("_", " ")} {llmSettings.auto_mode ? "⚡(Auto)" : ""}</span>
+                    <span className="badge-text-short">LLM</span>
+                  </span>
+                </div>
+              )}
             </div>
 
             <div className="navbar-right">
-              <button
-                className={`btn-icon ${settings.always_on_top ? "pinned" : ""}`}
-                onClick={() => toggleAlwaysOnTop()}
-                title={
-                  settings.always_on_top
-                    ? "Always on Top: ON (Click to unpin)"
-                    : "Always on Top: OFF (Click to pin)"
-                }
-              >
-                📌
-              </button>
-              <button
-                className="btn btn-secondary"
-                onClick={() => toggleMiniMode(true)}
-                title="Switch to compact floating wizard (Alt+M)"
-                style={{ fontSize: "12px", padding: "5px 10px" }}
-              >
-                ⊡ Mini Wizard
-              </button>
+              {/* Desktop / Tablet Inline Toggles (compacts or hides responsively) */}
+              <div className="nav-inline-actions">
+                {llmSettings.enabled && (
+                  <label className="auto-mode-toggle" title="Toggle automatic LLM transformation immediately on recording stop">
+                    <input
+                      type="checkbox"
+                      checked={llmSettings.auto_mode}
+                      onChange={(e) =>
+                        updateAndSaveLlmSettings({ auto_mode: e.target.checked })
+                      }
+                    />
+                    <span className={`auto-pill ${llmSettings.auto_mode ? "active" : ""}`}>
+                      <span className="auto-pill-icon">⚡</span>
+                      <span className="auto-pill-label"> Auto Transform: </span>
+                      <span className="auto-pill-status">{llmSettings.auto_mode ? "ON" : "OFF"}</span>
+                    </span>
+                  </label>
+                )}
+
+                <label className="auto-mode-toggle" title="Toggle automatic copying to clipboard">
+                  <input
+                    type="checkbox"
+                    checked={settings.auto_copy}
+                    onChange={(e) =>
+                      updateAndSaveSettings({ auto_copy: e.target.checked })
+                    }
+                  />
+                  <span className={`auto-pill ${settings.auto_copy ? "active" : ""}`}>
+                    <span className="auto-pill-icon">📋</span>
+                    <span className="auto-pill-label"> Auto Copy: </span>
+                    <span className="auto-pill-status">{settings.auto_copy ? "ON" : "OFF"}</span>
+                  </span>
+                </label>
+
+                <button
+                  className={`btn-icon ${settings.always_on_top ? "pinned" : ""}`}
+                  onClick={() => toggleAlwaysOnTop()}
+                  title={
+                    settings.always_on_top
+                      ? "Always on Top: ON (Click to unpin)"
+                      : "Always on Top: OFF (Click to pin)"
+                  }
+                >
+                  📌
+                </button>
+                <button
+                  className="btn btn-secondary nav-btn-mini"
+                  onClick={() => toggleMiniMode(true)}
+                  title="Switch to compact floating wizard (Alt+M)"
+                  style={{ fontSize: "12px", padding: "5px 10px" }}
+                >
+                  <span>⊡</span>
+                  <span className="nav-btn-mini-label"> Mini Wizard</span>
+                </button>
+              </div>
+
+              {/* Collapsible Action Dropdown for compact/narrow screens */}
+              <div className="nav-overflow-container" ref={navOverflowRef}>
+                <button
+                  type="button"
+                  className={`btn-icon nav-overflow-trigger ${navOverflowOpen ? "active" : ""}`}
+                  onClick={() => setNavOverflowOpen(!navOverflowOpen)}
+                  title="Quick Actions & Toggles"
+                  aria-label="Quick Actions"
+                >
+                  ⋯
+                  {(llmSettings.auto_mode || settings.auto_copy || settings.always_on_top) && (
+                    <span className="nav-overflow-dot" />
+                  )}
+                </button>
+
+                {navOverflowOpen && (
+                  <div className="nav-overflow-menu">
+                    <div className="nav-overflow-header">
+                      <span>Quick Controls</span>
+                      <button
+                        type="button"
+                        className="btn-icon"
+                        style={{ padding: "2px 6px", fontSize: "11px" }}
+                        onClick={() => setNavOverflowOpen(false)}
+                        title="Close"
+                      >
+                        ✕
+                      </button>
+                    </div>
+
+                    {llmSettings.enabled && (
+                      <label className="nav-overflow-item">
+                        <span className="nav-overflow-item-left">
+                          <span>⚡</span>
+                          <span>Auto Transform</span>
+                        </span>
+                        <input
+                          type="checkbox"
+                          checked={llmSettings.auto_mode}
+                          onChange={(e) =>
+                            updateAndSaveLlmSettings({ auto_mode: e.target.checked })
+                          }
+                        />
+                        <span className={`mini-status-pill ${llmSettings.auto_mode ? "active" : ""}`}>
+                          {llmSettings.auto_mode ? "ON" : "OFF"}
+                        </span>
+                      </label>
+                    )}
+
+                    <label className="nav-overflow-item">
+                      <span className="nav-overflow-item-left">
+                        <span>📋</span>
+                        <span>Auto Copy</span>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={settings.auto_copy}
+                        onChange={(e) =>
+                          updateAndSaveSettings({ auto_copy: e.target.checked })
+                        }
+                      />
+                      <span className={`mini-status-pill ${settings.auto_copy ? "active" : ""}`}>
+                        {settings.auto_copy ? "ON" : "OFF"}
+                      </span>
+                    </label>
+
+                    <button
+                      type="button"
+                      className="nav-overflow-btn"
+                      onClick={() => {
+                        toggleAlwaysOnTop();
+                      }}
+                    >
+                      <span className="nav-overflow-item-left">
+                        <span>📌</span>
+                        <span>Always on Top</span>
+                      </span>
+                      <span className={`mini-status-pill ${settings.always_on_top ? "active" : ""}`}>
+                        {settings.always_on_top ? "ON" : "OFF"}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      className="nav-overflow-btn"
+                      onClick={() => {
+                        setNavOverflowOpen(false);
+                        toggleMiniMode(true);
+                      }}
+                    >
+                      <span className="nav-overflow-item-left">
+                        <span>⊡</span>
+                        <span>Mini Wizard Mode</span>
+                      </span>
+                      <span className="key-hint">Alt+M</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+
               <button
                 className="btn-icon"
                 onClick={() => openSettings("asr")}
@@ -1784,16 +3195,217 @@ export default function App() {
             </div>
           )}
 
-          {/* Scratchpad Text Area */}
-          <div className="editor-container">
-            <textarea
-              className="scratchpad-textarea"
-              placeholder="Type here, or press 'Record' [Alt+R] to speak. Transcribed speech automatically appends and copies to clipboard..."
-              value={content}
-              onChange={(e) => handleContentChange(e.target.value)}
-              onBlur={handleBlurSave}
-            />
-          </div>
+          {/* Main Editor: Dual-Field when LLM enabled, Classic Scratchpad otherwise */}
+          {llmSettings.enabled ? (
+            <div className="dual-editor-container">
+              {/* Middle Action Strip */}
+              <div className="transform-strip">
+                <div className="transform-controls-left">
+                  <div className="voice-selector">
+                    <label className="strip-label">Voice / Style:</label>
+                    <select
+                      className="form-select strip-select"
+                      value={llmSettings.voice_preset}
+                      onChange={(e) => {
+                        updateAndSaveLlmSettings({ voice_preset: e.target.value });
+                      }}
+                      title={
+                        (llmSettings.presets || DEFAULT_PRESETS).find(
+                          (p) => p.id === llmSettings.voice_preset
+                        )?.prompt || "Select conversion style"
+                      }
+                    >
+                      {(llmSettings.presets || DEFAULT_PRESETS).map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.label}
+                        </option>
+                      ))}
+                      <option value="custom">🛠 Custom Instructions</option>
+                    </select>
+                    <button
+                      type="button"
+                      className="preset-strip-btn"
+                      onClick={async () => {
+                        try {
+                          await invoke("open_presets_folder");
+                        } catch (err: any) {
+                          setErrorMsg("Failed opening presets folder: " + String(err));
+                        }
+                      }}
+                      title="Open presets directory in file manager to view or edit Markdown preset files"
+                    >
+                      📂
+                    </button>
+                    <button
+                      type="button"
+                      className="preset-strip-btn"
+                      onClick={() => openSettings("llm")}
+                      title="Manage, add, and customize presets in Settings"
+                    >
+                      <span>⚙️</span> <span className="btn-label-text">Presets</span>
+                    </button>
+                  </div>
+
+                  {llmSettings.voice_preset === "custom" && (
+                    <input
+                      type="text"
+                      className="form-input strip-custom-input"
+                      placeholder="e.g. Rewrite as an executive memo, or translate to Bengali..."
+                      value={llmSettings.custom_prompt}
+                      onChange={(e) =>
+                        setLlmSettings({ ...llmSettings, custom_prompt: e.target.value })
+                      }
+                      onBlur={() =>
+                        updateAndSaveLlmSettings({ custom_prompt: llmSettings.custom_prompt })
+                      }
+                    />
+                  )}
+                </div>
+
+                <div className="transform-controls-right">
+                  <button
+                    type="button"
+                    className={`btn btn-transform ${isTransforming ? "loading" : ""}`}
+                    onClick={() => handleTransform()}
+                    disabled={isTransforming || !rawTranscript.trim()}
+                    title="Transform raw transcript using selected LLM voice"
+                  >
+                    {isTransforming ? (
+                      <>⏳ <span className="btn-transform-text">Transforming...</span></>
+                    ) : (
+                      <>✨ <span className="btn-transform-text">Transform with LLM</span></>
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {/* Panel 1: Raw Transcription Buffer */}
+              <div className="dual-editor-panel raw-panel">
+                <div className="panel-header">
+                  <div className="panel-title-group">
+                    <span className="panel-badge raw">🎙 Raw Transcription</span>
+                    <span className="panel-sub">Multi-clip buffer • Editable</span>
+                  </div>
+                  <div className="panel-actions">
+                    {rawTranscript && (
+                      <>
+                        <button
+                          type="button"
+                          className="btn-panel-action"
+                          onClick={() => copyText(rawTranscript)}
+                          title="Copy raw text to clipboard"
+                        >
+                          📋 <span className="btn-panel-label">Copy</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-panel-action danger"
+                          onClick={() => {
+                            setRawTranscript("");
+                            rawTranscriptRef.current = "";
+                          }}
+                          title="Clear raw transcript buffer"
+                        >
+                          🗑️ <span className="btn-panel-label">Clear</span>
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <textarea
+                  className="dual-textarea raw-textarea"
+                  placeholder="Record speech [Alt+R] or type here. Multiple clips accumulate in this buffer for you to review and edit before transforming..."
+                  value={rawTranscript}
+                  onChange={(e) => handleContentChange(e.target.value)}
+                  onBlur={handleBlurSave}
+                />
+                <div className="panel-footer">
+                  <span>{rawTranscript.trim() ? rawTranscript.trim().split(/\s+/).length : 0} words</span>
+                  <span>{rawTranscript.length} chars</span>
+                </div>
+              </div>
+
+              {/* Panel 2: LLM Transformed Result */}
+              <div className="dual-editor-panel result-panel">
+                <div className="panel-header">
+                  <div className="panel-title-group">
+                    <span className="panel-badge result">✨ LLM Result</span>
+                    <span className="panel-sub">
+                      {llmSettings.voice_preset === "grammar_fix"
+                        ? "Grammar Rectified"
+                        : llmSettings.voice_preset === "professional"
+                        ? "Professional Voice"
+                        : llmSettings.voice_preset === "casual"
+                        ? "Casual Voice"
+                        : llmSettings.voice_preset === "concise"
+                        ? "Concise Summary"
+                        : llmSettings.voice_preset === "bullets"
+                        ? "Action Bullets"
+                        : "Custom Transformation"}
+                    </span>
+                  </div>
+                  <div className="panel-actions">
+                    {llmResult && (
+                      <>
+                        <button
+                          type="button"
+                          className="btn-panel-action primary"
+                          onClick={() => copyText(llmResult)}
+                          title="Copy result to clipboard"
+                        >
+                          📋 <span className="btn-panel-label">Copy Result</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-panel-action"
+                          onClick={() => {
+                            setRawTranscript(llmResult);
+                            rawTranscriptRef.current = llmResult;
+                            showToast("✓ Result applied to raw buffer");
+                          }}
+                          title="Send result back to raw buffer for multi-pass editing"
+                        >
+                          ⬆ <span className="btn-panel-label">Apply to Raw</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-panel-action"
+                          onClick={() => persistNote(llmResult, activeNoteId)}
+                          title="Save result as current note"
+                        >
+                          💾 <span className="btn-panel-label">Save Note</span>
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <textarea
+                  className="dual-textarea result-textarea"
+                  placeholder={
+                    isTransforming
+                      ? "LLM is thinking and refining your speech..."
+                      : "LLM-enhanced result will appear here. Click '✨ Transform' above or enable 'Auto Transform' to process automatically on recording stop..."
+                  }
+                  value={llmResult}
+                  onChange={(e) => setLlmResult(e.target.value)}
+                />
+                <div className="panel-footer">
+                  <span>{llmResult.trim() ? llmResult.trim().split(/\s+/).length : 0} words</span>
+                  <span>{llmResult.length} chars</span>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="editor-container">
+              <textarea
+                className="scratchpad-textarea"
+                placeholder="Type here, or press 'Record' [Alt+R] to speak. Transcribed speech automatically appends and copies to clipboard..."
+                value={content}
+                onChange={(e) => handleContentChange(e.target.value)}
+                onBlur={handleBlurSave}
+              />
+            </div>
+          )}
 
           {/* Bottom Floating Control Dock */}
           <footer className="bottom-bar">
@@ -1803,7 +3415,7 @@ export default function App() {
                 onClick={handleNewNote}
                 title="Start a fresh note"
               >
-                + New Note
+                <span>+</span> <span className="btn-label-text">New Note</span>
               </button>
               <button
                 className="btn btn-secondary"
@@ -1811,7 +3423,7 @@ export default function App() {
                 disabled={!content.trim()}
                 title="Copy current note to clipboard"
               >
-                📋 Copy Note
+                <span>📋</span> <span className="btn-label-text">Copy Note</span>
               </button>
             </div>
 
@@ -1824,11 +3436,13 @@ export default function App() {
                 disabled={isTranscribing}
                 title="Shortcut: Alt+R"
               >
-                {isRecording
-                  ? `■ Stop (${formatTimer(recordSeconds)})`
-                  : isTranscribing
-                  ? "⌛ Processing..."
-                  : "● Record [Alt+R]"}
+                {isRecording ? (
+                  <>■ <span className="btn-record-text">Stop ({formatTimer(recordSeconds)})</span></>
+                ) : isTranscribing ? (
+                  <>⌛ <span className="btn-record-text">Processing...</span></>
+                ) : (
+                  <>● <span className="btn-record-text">Record</span> <span className="btn-record-hint">[Alt+R]</span></>
+                )}
               </button>
             </div>
 

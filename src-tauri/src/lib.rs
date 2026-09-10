@@ -1,7 +1,10 @@
 mod audio;
 mod db;
 mod engine;
+mod env_config;
+mod llm;
 mod models;
+mod presets;
 mod transcribe;
 
 use audio::AudioRecorder;
@@ -14,6 +17,7 @@ pub struct AppState {
     audio: Arc<AudioRecorder>,
     supervisor: Arc<engine::ModelSupervisor>,
     app_data_dir: std::path::PathBuf,
+    is_mini: std::sync::atomic::AtomicBool,
 }
 
 #[tauri::command]
@@ -56,12 +60,16 @@ async fn stop_recording_and_transcribe(
         return Err("API endpoint URL is missing. Set it in Settings.".into());
     }
 
+    let llm_cfg = env_config::load_llm_settings(&state.app_data_dir);
+    let timeout_secs = llm_cfg.request_timeout_secs.max(settings.request_timeout_secs).max(180) as u64;
+
     transcribe::transcribe_audio(
         wav_bytes,
         &settings.api_base_url,
         &settings.api_key,
         &settings.model,
         settings.language.as_deref(),
+        timeout_secs,
     )
     .await
 }
@@ -108,9 +116,43 @@ fn save_settings(
     state.db.save_settings(&settings)
 }
 
+fn save_current_window_state(db: &Database, window: &tauri::Window, is_mini: bool) {
+    let mut current = db.get_window_state().unwrap_or_default();
+    let scale_factor = window.scale_factor().unwrap_or(1.0);
+
+    if is_mini {
+        if let Ok(pos) = window.outer_position() {
+            let logical_pos = pos.to_logical::<f64>(scale_factor);
+            current.mini_x = Some(logical_pos.x);
+            current.mini_y = Some(logical_pos.y);
+            let _ = db.save_window_state(&current);
+        }
+    } else {
+        let is_max = window.is_maximized().unwrap_or(false);
+        current.maximized = is_max;
+        if !is_max {
+            if let Ok(pos) = window.outer_position() {
+                let logical_pos = pos.to_logical::<f64>(scale_factor);
+                current.x = Some(logical_pos.x);
+                current.y = Some(logical_pos.y);
+            }
+            if let Ok(size) = window.inner_size() {
+                let logical_size = size.to_logical::<f64>(scale_factor);
+                current.width = Some(logical_size.width);
+                current.height = Some(logical_size.height);
+            }
+        }
+        let _ = db.save_window_state(&current);
+    }
+}
+
 #[tauri::command]
 fn set_mini_mode(state: tauri::State<'_, AppState>, window: tauri::Window, mini: bool) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
     if mini {
+        save_current_window_state(&state.db, &window, false);
+        state.is_mini.store(true, Ordering::SeqCst);
+
         let _ = window.set_resizable(false);
         let _ = window.set_decorations(false);
         let _ = window.set_min_size(Some(tauri::LogicalSize::new(120.0, 40.0)));
@@ -118,7 +160,10 @@ fn set_mini_mode(state: tauri::State<'_, AppState>, window: tauri::Window, mini:
         window.set_size(tauri::LogicalSize::new(135.0, 44.0)).map_err(|e| e.to_string())?;
         window.set_always_on_top(true).map_err(|e| e.to_string())?;
 
-        if let Ok(Some(monitor)) = window.current_monitor() {
+        let saved = state.db.get_window_state().unwrap_or_default();
+        if let (Some(mx), Some(my)) = (saved.mini_x, saved.mini_y) {
+            let _ = window.set_position(tauri::LogicalPosition::new(mx, my));
+        } else if let Ok(Some(monitor)) = window.current_monitor() {
             let scale_factor = monitor.scale_factor();
             let screen_size = monitor.size().to_logical::<f64>(scale_factor);
             let screen_pos = monitor.position().to_logical::<f64>(scale_factor);
@@ -139,12 +184,29 @@ fn set_mini_mode(state: tauri::State<'_, AppState>, window: tauri::Window, mini:
             let _ = w.set_always_on_top(true);
         });
     } else {
+        save_current_window_state(&state.db, &window, true);
+        state.is_mini.store(false, Ordering::SeqCst);
+
         let _ = window.set_max_size::<tauri::LogicalSize<f64>>(None);
         let _ = window.set_min_size(Some(tauri::LogicalSize::new(280.0, 64.0)));
         let _ = window.set_decorations(true);
         let _ = window.set_resizable(true);
-        window.set_size(tauri::LogicalSize::new(960.0, 700.0)).map_err(|e| e.to_string())?;
-        let _ = window.center();
+
+        let saved = state.db.get_window_state().unwrap_or_default();
+        let target_w = saved.width.unwrap_or(960.0).max(280.0);
+        let target_h = saved.height.unwrap_or(700.0).max(64.0);
+        window.set_size(tauri::LogicalSize::new(target_w, target_h)).map_err(|e| e.to_string())?;
+
+        if let (Some(x), Some(y)) = (saved.x, saved.y) {
+            let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+        } else {
+            let _ = window.center();
+        }
+
+        if saved.maximized {
+            let _ = window.maximize();
+        }
+
         let settings = state.db.get_settings().unwrap_or_default();
         let top = settings.always_on_top;
         window.set_always_on_top(top).map_err(|e| e.to_string())?;
@@ -323,8 +385,140 @@ fn minimize_window(window: tauri::Window) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn close_window(window: tauri::Window) -> Result<(), String> {
+fn close_window(state: tauri::State<'_, AppState>, window: tauri::Window) -> Result<(), String> {
+    save_current_window_state(
+        &state.db,
+        &window,
+        state.is_mini.load(std::sync::atomic::Ordering::SeqCst),
+    );
     window.close().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_llm_config(state: tauri::State<'_, AppState>) -> Result<env_config::LlmSettings, String> {
+    let mut settings = env_config::load_llm_settings(&state.app_data_dir);
+    // Load presets dynamically from presets/*.md directory
+    settings.presets = presets::load_presets(&state.app_data_dir);
+    Ok(settings)
+}
+
+#[tauri::command]
+fn save_llm_config(
+    state: tauri::State<'_, AppState>,
+    config: env_config::LlmSettings,
+) -> Result<(), String> {
+    env_config::save_llm_settings(&state.app_data_dir, &config)?;
+    // Synchronize presets with markdown files
+    for p in &config.presets {
+        let _ = presets::save_preset_file(&state.app_data_dir, p);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn open_presets_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let dir = presets::presets_dir(&state.app_data_dir);
+    let _ = presets::ensure_presets_dir(&state.app_data_dir);
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_preset_markdown(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    presets::delete_preset_file(&state.app_data_dir, &id)
+}
+
+#[tauri::command]
+fn restore_presets_defaults(state: tauri::State<'_, AppState>) -> Result<Vec<presets::PromptPreset>, String> {
+    presets::restore_default_presets(&state.app_data_dir)
+}
+
+#[tauri::command]
+async fn fetch_llm_models(
+    state: tauri::State<'_, AppState>,
+    provider_id: String,
+) -> Result<Vec<String>, String> {
+    let settings = env_config::load_llm_settings(&state.app_data_dir);
+    let provider = settings
+        .providers
+        .iter()
+        .find(|p| p.id == provider_id)
+        .ok_or_else(|| format!("Provider '{}' not found", provider_id))?;
+
+    let base_url = provider.resolved_base_url();
+    llm::fetch_models(&base_url, &provider.api_key).await
+}
+
+#[tauri::command]
+async fn transform_with_llm(
+    state: tauri::State<'_, AppState>,
+    text: String,
+    provider_id: Option<String>,
+    model: Option<String>,
+    preset: String,
+    custom_prompt: Option<String>,
+) -> Result<String, String> {
+    let settings = env_config::load_llm_settings(&state.app_data_dir);
+    let active_id = provider_id.unwrap_or_else(|| settings.active_provider_id.clone());
+
+    let provider = settings
+        .providers
+        .iter()
+        .find(|p| p.id == active_id)
+        .ok_or_else(|| format!("Provider '{}' not found in configuration", active_id))?;
+
+    let base_url = provider.resolved_base_url();
+    let model_to_use = model.unwrap_or_else(|| settings.model.clone());
+
+    let system_prompt = if preset == "custom" {
+        let p = custom_prompt.unwrap_or_else(|| settings.custom_prompt.clone());
+        if p.trim().is_empty() {
+            "You are an editor. Improve the following text. Do not add commentary. Output ONLY the improved text.".to_string()
+        } else {
+            p.trim().to_string()
+        }
+    } else {
+        let all_presets = presets::load_presets(&state.app_data_dir);
+        if let Some(found) = all_presets.iter().find(|pr| pr.id == preset) {
+            found.prompt.clone()
+        } else if let Some(found) = settings.presets.iter().find(|pr| pr.id == preset) {
+            found.prompt.clone()
+        } else {
+            llm::resolve_system_prompt(&preset, &custom_prompt.unwrap_or_default())
+        }
+    };
+
+    let timeout_secs = settings.request_timeout_secs.max(180) as u64;
+
+    llm::transform_text_with_prompt(
+        &base_url,
+        &provider.api_key,
+        &model_to_use,
+        &system_prompt,
+        &text,
+        timeout_secs,
+    )
+    .await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -340,6 +534,9 @@ pub fn run() {
             if let Err(e) = std::fs::create_dir_all(&app_data_dir) {
                 eprintln!("Warning: could not create app_data_dir: {}", e);
             }
+
+            // Ensure presets directory and .guide.md exist
+            let _ = presets::ensure_presets_dir(&app_data_dir);
 
             let old_db_path = app_data_dir.join("transcribe.db");
             let db_path = app_data_dir.join("lipi.db");
@@ -372,14 +569,41 @@ pub fn run() {
                 }
             });
 
+            let saved_window_state = db_arc.get_window_state();
+            if let Some(w) = app.get_webview_window("main") {
+                if let Some(ref saved) = saved_window_state {
+                    let target_w = saved.width.unwrap_or(960.0).max(280.0);
+                    let target_h = saved.height.unwrap_or(700.0).max(64.0);
+                    let _ = w.set_size(tauri::LogicalSize::new(target_w, target_h));
+                    if let (Some(x), Some(y)) = (saved.x, saved.y) {
+                        let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+                    }
+                    if saved.maximized {
+                        let _ = w.maximize();
+                    }
+                }
+            }
+
             app.manage(AppState {
                 db: db_arc,
                 audio: Arc::new(AudioRecorder::new()),
                 supervisor: supervisor_arc,
                 app_data_dir,
+                is_mini: std::sync::atomic::AtomicBool::new(false),
             });
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                if let Some(state) = window.try_state::<AppState>() {
+                    save_current_window_state(
+                        &state.db,
+                        window,
+                        state.is_mini.load(std::sync::atomic::Ordering::SeqCst),
+                    );
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             start_recording,
@@ -405,7 +629,14 @@ pub fn run() {
             set_always_on_top,
             start_drag,
             minimize_window,
-            close_window
+            close_window,
+            get_llm_config,
+            save_llm_config,
+            fetch_llm_models,
+            transform_with_llm,
+            open_presets_folder,
+            delete_preset_markdown,
+            restore_presets_defaults
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

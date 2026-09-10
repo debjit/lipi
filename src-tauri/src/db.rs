@@ -24,6 +24,7 @@ pub struct AppSettings {
     pub local_model_size: String,
     pub models_folder: String,
     pub model_idle_timeout_mins: u32,
+    pub request_timeout_secs: u32,
 }
 
 impl Default for AppSettings {
@@ -40,8 +41,20 @@ impl Default for AppSettings {
             local_model_size: "base".into(),
             models_folder: String::new(),
             model_idle_timeout_mins: 10,
+            request_timeout_secs: 180,
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct WindowState {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    pub maximized: bool,
+    pub mini_x: Option<f64>,
+    pub mini_y: Option<f64>,
 }
 
 pub struct Database {
@@ -157,6 +170,7 @@ impl Database {
             local_model_size: get_val("local_model_size").unwrap_or_else(|| "base".into()),
             models_folder: get_val("models_folder").unwrap_or_default(),
             model_idle_timeout_mins: get_val("model_idle_timeout_mins").and_then(|v| v.parse().ok()).unwrap_or(10),
+            request_timeout_secs: get_val("request_timeout_secs").and_then(|v| v.parse().ok()).unwrap_or(180).max(180),
         })
     }
 
@@ -181,6 +195,25 @@ impl Database {
         set_val("local_model_size", &settings.local_model_size).map_err(|e| e.to_string())?;
         set_val("models_folder", &settings.models_folder).map_err(|e| e.to_string())?;
         set_val("model_idle_timeout_mins", &settings.model_idle_timeout_mins.to_string()).map_err(|e| e.to_string())?;
+        set_val("request_timeout_secs", &settings.request_timeout_secs.max(180).to_string()).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_window_state(&self) -> Option<WindowState> {
+        let conn = self.conn.lock().ok()?;
+        let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = 'window_state'").ok()?;
+        let val: String = stmt.query_row([], |r| r.get(0)).ok()?;
+        serde_json::from_str(&val).ok()
+    }
+
+    pub fn save_window_state(&self, state: &WindowState) -> Result<(), String> {
+        let json = serde_json::to_string(state).map_err(|e| e.to_string())?;
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('window_state', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1",
+            params![json],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 }
@@ -232,6 +265,7 @@ mod tests {
             local_model_size: "tiny".into(),
             models_folder: "/external/models".into(),
             model_idle_timeout_mins: 5,
+            request_timeout_secs: 240,
         };
         db.save_settings(&new_settings).unwrap();
         let loaded = db.get_settings().unwrap();
@@ -246,6 +280,7 @@ mod tests {
         assert_eq!(loaded.local_model_size, "tiny");
         assert_eq!(loaded.models_folder, "/external/models");
         assert_eq!(loaded.model_idle_timeout_mins, 5);
+        assert_eq!(loaded.request_timeout_secs, 240);
     }
 
     #[test]
@@ -278,6 +313,32 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_window_state_persistence() {
+        let db = Database::new(":memory:").unwrap();
+        assert!(db.get_window_state().is_none());
+
+        let state = WindowState {
+            x: Some(150.0),
+            y: Some(250.0),
+            width: Some(1024.0),
+            height: Some(768.0),
+            maximized: false,
+            mini_x: Some(30.0),
+            mini_y: Some(60.0),
+        };
+
+        db.save_window_state(&state).unwrap();
+        let loaded = db.get_window_state().unwrap();
+        assert_eq!(loaded.x, Some(150.0));
+        assert_eq!(loaded.y, Some(250.0));
+        assert_eq!(loaded.width, Some(1024.0));
+        assert_eq!(loaded.height, Some(768.0));
+        assert_eq!(loaded.maximized, false);
+        assert_eq!(loaded.mini_x, Some(30.0));
+        assert_eq!(loaded.mini_y, Some(60.0));
     }
 }
 

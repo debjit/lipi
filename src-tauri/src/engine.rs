@@ -373,7 +373,7 @@ server.serve_forever()
         match self.ensure_loaded(engine, model_size, app_data_dir, custom_models_dir).await {
             Ok(port) => {
                 let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(120))
+                    .timeout(std::time::Duration::from_secs(180))
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new());
 

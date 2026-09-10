@@ -1,0 +1,309 @@
+use serde_json::Value;
+
+pub fn resolve_system_prompt(preset: &str, custom_prompt: &str) -> String {
+    match preset {
+        "professional" => {
+            "You are an executive communications editor. Rewrite the transcribed speech text into clear, polished, professional business language while preserving all original facts and substance. Do not add commentary, pleasantries, or introductory remarks. Output ONLY the rewritten text.".to_string()
+        }
+        "casual" => {
+            "Rewrite the transcribed speech text into a friendly, relaxed, conversational tone. Smooth out awkward spoken hesitations while keeping the speaker's personality. Do not add commentary or pleasantries. Output ONLY the rewritten text.".to_string()
+        }
+        "concise" => {
+            "Condense the transcribed speech text into a punchy, high-impact summary. Eliminate filler words, redundancies, and rambling. Do not add commentary. Output ONLY the concise text.".to_string()
+        }
+        "bullets" => {
+            "Extract the core points, key details, and action items from the transcribed speech text into a structured Markdown bullet list. Do not add commentary. Output ONLY the bullet points.".to_string()
+        }
+        "custom" => {
+            if custom_prompt.trim().is_empty() {
+                "You are an editor. Improve the following text. Do not add commentary. Output ONLY the improved text.".to_string()
+            } else {
+                custom_prompt.trim().to_string()
+            }
+        }
+        _ => {
+            // Default: grammar_fix
+            "You are an expert copyeditor. Fix all grammatical mistakes, spelling errors, punctuation mistakes, and typos in the transcribed speech text. Strictly preserve the original tone, vocabulary, and meaning. Do not add any conversational remarks, explanations, or quotes. Output ONLY the corrected text.".to_string()
+        }
+    }
+}
+
+pub fn get_curated_fallback_models(base_url: &str) -> Vec<String> {
+    if base_url.contains("cloudflare.com") {
+        vec![
+            "@cf/meta/llama-3.1-8b-instruct".into(),
+            "@cf/meta/llama-3.3-70b-instruct-fp8-fast".into(),
+            "@cf/qwen/qwen2.5-7b-instruct".into(),
+            "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b".into(),
+        ]
+    } else if base_url.contains("groq.com") {
+        vec![
+            "llama-3.3-70b-versatile".into(),
+            "llama-3.1-8b-instant".into(),
+            "mixtral-8x7b-32768".into(),
+        ]
+    } else if base_url.contains("openai.com") {
+        vec![
+            "gpt-4o-mini".into(),
+            "gpt-4o".into(),
+            "gpt-3.5-turbo".into(),
+        ]
+    } else {
+        vec![
+            "llama3.2".into(),
+            "llama3.1".into(),
+            "mistral".into(),
+            "qwen2.5".into(),
+        ]
+    }
+}
+
+pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("Endpoint base URL is empty".into());
+    }
+
+    let url = if trimmed.ends_with("/models") {
+        trimmed.to_string()
+    } else {
+        format!("{}/models", trimmed)
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = client.get(&url);
+    let trimmed_key = api_key.trim();
+    if !trimmed_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", trimmed_key));
+    }
+
+    let resp = req.send().await;
+    match resp {
+        Ok(res) if res.status().is_success() => {
+            let body_text = res.text().await.unwrap_or_default();
+            let mut model_names = Vec::new();
+
+            if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
+                // 1. OpenAI standard: {"data": [{"id": "model-name"}, ...]}
+                if let Some(data_arr) = json.get("data").and_then(|d| d.as_array()) {
+                    for item in data_arr {
+                        if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                            model_names.push(id.to_string());
+                        }
+                    }
+                }
+
+                // 2. Cloudflare / alternative format: {"result": [{"name": "model-name"}, ...]}
+                if model_names.is_empty() {
+                    if let Some(res_arr) = json.get("result").and_then(|r| r.as_array()) {
+                        for item in res_arr {
+                            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                                model_names.push(name.to_string());
+                            } else if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                                model_names.push(id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !model_names.is_empty() {
+                model_names.sort();
+                return Ok(model_names);
+            }
+
+            // Fallback to curated if returned empty list
+            Ok(get_curated_fallback_models(base_url))
+        }
+        _ => {
+            // If fetching /models endpoint is not supported by this server or auth failed,
+            // provide curated list rather than hard erroring
+            Ok(get_curated_fallback_models(base_url))
+        }
+    }
+}
+
+pub async fn transform_text_with_prompt(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    user_text: &str,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let trimmed_text = user_text.trim();
+    if trimmed_text.is_empty() {
+        return Err("No text provided to transform".into());
+    }
+
+    let trimmed_base = base_url.trim().trim_end_matches('/');
+    if trimmed_base.is_empty() {
+        return Err("LLM endpoint URL is missing. Check your settings.".into());
+    }
+
+    let endpoint = if trimmed_base.ends_with("/chat/completions") {
+        trimmed_base.to_string()
+    } else {
+        format!("{}/chat/completions", trimmed_base)
+    };
+
+    let model_to_use = if model.trim().is_empty() {
+        if trimmed_base.contains("cloudflare.com") {
+            "@cf/meta/llama-3.1-8b-instruct"
+        } else if trimmed_base.contains("groq.com") {
+            "llama-3.3-70b-versatile"
+        } else {
+            "gpt-4o-mini"
+        }
+    } else {
+        model.trim()
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs.max(180)))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let payload = serde_json::json!({
+        "model": model_to_use,
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": trimmed_text }
+        ],
+        "temperature": 0.2
+    });
+
+    let mut req = client.post(&endpoint).json(&payload);
+    let trimmed_key = api_key.trim();
+    if !trimmed_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", trimmed_key));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("LLM request failed to {}: {}", endpoint, e))?;
+
+    let status = resp.status();
+    let body_text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed reading response: {}", e))?;
+
+    if !status.is_success() {
+        let err_msg = if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
+            if let Some(msg) = json
+                .get("error")
+                .and_then(|e| e.get("message").or(Some(e)))
+                .and_then(|m| m.as_str())
+            {
+                msg.to_string()
+            } else if let Some(msg) = json
+                .get("errors")
+                .and_then(|e| e.as_array())
+                .and_then(|a| a.first())
+                .and_then(|o| o.get("message"))
+                .and_then(|m| m.as_str())
+            {
+                msg.to_string()
+            } else {
+                body_text.clone()
+            }
+        } else {
+            body_text.clone()
+        };
+
+        return Err(format!("LLM Error (HTTP {}): {}", status.as_u16(), err_msg));
+    }
+
+    if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
+        // Standard OpenAI choices[0].message.content
+        if let Some(content) = json
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("message"))
+            .and_then(|msg| msg.get("content"))
+            .and_then(|c| c.as_str())
+        {
+            return Ok(clean_llm_response(content));
+        }
+
+        // Direct Cloudflare Workers AI fallback format: {"result": {"response": "..."}}
+        if let Some(resp_text) = json
+            .get("result")
+            .and_then(|r| r.get("response"))
+            .and_then(|t| t.as_str())
+        {
+            return Ok(clean_llm_response(resp_text));
+        }
+    }
+
+    Ok(clean_llm_response(&body_text))
+}
+
+fn clean_llm_response(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Strip wrapping markdown code blocks if the model erroneously added them
+    if trimmed.starts_with("```") && trimmed.ends_with("```") {
+        let lines: Vec<&str> = trimmed.lines().collect();
+        if lines.len() >= 2 {
+            let inner = lines[1..lines.len() - 1].join("\n");
+            return inner.trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+#[allow(dead_code)]
+pub async fn transform_text(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    preset: &str,
+    custom_prompt: &str,
+    user_text: &str,
+) -> Result<String, String> {
+    let system_prompt = resolve_system_prompt(preset, custom_prompt);
+    transform_text_with_prompt(base_url, api_key, model, &system_prompt, user_text, 180).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prompts() {
+        assert!(resolve_system_prompt("grammar_fix", "").contains("copyeditor"));
+        assert!(resolve_system_prompt("professional", "").contains("business"));
+        assert!(resolve_system_prompt("casual", "").contains("conversational"));
+        assert!(resolve_system_prompt("concise", "").contains("Condense"));
+        assert!(resolve_system_prompt("bullets", "").contains("bullet"));
+        assert_eq!(
+            resolve_system_prompt("custom", "Make it a poem"),
+            "Make it a poem"
+        );
+    }
+
+    #[test]
+    fn test_clean_response() {
+        assert_eq!(clean_llm_response("Hello world"), "Hello world");
+        assert_eq!(
+            clean_llm_response("```markdown\nHello world\n```"),
+            "Hello world"
+        );
+    }
+
+    #[test]
+    fn test_fallback_models() {
+        let cf = get_curated_fallback_models("https://api.cloudflare.com/client/v4/accounts/1/ai/v1");
+        assert!(cf.iter().any(|m| m.contains("llama-3.1")));
+
+        let groq = get_curated_fallback_models("https://api.groq.com/openai/v1");
+        assert!(groq.iter().any(|m| m.contains("llama-3.3")));
+    }
+}
