@@ -21,7 +21,7 @@ pub fn sanitize_id(id: &str) -> String {
 pub struct LlmProvider {
     pub id: String,
     pub name: String,
-    pub provider_type: String, // "cloudflare" | "groq" | "openai" | "custom"
+    pub provider_type: String, // "cloudflare" | "groq" | "openai" | "ollama" | "custom"
     pub api_key: String,
     pub account_id: String,
     pub base_url: String,
@@ -40,6 +40,7 @@ impl LlmProvider {
             }
             "groq" => "https://api.groq.com/openai/v1".to_string(),
             "openai" => "https://api.openai.com/v1".to_string(),
+            "ollama" => "http://localhost:11434/v1".to_string(),
             _ => "http://localhost:8000/v1".to_string(),
         }
     }
@@ -100,6 +101,14 @@ impl Default for LlmSettings {
                     api_key: String::new(),
                     account_id: String::new(),
                     base_url: "https://api.groq.com/openai/v1".into(),
+                },
+                LlmProvider {
+                    id: "OLLAMA_DEFAULT".into(),
+                    name: "Ollama (Local)".into(),
+                    provider_type: "ollama".into(),
+                    api_key: String::new(),
+                    account_id: String::new(),
+                    base_url: "http://localhost:11434/v1".into(),
                 },
             ],
             presets: default_prompt_presets(),
@@ -192,6 +201,8 @@ pub fn load_llm_settings(app_data_dir: &Path) -> LlmSettings {
                     "groq".into()
                 } else if pid.contains("OPENAI") {
                     "openai".into()
+                } else if pid.contains("OLLAMA") {
+                    "ollama".into()
                 } else {
                     "custom".into()
                 }
@@ -204,6 +215,8 @@ pub fn load_llm_settings(app_data_dir: &Path) -> LlmSettings {
                     "Groq Cloud".into()
                 } else if provider_type == "openai" {
                     "OpenAI".into()
+                } else if provider_type == "ollama" {
+                    "Ollama (Local)".into()
                 } else {
                     format!("Provider {}", pid)
                 }

@@ -29,7 +29,7 @@ interface AppSettings {
 interface LlmProvider {
   id: string;
   name: string;
-  provider_type: "cloudflare" | "groq" | "openai" | "custom";
+  provider_type: "cloudflare" | "groq" | "openai" | "ollama" | "custom";
   api_key: string;
   account_id: string;
   base_url: string;
@@ -299,6 +299,14 @@ export default function App() {
         api_key: "",
         account_id: "",
         base_url: "https://api.groq.com/openai/v1",
+      },
+      {
+        id: "OLLAMA_DEFAULT",
+        name: "Ollama (Local)",
+        provider_type: "ollama",
+        api_key: "",
+        account_id: "",
+        base_url: "http://localhost:11434/v1",
       },
     ],
     presets: DEFAULT_PRESETS,
@@ -797,7 +805,7 @@ export default function App() {
     updateAndSaveLlmSettings({ providers: updated });
   }
 
-  function handleAddProvider(type: "cloudflare" | "groq" | "openai" | "custom") {
+  function handleAddProvider(type: "cloudflare" | "groq" | "openai" | "ollama" | "custom") {
     const rand = Math.floor(1000 + Math.random() * 9000);
     const newId =
       type === "cloudflare"
@@ -806,6 +814,8 @@ export default function App() {
         ? `GROQ_${rand}`
         : type === "openai"
         ? `OPENAI_${rand}`
+        : type === "ollama"
+        ? `OLLAMA_${rand}`
         : `CUSTOM_${rand}`;
 
     const newName =
@@ -815,6 +825,8 @@ export default function App() {
         ? `Groq Cloud ${rand}`
         : type === "openai"
         ? `OpenAI ${rand}`
+        : type === "ollama"
+        ? `Ollama Local ${rand}`
         : `Custom Provider ${rand}`;
 
     const newProvider: LlmProvider = {
@@ -828,8 +840,10 @@ export default function App() {
           ? "https://api.groq.com/openai/v1"
           : type === "openai"
           ? "https://api.openai.com/v1"
-          : type === "custom"
+          : type === "ollama"
           ? "http://localhost:11434/v1"
+          : type === "custom"
+          ? "http://localhost:8000/v1"
           : "",
     };
 
@@ -841,10 +855,27 @@ export default function App() {
     setEditingProviderId(newId);
   }
 
+  function hasCustomProviderInfo(p: LlmProvider): boolean {
+    if (p.api_key?.trim() || p.account_id?.trim()) return true;
+    const url = p.base_url?.trim() || "";
+    if (!url) return false;
+    if (p.provider_type === "groq" && url === "https://api.groq.com/openai/v1") return false;
+    if (p.provider_type === "openai" && url === "https://api.openai.com/v1") return false;
+    if (p.provider_type === "ollama" && url === "http://localhost:11434/v1") return false;
+    return true;
+  }
+
   function handleDeleteProvider(id: string) {
     if (llmSettingsRef.current.providers.length <= 1) {
       showToast("Cannot delete the only configured provider");
       return;
+    }
+    const target = llmSettingsRef.current.providers.find((p) => p.id === id);
+    if (target && hasCustomProviderInfo(target)) {
+      const ok = window.confirm(
+        `Delete provider "${target.name}"?\n\nThis provider has saved credentials or custom configuration.`
+      );
+      if (!ok) return;
     }
     const filtered = llmSettingsRef.current.providers.filter((p) => p.id !== id);
     const nextActive =
@@ -2136,8 +2167,16 @@ export default function App() {
                           <button
                             type="button"
                             className="btn btn-secondary btn-sm"
+                            onClick={() => handleAddProvider("ollama")}
+                            title="Add a local Ollama API endpoint (runs small models locally)"
+                          >
+                            + Ollama
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
                             onClick={() => handleAddProvider("custom")}
-                            title="Add a Custom / Local Ollama / vLLM endpoint"
+                            title="Add a Custom / Local vLLM or API endpoint"
                           >
                             + Custom
                           </button>
@@ -2156,7 +2195,15 @@ export default function App() {
                             >
                               <div className="llm-provider-info">
                                 <span className="llm-provider-icon">
-                                  {p.provider_type === "cloudflare" ? "☁" : p.provider_type === "groq" ? "⚡" : p.provider_type === "openai" ? "🤖" : "⚙"}
+                                  {p.provider_type === "cloudflare"
+                                    ? "☁"
+                                    : p.provider_type === "groq"
+                                    ? "⚡"
+                                    : p.provider_type === "openai"
+                                    ? "🤖"
+                                    : p.provider_type === "ollama"
+                                    ? "🦙"
+                                    : "⚙"}
                                 </span>
                                 <div>
                                   <div className="llm-provider-name">{p.name}</div>
@@ -2316,6 +2363,34 @@ export default function App() {
                             </div>
                           )}
 
+                          {cur.provider_type === "ollama" && (
+                            <>
+                              <div className="form-group">
+                                <label className="form-label">Ollama API Base URL</label>
+                                <input
+                                  type="text"
+                                  className="form-input"
+                                  placeholder="http://localhost:11434/v1"
+                                  value={cur.base_url || "http://localhost:11434/v1"}
+                                  onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
+                                />
+                                <span className="form-hint">
+                                  Runs locally via Ollama API. Make sure Ollama is running (<code>ollama serve</code>). Best for small local LLMs. No API key needed.
+                                </span>
+                              </div>
+                              <div className="form-group">
+                                <label className="form-label">API Key / Token (Optional)</label>
+                                <input
+                                  type="password"
+                                  className="form-input"
+                                  placeholder="Optional (not required for local Ollama)"
+                                  value={cur.api_key}
+                                  onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                                />
+                              </div>
+                            </>
+                          )}
+
                           {cur.provider_type === "custom" && (
                             <>
                               <div className="form-group">
@@ -2363,7 +2438,7 @@ export default function App() {
                         <input
                           type="text"
                           className="form-input"
-                          placeholder="@cf/meta/llama-3.1-8b-instruct or llama-3.3-70b-versatile"
+                          placeholder="llama3.2, @cf/meta/llama-3.1-8b-instruct, or gpt-4o-mini"
                           value={llmSettings.model}
                           onChange={(e) => updateAndSaveLlmSettings({ model: e.target.value })}
                           list="available-models-list"
@@ -2378,24 +2453,42 @@ export default function App() {
                       </div>
 
                       <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
-                        {(editingProviderId.includes("cloudflare")
-                          ? [
+                        {(() => {
+                          const cur = llmSettings.providers.find((p) => p.id === editingProviderId) || llmSettings.providers[0];
+                          const isOllama = cur?.provider_type === "ollama" || editingProviderId.toLowerCase().includes("ollama");
+                          const isCf = cur?.provider_type === "cloudflare" || editingProviderId.toLowerCase().includes("cloudflare");
+                          const isGroq = cur?.provider_type === "groq" || editingProviderId.toLowerCase().includes("groq");
+
+                          if (isOllama) {
+                            return [
+                              { id: "llama3.2", label: "Llama 3.2 (3B)" },
+                              { id: "llama3.2:1b", label: "Llama 3.2 1B (Ultra-Light)" },
+                              { id: "qwen2.5:3b", label: "Qwen 2.5 3B" },
+                              { id: "qwen2.5:7b", label: "Qwen 2.5 7B" },
+                              { id: "phi3:mini", label: "Phi-3 Mini" },
+                              { id: "mistral", label: "Mistral 7B" },
+                            ];
+                          }
+                          if (isCf) {
+                            return [
                               { id: "@cf/meta/llama-3.1-8b-instruct", label: "Llama 3.1 8B (Fast)" },
                               { id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", label: "Llama 3.3 70B (Quality)" },
                               { id: "@cf/qwen/qwen2.5-7b-instruct", label: "Qwen 2.5 7B" },
                               { id: "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", label: "DeepSeek R1 32B" },
-                            ]
-                          : editingProviderId.includes("groq")
-                          ? [
+                            ];
+                          }
+                          if (isGroq) {
+                            return [
                               { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B (Fast)" },
                               { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B (Instant)" },
                               { id: "mixtral-8x7b-32768", label: "Mixtral 8x7B" },
-                            ]
-                          : [
-                              { id: "gpt-4o-mini", label: "GPT-4o Mini" },
-                              { id: "gpt-4o", label: "GPT-4o" },
-                            ]
-                        ).map((item) => (
+                            ];
+                          }
+                          return [
+                            { id: "gpt-4o-mini", label: "GPT-4o Mini" },
+                            { id: "gpt-4o", label: "GPT-4o" },
+                          ];
+                        })().map((item) => (
                           <button
                             key={item.id}
                             type="button"

@@ -28,6 +28,19 @@ pub fn resolve_system_prompt(preset: &str, custom_prompt: &str) -> String {
     }
 }
 
+pub fn normalize_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if (trimmed.contains(":11434") || trimmed.to_lowercase().contains("ollama"))
+        && !trimmed.ends_with("/v1")
+        && !trimmed.ends_with("/chat/completions")
+        && !trimmed.ends_with("/models")
+    {
+        format!("{}/v1", trimmed)
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub fn get_curated_fallback_models(base_url: &str) -> Vec<String> {
     if base_url.contains("cloudflare.com") {
         vec![
@@ -48,6 +61,15 @@ pub fn get_curated_fallback_models(base_url: &str) -> Vec<String> {
             "gpt-4o".into(),
             "gpt-3.5-turbo".into(),
         ]
+    } else if base_url.contains(":11434") || base_url.to_lowercase().contains("ollama") {
+        vec![
+            "llama3.2".into(),
+            "llama3.2:1b".into(),
+            "qwen2.5:3b".into(),
+            "qwen2.5:7b".into(),
+            "phi3:mini".into(),
+            "mistral".into(),
+        ]
     } else {
         vec![
             "llama3.2".into(),
@@ -59,7 +81,8 @@ pub fn get_curated_fallback_models(base_url: &str) -> Vec<String> {
 }
 
 pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
-    let trimmed = base_url.trim().trim_end_matches('/');
+    let normalized = normalize_base_url(base_url);
+    let trimmed = normalized.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err("Endpoint base URL is empty".into());
     }
@@ -109,6 +132,19 @@ pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, 
                         }
                     }
                 }
+
+                // 3. Ollama native tags format: {"models": [{"name": "model-name"}, ...]}
+                if model_names.is_empty() {
+                    if let Some(models_arr) = json.get("models").and_then(|m| m.as_array()) {
+                        for item in models_arr {
+                            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                                model_names.push(name.to_string());
+                            } else if let Some(m) = item.get("model").and_then(|m| m.as_str()) {
+                                model_names.push(m.to_string());
+                            }
+                        }
+                    }
+                }
             }
 
             if !model_names.is_empty() {
@@ -120,6 +156,34 @@ pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, 
             Ok(get_curated_fallback_models(base_url))
         }
         _ => {
+            // Secondary attempt for Ollama if /models failed: try native /api/tags
+            if (trimmed.contains(":11434") || trimmed.to_lowercase().contains("ollama"))
+                && !url.contains("/api/tags")
+            {
+                let root = trimmed.trim_end_matches("/v1");
+                let tags_url = format!("{}/api/tags", root);
+                if let Ok(res) = client.get(&tags_url).send().await {
+                    if res.status().is_success() {
+                        if let Ok(body_text) = res.text().await {
+                            if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
+                                let mut names = Vec::new();
+                                if let Some(arr) = json.get("models").and_then(|m| m.as_array()) {
+                                    for item in arr {
+                                        if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                                            names.push(name.to_string());
+                                        }
+                                    }
+                                }
+                                if !names.is_empty() {
+                                    names.sort();
+                                    return Ok(names);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // If fetching /models endpoint is not supported by this server or auth failed,
             // provide curated list rather than hard erroring
             Ok(get_curated_fallback_models(base_url))
@@ -140,7 +204,8 @@ pub async fn transform_text_with_prompt(
         return Err("No text provided to transform".into());
     }
 
-    let trimmed_base = base_url.trim().trim_end_matches('/');
+    let normalized_base = normalize_base_url(base_url);
+    let trimmed_base = normalized_base.trim().trim_end_matches('/');
     if trimmed_base.is_empty() {
         return Err("LLM endpoint URL is missing. Check your settings.".into());
     }
@@ -156,6 +221,8 @@ pub async fn transform_text_with_prompt(
             "@cf/meta/llama-3.1-8b-instruct"
         } else if trimmed_base.contains("groq.com") {
             "llama-3.3-70b-versatile"
+        } else if trimmed_base.contains(":11434") || trimmed_base.to_lowercase().contains("ollama") {
+            "llama3.2"
         } else {
             "gpt-4o-mini"
         }
@@ -174,7 +241,8 @@ pub async fn transform_text_with_prompt(
             { "role": "system", "content": system_prompt },
             { "role": "user", "content": trimmed_text }
         ],
-        "temperature": 0.2
+        "temperature": 0.2,
+        "stream": false
     });
 
     let mut req = client.post(&endpoint).json(&payload);
@@ -305,5 +373,29 @@ mod tests {
 
         let groq = get_curated_fallback_models("https://api.groq.com/openai/v1");
         assert!(groq.iter().any(|m| m.contains("llama-3.3")));
+
+        let ollama = get_curated_fallback_models("http://localhost:11434/v1");
+        assert!(ollama.iter().any(|m| m == "llama3.2"));
+        assert!(ollama.iter().any(|m| m == "llama3.2:1b"));
+    }
+
+    #[test]
+    fn test_normalize_base_url() {
+        assert_eq!(
+            normalize_base_url("http://localhost:11434"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            normalize_base_url("http://localhost:11434/v1"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            normalize_base_url("http://127.0.0.1:11434/"),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.groq.com/openai/v1"),
+            "https://api.groq.com/openai/v1"
+        );
     }
 }
