@@ -200,7 +200,7 @@ pub async fn transform_text_with_prompt(
     system_prompt: &str,
     user_text: &str,
     timeout_secs: u64,
-) -> Result<String, String> {
+) -> Result<(String, u32, u32), String> {
     let trimmed_text = user_text.trim();
     if trimmed_text.is_empty() {
         return Err("No text provided to transform".into());
@@ -290,7 +290,16 @@ pub async fn transform_text_with_prompt(
         return Err(format!("LLM Error (HTTP {}): {}", status.as_u16(), err_msg));
     }
 
+    let mut prompt_tokens = 0u32;
+    let mut completion_tokens = 0u32;
+    let mut response_content: Option<String> = None;
+
     if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
+        if let Some(usage) = json.get("usage") {
+            prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        }
+
         // Standard OpenAI choices[0].message.content
         if let Some(content) = json
             .get("choices")
@@ -300,20 +309,27 @@ pub async fn transform_text_with_prompt(
             .and_then(|msg| msg.get("content"))
             .and_then(|c| c.as_str())
         {
-            return Ok(clean_llm_response(content));
-        }
-
-        // Direct Cloudflare Workers AI fallback format: {"result": {"response": "..."}}
-        if let Some(resp_text) = json
+            response_content = Some(clean_llm_response(content));
+        } else if let Some(resp_text) = json
             .get("result")
             .and_then(|r| r.get("response"))
             .and_then(|t| t.as_str())
         {
-            return Ok(clean_llm_response(resp_text));
+            // Direct Cloudflare Workers AI fallback format: {"result": {"response": "..."}}
+            response_content = Some(clean_llm_response(resp_text));
         }
     }
 
-    Ok(clean_llm_response(&body_text))
+    let final_text = response_content.unwrap_or_else(|| clean_llm_response(&body_text));
+
+    if prompt_tokens == 0 {
+        prompt_tokens = (system_prompt.len() + trimmed_text.len()).div_ceil(4) as u32;
+    }
+    if completion_tokens == 0 {
+        completion_tokens = final_text.len().div_ceil(4) as u32;
+    }
+
+    Ok((final_text, prompt_tokens, completion_tokens))
 }
 
 fn clean_llm_response(raw: &str) -> String {
@@ -339,7 +355,9 @@ pub async fn transform_text(
     user_text: &str,
 ) -> Result<String, String> {
     let system_prompt = resolve_system_prompt(preset, custom_prompt);
-    transform_text_with_prompt(base_url, api_key, model, &system_prompt, user_text, 180).await
+    transform_text_with_prompt(base_url, api_key, model, &system_prompt, user_text, 180)
+        .await
+        .map(|(t, _, _)| t)
 }
 
 #[cfg(test)]

@@ -25,6 +25,7 @@ interface AppSettings {
   models_folder?: string;
   model_idle_timeout_mins?: number;
   request_timeout_secs?: number;
+  mini_record_mode?: "new_note" | "append";
 }
 
 interface LlmProvider {
@@ -77,21 +78,72 @@ interface ModelMemoryStatus {
   port?: number;
 }
 
+interface CloudflareUsagePeriod {
+  label: string;
+  total_neurons: number;
+  total_cost_usd: number;
+  asr_audio_secs: number;
+  asr_count: number;
+  llm_tokens: number;
+  llm_count: number;
+}
+
+interface OperationResult {
+  text: string;
+  cf_neurons?: number | null;
+  cf_cost?: number | null;
+}
+
+interface CloudflareUsageSummary {
+  today: CloudflareUsagePeriod;
+  current_month: CloudflareUsagePeriod;
+  all_time: CloudflareUsagePeriod;
+  monthly_history: CloudflareUsagePeriod[];
+}
+
+function formatNeurons(n: number): string {
+  if (!n || n <= 0) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  if (n % 1 !== 0) return n.toFixed(1);
+  return Math.round(n).toString();
+}
+
+function formatCostUsd(c: number): string {
+  if (!c || c <= 0) return "$0.00";
+  if (c < 0.0001) return "<$0.0001";
+  if (c < 0.01) return `$${c.toFixed(4)}`;
+  return `$${c.toFixed(2)}`;
+}
+
+function formatDurationSecs(secs: number): string {
+  const s = Math.round(secs);
+  const mins = Math.floor(s / 60);
+  const remSecs = s % 60;
+  if (mins === 0) return `${remSecs}s`;
+  return `${mins}m ${remSecs}s`;
+}
+
 function getDisplayModelName(settings: AppSettings): string {
   if (settings.engine_mode === "local") {
+    // Strictly zero-cost / local offline
     return `Whisper (${settings.local_model_size})`;
   }
   const raw = (settings.model || "").trim();
-  if (!raw) return "whisper-1";
-  if (raw.startsWith("@cf/")) {
-    const parts = raw.split("/");
-    return parts[parts.length - 1] || raw;
+  let baseName = raw;
+  if (!baseName) baseName = "whisper-1";
+  else if (baseName.startsWith("@cf/")) {
+    const parts = baseName.split("/");
+    baseName = parts[parts.length - 1] || baseName;
+    if (baseName === "whisper-large-v3-turbo") {
+      baseName = "turbo";
+    }
+  } else if (baseName.includes("/") && !baseName.startsWith("http")) {
+    const parts = baseName.split("/");
+    baseName = parts[parts.length - 1] || baseName;
   }
-  if (raw.includes("/") && !raw.startsWith("http")) {
-    const parts = raw.split("/");
-    return parts[parts.length - 1] || raw;
-  }
-  return raw;
+
+  return baseName;
 }
 
 function deriveTitle(text: string): string {
@@ -257,6 +309,7 @@ export default function App() {
     models_folder: "",
     model_idle_timeout_mins: 10,
     request_timeout_secs: 180,
+    mini_record_mode: "new_note",
   });
 
   const activePreset = getActivePreset(settings.api_base_url);
@@ -406,6 +459,44 @@ export default function App() {
 
   const [settingsNavTab, setSettingsNavTab] = useState<"asr" | "llm" | "preferences" | "logs">("asr");
 
+  const [cfUsage, setCfUsage] = useState<CloudflareUsageSummary | null>(null);
+  const [loadingCfUsage, setLoadingCfUsage] = useState<boolean>(false);
+
+  const isCloudflareAsr = settings.engine_mode === "cloud" && settings.api_base_url.includes("api.cloudflare.com");
+  const activeLlmProvider = (llmSettings.providers || []).find((p) => p.id === llmSettings.active_provider_id);
+  const isCloudflareLlm = llmSettings.enabled && (
+    activeLlmProvider?.provider_type === "cloudflare" ||
+    (activeLlmProvider?.base_url || "").includes("cloudflare.com")
+  );
+  const isCloudflareActive = isCloudflareAsr || isCloudflareLlm;
+
+  async function loadCfUsage(): Promise<CloudflareUsageSummary | null> {
+    try {
+      setLoadingCfUsage(true);
+      const summary: CloudflareUsageSummary = await invoke("get_cf_usage_summary");
+      setCfUsage(summary);
+      return summary;
+    } catch (err) {
+      console.error("Failed to load Cloudflare usage summary:", err);
+      return null;
+    } finally {
+      setLoadingCfUsage(false);
+    }
+  }
+
+  async function handleClearCfUsage() {
+    if (!window.confirm("Are you sure you want to clear your local Cloudflare usage records? This cannot be undone.")) {
+      return;
+    }
+    try {
+      await invoke("clear_cf_usage_logs");
+      await loadCfUsage();
+      showToast("✓ Cloudflare usage history cleared");
+    } catch (err) {
+      showToast(`Failed to clear usage: ${err}`);
+    }
+  }
+
   const activeViewRef = useRef(activeView);
   activeViewRef.current = activeView;
 
@@ -432,6 +523,7 @@ export default function App() {
     loadNotes();
     loadSettings();
     loadLlmSettings();
+    loadCfUsage();
   }, []);
 
   useEffect(() => {
@@ -959,7 +1051,7 @@ export default function App() {
     setIsTransforming(true);
     setErrorMsg(null);
     try {
-      const transformed: string = await invoke("transform_with_llm", {
+      const res: OperationResult = await invoke("transform_with_llm", {
         text,
         providerId: llmSettingsRef.current.active_provider_id,
         model: llmSettingsRef.current.model,
@@ -967,18 +1059,48 @@ export default function App() {
         customPrompt: llmSettingsRef.current.custom_prompt || undefined,
       });
 
+      const transformed = (res && typeof res === "object" ? res.text : String(res || "")).trim();
+      const itemNeurons = res?.cf_neurons ?? null;
+      const itemCost = res?.cf_cost ?? null;
+
       setLlmResult(transformed);
 
       const activeId = activeIdRef.current;
       await persistNote(transformed, activeId);
+
+      await loadCfUsage();
+      const activeProvider = (llmSettingsRef.current.providers || []).find((p) => p.id === llmSettingsRef.current.active_provider_id);
+      const isCfLlm = llmSettingsRef.current.enabled && (
+        activeProvider?.provider_type === "cloudflare" ||
+        (activeProvider?.base_url || "").includes("cloudflare.com")
+      );
+      const isLocalLlm = activeProvider?.provider_type === "ollama" || (activeProvider?.base_url || "").includes("localhost") || (activeProvider?.base_url || "").includes("127.0.0.1");
+
+      let logMsg = `Transformed ${text.split(/\s+/).filter(Boolean).length} words -> ${transformed.split(/\s+/).filter(Boolean).length} words.`;
+      if (isCfLlm) {
+        if (itemNeurons !== null && itemNeurons !== undefined) {
+          logMsg += ` Consumed: ${formatNeurons(itemNeurons)} Ⓝ (${formatCostUsd(itemCost || 0)})`;
+        }
+      } else if (isLocalLlm) {
+        logMsg += ` (Local LLM - zero cost)`;
+      }
+
+      let logDetails = `Raw Input:\n${text}\n\nTransformed Output:\n${transformed}`;
+      if (isCfLlm) {
+        if (itemNeurons !== null && itemNeurons !== undefined) {
+          logDetails += `\n\nCloudflare LLM Consumed: ${formatNeurons(itemNeurons)} Neurons (~${formatCostUsd(itemCost || 0)})`;
+        }
+      } else if (isLocalLlm) {
+        logDetails += `\n\nLocal model inference - 100% offline, zero cloud cost.`;
+      }
 
       addLog({
         level: "success",
         title: "LLM Transformation Succeeded",
         engine: `LLM (${llmSettingsRef.current.voice_preset})`,
         model: llmSettingsRef.current.model,
-        message: `Transformed ${text.split(/\s+/).filter(Boolean).length} words -> ${transformed.split(/\s+/).filter(Boolean).length} words`,
-        details: `Raw Input:\n${text}\n\nTransformed Output:\n${transformed}`,
+        message: logMsg,
+        details: logDetails,
       });
 
       if (settingsRef.current.auto_copy) {
@@ -1035,6 +1157,7 @@ export default function App() {
     setSettingsNavTab(tab);
     loadSettings();
     loadLlmSettings();
+    loadCfUsage();
     refreshModelStatus();
     refreshMemoryStatus();
     setActiveView("settings");
@@ -1064,6 +1187,7 @@ export default function App() {
       const saved: Note = await invoke("save_note", { title, content: text });
       await loadNotes();
       setActiveNoteId(saved.id);
+      activeIdRef.current = saved.id;
       return saved.id;
     }
   }
@@ -1088,25 +1212,70 @@ export default function App() {
       setIsRecording(false);
       setIsTranscribing(true);
       try {
-        const transcript: string = await invoke("stop_recording_and_transcribe");
+        const res: OperationResult = await invoke("stop_recording_and_transcribe");
+        const transcript = (res && typeof res === "object" ? res.text : String(res || "")).trim();
+        const itemNeurons = res?.cf_neurons ?? null;
+        const itemCost = res?.cf_cost ?? null;
+
         if (transcript) {
+          const isMini = miniModeRef.current;
+          const shouldCreateNewNote = isMini && (settingsRef.current.mini_record_mode !== "append");
+          await loadCfUsage();
+
+          const isCfAsr = settingsRef.current.engine_mode === "cloud" && (settingsRef.current.api_base_url || "").includes("api.cloudflare.com");
+          const isLocalAsr = settingsRef.current.engine_mode === "local";
+          const isTinyEn = isCfAsr && (settingsRef.current.model || "").includes("tiny");
+
+          let asrMsg = `Transcribed ${transcript.trim().split(/\s+/).filter(Boolean).length} words.`;
+          if (isTinyEn) {
+            asrMsg += ` (whisper-tiny-en · Beta)`;
+          } else if (isCfAsr) {
+            if (itemNeurons !== null && itemNeurons !== undefined) {
+              asrMsg += ` Consumed: ${formatNeurons(itemNeurons)} Ⓝ (${formatCostUsd(itemCost || 0)})`;
+            }
+          } else if (isLocalAsr) {
+            asrMsg += ` (Local engine - zero cost)`;
+          }
+
+          let asrDetails = `Result: "${transcript.slice(0, 200)}${transcript.length > 200 ? "..." : ""}"`;
+          if (isTinyEn) {
+            asrDetails += `\n\nCloudflare Workers AI (whisper-tiny-en Beta · Fast) - zero neuron billing.`;
+          } else if (isCfAsr) {
+            if (itemNeurons !== null && itemNeurons !== undefined) {
+              asrDetails += `\n\nCloudflare ASR Consumed: ${formatNeurons(itemNeurons)} Neurons (~${formatCostUsd(itemCost || 0)})`;
+            }
+          } else if (isLocalAsr) {
+            asrDetails += `\n\nLocal engine (${settingsRef.current.local_engine}) - 100% offline, zero cloud cost.`;
+          }
+
           if (llmSettingsRef.current.enabled) {
-            // Dual-field multi-clip accumulation
-            const currentRaw = rawTranscriptRef.current;
-            const nextRaw = currentRaw ? `${currentRaw.trim()} ${transcript}` : transcript;
+            // Dual-field multi-clip accumulation or fresh item
+            let nextRaw: string;
+            let targetNoteId: number | null;
+
+            if (shouldCreateNewNote) {
+              nextRaw = transcript;
+              targetNoteId = null;
+              setLlmResult("");
+            } else {
+              const currentRaw = rawTranscriptRef.current;
+              nextRaw = currentRaw ? `${currentRaw.trim()} ${transcript}` : transcript;
+              targetNoteId = activeIdRef.current;
+            }
+
             setRawTranscript(nextRaw);
             rawTranscriptRef.current = nextRaw;
             setContent(nextRaw);
-            await persistNote(nextRaw, activeIdRef.current);
+            await persistNote(nextRaw, targetNoteId);
 
             addLog({
               level: "success",
               title: "Transcription Successful",
-              engine: settingsRef.current.engine_mode === "cloud" ? "Remote API" : `Local (${settingsRef.current.local_engine})`,
+              engine: settingsRef.current.engine_mode === "cloud" ? (isCfAsr ? "Cloudflare Workers AI" : "Remote API") : `Local (${settingsRef.current.local_engine})`,
               model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
               endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
-              message: `Transcribed ${transcript.trim().split(/\s+/).filter(Boolean).length} words.`,
-              details: `Result: "${transcript.slice(0, 200)}${transcript.length > 200 ? "..." : ""}"`,
+              message: asrMsg,
+              details: asrDetails,
             });
 
             if (llmSettingsRef.current.auto_mode) {
@@ -1119,22 +1288,33 @@ export default function App() {
               }
             }
           } else {
-            // Standard scratchpad behavior
-            const current = activeContentRef.current;
-            const nextContent = current ? `${current.trim()} ${transcript}` : transcript;
+            // Standard scratchpad behavior or fresh item
+            let nextContent: string;
+            let targetNoteId: number | null;
+
+            if (shouldCreateNewNote) {
+              nextContent = transcript;
+              targetNoteId = null;
+              setLlmResult("");
+            } else {
+              const current = activeContentRef.current;
+              nextContent = current ? `${current.trim()} ${transcript}` : transcript;
+              targetNoteId = activeIdRef.current;
+            }
+
             setContent(nextContent);
             setRawTranscript(nextContent);
             rawTranscriptRef.current = nextContent;
-            await persistNote(nextContent, activeIdRef.current);
+            await persistNote(nextContent, targetNoteId);
 
             addLog({
               level: "success",
               title: "Transcription Successful",
-              engine: settingsRef.current.engine_mode === "cloud" ? "Remote API" : `Local (${settingsRef.current.local_engine})`,
+              engine: settingsRef.current.engine_mode === "cloud" ? (isCfAsr ? "Cloudflare Workers AI" : "Remote API") : `Local (${settingsRef.current.local_engine})`,
               model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
               endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
-              message: `Transcribed ${transcript.trim().split(/\s+/).filter(Boolean).length} words.`,
-              details: `Result: "${transcript.slice(0, 200)}${transcript.length > 200 ? "..." : ""}"`,
+              message: asrMsg,
+              details: asrDetails,
             });
 
             if (settingsRef.current.auto_copy) {
@@ -1324,6 +1504,16 @@ export default function App() {
         >
           {isRecording ? "■" : isTranscribing ? "…" : copiedNotification ? "✓" : "●"}
         </button>
+
+        {isRecording && (
+          <span
+            className="mini-elapsed-pill"
+            onMouseDown={(e) => e.stopPropagation()}
+            title={`Recording: ${formatTimer(recordSeconds)}`}
+          >
+            {formatTimer(recordSeconds)}
+          </span>
+        )}
 
         <button
           className="btn-mini-float"
@@ -1598,6 +1788,78 @@ export default function App() {
                       <span className="form-hint">
                         Found in Cloudflare Dashboard &rarr; Workers &amp; Pages overview (right sidebar). URL is added automatically.
                       </span>
+                      <div className="cf-usage-panel">
+                        <div className="cf-usage-panel-header">
+                          <div className="cf-usage-panel-title">
+                            <span>⚡</span>
+                            <span>Cloudflare Consumed Workers AI Usage</span>
+                          </div>
+                          <div className="cf-usage-reset-badge">
+                            Resets 00:00 UTC ({cfUsage?.today?.label || "Today"})
+                          </div>
+                        </div>
+
+                        <div className="cf-usage-panel-stats">
+                          <div className="cf-panel-stat-box">
+                            <span className="cf-panel-stat-label">Today's Consumed</span>
+                            <span className="cf-panel-stat-val">
+                              {formatNeurons(cfUsage?.today?.total_neurons ?? 0)}
+                              <span className="cf-panel-stat-sub"> Ⓝ</span>
+                            </span>
+                          </div>
+
+                          <div className="cf-panel-stat-box">
+                            <span className="cf-panel-stat-label">Consumed Cost</span>
+                            <span className="cf-panel-stat-val">
+                              {formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}
+                              <span className="cf-panel-stat-sub"> @ $0.011/1k</span>
+                            </span>
+                          </div>
+
+                          <div className="cf-panel-stat-box">
+                            <span className="cf-panel-stat-label">Today's Speech</span>
+                            <span className="cf-panel-stat-val">
+                              {formatDurationSecs(cfUsage?.today?.asr_audio_secs ?? 0)}
+                              <span className="cf-panel-stat-sub"> ({cfUsage?.today?.asr_count ?? 0} {cfUsage?.today?.asr_count === 1 ? "rec" : "recs"})</span>
+                            </span>
+                          </div>
+
+                          <div className="cf-panel-stat-box">
+                            <span className="cf-panel-stat-label">This Month Consumed</span>
+                            <span className="cf-panel-stat-val">
+                              {formatNeurons(cfUsage?.current_month?.total_neurons ?? 0)} Ⓝ
+                              <span className="cf-panel-stat-sub"> ({formatCostUsd(cfUsage?.current_month?.total_cost_usd ?? 0)})</span>
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="cf-usage-panel-footer">
+                          <span className="cf-panel-hint">
+                            Tracks Neurons consumed directly within Lipi (does not track external usage on your Cloudflare account). Cloudflare free tier resets at 00:00 UTC.
+                          </span>
+                          <div style={{ display: "flex", gap: "6px" }}>
+                            <button
+                              type="button"
+                              className="btn btn-secondary"
+                              style={{ fontSize: "11px", padding: "2px 8px" }}
+                              onClick={() => loadCfUsage()}
+                              disabled={loadingCfUsage}
+                              title="Refresh Cloudflare usage statistics"
+                            >
+                              🔄 Refresh
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-secondary"
+                              style={{ fontSize: "11px", padding: "2px 8px", color: "var(--text-danger, #ef4444)" }}
+                              onClick={handleClearCfUsage}
+                              title="Reset local Cloudflare usage tracking data"
+                            >
+                              🗑 Reset
+                            </button>
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   ) : (
                     <div className="form-group">
@@ -1651,9 +1913,9 @@ export default function App() {
                     {activePreset.id === "cloudflare" && (
                       <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
                         {[
-                          { id: "@cf/openai/whisper", label: "whisper (Standard)" },
-                          { id: "@cf/openai/whisper-large-v3-turbo", label: "large-v3-turbo (Accurate)" },
-                          { id: "@cf/openai/whisper-tiny-en", label: "tiny-en (Fast)" },
+                          { id: "@cf/openai/whisper", label: "whisper (Standard · ~41.1 Ⓝ/min)" },
+                          { id: "@cf/openai/whisper-large-v3-turbo", label: "large-v3-turbo (Turbo · ~46.6 Ⓝ/min)" },
+                          { id: "@cf/openai/whisper-tiny-en", label: "whisper-tiny-en (Beta · Fast)" },
                         ].map((item) => (
                           <button
                             key={item.id}
@@ -1674,7 +1936,7 @@ export default function App() {
                       {activePreset.id === "groq"
                         ? "Default: 'whisper-large-v3-turbo' (or 'whisper-large-v3')."
                         : activePreset.id === "cloudflare"
-                        ? "Supports: '@cf/openai/whisper', '@cf/openai/whisper-large-v3-turbo', '@cf/openai/whisper-tiny-en'."
+                        ? "Supports: '@cf/openai/whisper' ($0.0005/min), '@cf/openai/whisper-large-v3-turbo' ($0.0005/min), and '@cf/openai/whisper-tiny-en' (Beta · Fast)."
                         : "e.g. 'whisper-1' (OpenAI / local standard)."}
                     </span>
                   </div>
@@ -2369,6 +2631,78 @@ export default function App() {
                                   Needs <em>Workers AI: Read</em> permissions. Stored securely in local configuration.
                                 </span>
                               </div>
+                              <div className="cf-usage-panel" style={{ marginTop: "12px" }}>
+                                <div className="cf-usage-panel-header">
+                                  <div className="cf-usage-panel-title">
+                                    <span>⚡</span>
+                                    <span>Cloudflare Consumed Workers AI Usage</span>
+                                  </div>
+                                  <div className="cf-usage-reset-badge">
+                                    Resets 00:00 UTC ({cfUsage?.today?.label || "Today"})
+                                  </div>
+                                </div>
+
+                                <div className="cf-usage-panel-stats">
+                                  <div className="cf-panel-stat-box">
+                                    <span className="cf-panel-stat-label">Today's Consumed</span>
+                                    <span className="cf-panel-stat-val">
+                                      {formatNeurons(cfUsage?.today?.total_neurons ?? 0)}
+                                      <span className="cf-panel-stat-sub"> Ⓝ</span>
+                                    </span>
+                                  </div>
+
+                                  <div className="cf-panel-stat-box">
+                                    <span className="cf-panel-stat-label">Consumed Cost</span>
+                                    <span className="cf-panel-stat-val">
+                                      {formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}
+                                      <span className="cf-panel-stat-sub"> @ $0.011/1k</span>
+                                    </span>
+                                  </div>
+
+                                  <div className="cf-panel-stat-box">
+                                    <span className="cf-panel-stat-label">Today's LLM Tokens</span>
+                                    <span className="cf-panel-stat-val">
+                                      {(cfUsage?.today?.llm_tokens ?? 0).toLocaleString()}
+                                      <span className="cf-panel-stat-sub"> ({cfUsage?.today?.llm_count ?? 0} {cfUsage?.today?.llm_count === 1 ? "tx" : "txs"})</span>
+                                    </span>
+                                  </div>
+
+                                  <div className="cf-panel-stat-box">
+                                    <span className="cf-panel-stat-label">This Month Consumed</span>
+                                    <span className="cf-panel-stat-val">
+                                      {formatNeurons(cfUsage?.current_month?.total_neurons ?? 0)} Ⓝ
+                                      <span className="cf-panel-stat-sub"> ({formatCostUsd(cfUsage?.current_month?.total_cost_usd ?? 0)})</span>
+                                    </span>
+                                  </div>
+                                </div>
+
+                                <div className="cf-usage-panel-footer">
+                                  <span className="cf-panel-hint">
+                                    Tracks Neurons consumed directly within Lipi (does not track external usage on your Cloudflare account). Cloudflare free tier resets at 00:00 UTC.
+                                  </span>
+                                  <div style={{ display: "flex", gap: "6px" }}>
+                                    <button
+                                      type="button"
+                                      className="btn btn-secondary"
+                                      style={{ fontSize: "11px", padding: "2px 8px" }}
+                                      onClick={() => loadCfUsage()}
+                                      disabled={loadingCfUsage}
+                                      title="Refresh Cloudflare usage statistics"
+                                    >
+                                      🔄 Refresh
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="btn btn-secondary"
+                                      style={{ fontSize: "11px", padding: "2px 8px", color: "var(--text-danger, #ef4444)" }}
+                                      onClick={handleClearCfUsage}
+                                      title="Reset local Cloudflare usage tracking data"
+                                    >
+                                      🗑 Reset
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
                             </>
                           )}
 
@@ -2956,8 +3290,58 @@ export default function App() {
                     Prevents other windows from covering this app.
                   </span>
                 </div>
+
+                <div className="form-group" style={{ marginTop: "18px", paddingTop: "14px", borderTop: "1px solid var(--border)" }}>
+                  <label className="form-label" style={{ fontWeight: 600, display: "block", marginBottom: "8px" }}>
+                    Mini Wizard Recording Behavior
+                  </label>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                    <label className="radio-label" style={{ display: "flex", alignItems: "flex-start", gap: "10px", cursor: "pointer" }}>
+                      <input
+                        type="radio"
+                        name="mini_record_mode"
+                        value="new_note"
+                        checked={settings.mini_record_mode !== "append"}
+                        onChange={() => updateAndSaveSettings({ mini_record_mode: "new_note" })}
+                        style={{ marginTop: "3px" }}
+                      />
+                      <div>
+                        <span style={{ fontWeight: 500, color: "var(--text-primary)" }}>
+                          Create a new note for each recording (Default)
+                        </span>
+                        <div className="form-hint" style={{ marginTop: "2px" }}>
+                          Each recording finished in the Mini Wizard saves as an independent new note.
+                        </div>
+                      </div>
+                    </label>
+
+                    <label className="radio-label" style={{ display: "flex", alignItems: "flex-start", gap: "10px", cursor: "pointer" }}>
+                      <input
+                        type="radio"
+                        name="mini_record_mode"
+                        value="append"
+                        checked={settings.mini_record_mode === "append"}
+                        onChange={() => updateAndSaveSettings({ mini_record_mode: "append" })}
+                        style={{ marginTop: "3px" }}
+                      />
+                      <div>
+                        <span style={{ fontWeight: 500, color: "var(--text-primary)" }}>
+                          Append to current active note
+                        </span>
+                        <div className="form-hint" style={{ marginTop: "2px" }}>
+                          Appends transcribed speech onto the end of the currently selected note.
+                        </div>
+                      </div>
+                    </label>
+                  </div>
+                  <span className="form-hint" style={{ display: "block", marginTop: "10px", fontStyle: "italic" }}>
+                    Note: In full screen mode, recordings append to the active note by default, and you can create a fresh note anytime using the "New Note" button.
+                  </span>
+                </div>
               </div>
             )}
+
+
 
             {/* Section 4: Diagnostic & Activity Logs */}
             {settingsNavTab === "logs" && (
@@ -3201,6 +3585,8 @@ export default function App() {
                         {settings.always_on_top ? "ON" : "OFF"}
                       </span>
                     </button>
+
+
 
                     <div className="nav-overflow-divider" />
 
@@ -3504,18 +3890,35 @@ export default function App() {
                 title="Shortcut: Alt+R"
               >
                 {isRecording ? (
-                  <>■ <span className="btn-record-text">Stop ({formatTimer(recordSeconds)})</span></>
+                  <>■ <span className="btn-record-text">Stop</span></>
                 ) : isTranscribing ? (
                   <>⌛ <span className="btn-record-text">Processing...</span></>
                 ) : (
                   <>● <span className="btn-record-text">Record</span> <span className="btn-record-hint">[Alt+R]</span></>
                 )}
               </button>
+
+              {isRecording && (
+                <div className="record-elapsed-pill" title="Recording elapsed time">
+                  <span className="record-elapsed-dot pulse" />
+                  <span className="record-elapsed-time">{formatTimer(recordSeconds)}</span>
+                </div>
+              )}
             </div>
 
             <div className="bottom-right">
               <span className="stat-counter">
                 {wordCount} {wordCount === 1 ? "word" : "words"} · {content.length} chars
+                {isCloudflareActive && !settings.model?.includes("tiny") && (
+                  <span
+                    className="stat-counter-cf"
+                    onClick={() => openSettings("asr")}
+                    title={`Cloudflare Workers AI: Today consumed ${formatNeurons(cfUsage?.today?.total_neurons ?? 0)} Ⓝ (${formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}) in Lipi. Click to view settings.`}
+                    style={{ cursor: "pointer" }}
+                  >
+                    {" "}· {formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}
+                  </span>
+                )}
               </span>
             </div>
           </footer>

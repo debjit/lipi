@@ -9,8 +9,16 @@ mod transcribe;
 
 use audio::AudioRecorder;
 use db::{AppSettings, Database, Note};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::Manager;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OperationResult {
+    pub text: String,
+    pub cf_neurons: Option<f64>,
+    pub cf_cost: Option<f64>,
+}
 
 pub struct AppState {
     db: Arc<Database>,
@@ -33,7 +41,7 @@ fn is_recording(state: tauri::State<'_, AppState>) -> bool {
 #[tauri::command]
 async fn stop_recording_and_transcribe(
     state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
+) -> Result<OperationResult, String> {
     let wav_bytes = state.audio.stop()?;
     let settings = state.db.get_settings()?;
 
@@ -43,7 +51,7 @@ async fn stop_recording_and_transcribe(
         } else {
             Some(settings.models_folder.as_str())
         };
-        return state
+        let text = state
             .supervisor
             .transcribe(
                 wav_bytes,
@@ -53,7 +61,12 @@ async fn stop_recording_and_transcribe(
                 &state.app_data_dir,
                 custom_dir,
             )
-            .await;
+            .await?;
+        return Ok(OperationResult {
+            text,
+            cf_neurons: None,
+            cf_cost: None,
+        });
     }
 
     if settings.api_base_url.trim().is_empty() {
@@ -63,7 +76,14 @@ async fn stop_recording_and_transcribe(
     let llm_cfg = env_config::load_llm_settings(&state.app_data_dir);
     let timeout_secs = llm_cfg.request_timeout_secs.max(settings.request_timeout_secs).max(180) as u64;
 
-    transcribe::transcribe_audio(
+    let wav_len = wav_bytes.len();
+    let duration_secs = if wav_len > 44 {
+        (wav_len - 44) as f64 / 32000.0
+    } else {
+        0.0
+    };
+
+    let result = transcribe::transcribe_audio(
         wav_bytes,
         &settings.api_base_url,
         &settings.api_key,
@@ -71,7 +91,27 @@ async fn stop_recording_and_transcribe(
         settings.language.as_deref(),
         timeout_secs,
     )
-    .await
+    .await?;
+
+    let mut cf_neurons = None;
+    let mut cf_cost = None;
+
+    if settings.api_base_url.contains("api.cloudflare.com") {
+        if let Ok((neurons, cost)) = state.db.log_cf_asr_usage(&settings.model, duration_secs) {
+            eprintln!(
+                "[Cloudflare ASR] Audio: {:.2}s | Model: {} | Consumed: {:.2} Neurons (~${:.5})",
+                duration_secs, settings.model, neurons, cost
+            );
+            cf_neurons = Some(neurons);
+            cf_cost = Some(cost);
+        }
+    }
+
+    Ok(OperationResult {
+        text: result,
+        cf_neurons,
+        cf_cost,
+    })
 }
 
 #[tauri::command]
@@ -477,7 +517,7 @@ async fn transform_with_llm(
     model: Option<String>,
     preset: String,
     custom_prompt: Option<String>,
-) -> Result<String, String> {
+) -> Result<OperationResult, String> {
     let settings = env_config::load_llm_settings(&state.app_data_dir);
     let active_id = provider_id.unwrap_or_else(|| settings.active_provider_id.clone());
 
@@ -510,7 +550,7 @@ async fn transform_with_llm(
 
     let timeout_secs = settings.request_timeout_secs.max(180) as u64;
 
-    llm::transform_text_with_prompt(
+    let (result_text, prompt_tokens, completion_tokens) = llm::transform_text_with_prompt(
         &base_url,
         &provider.api_key,
         &model_to_use,
@@ -518,8 +558,39 @@ async fn transform_with_llm(
         &text,
         timeout_secs,
     )
-    .await
+    .await?;
+
+    let mut cf_neurons = None;
+    let mut cf_cost = None;
+
+    if base_url.contains("cloudflare.com") || provider.provider_type == "cloudflare" {
+        if let Ok((neurons, cost)) = state.db.log_cf_llm_usage(&model_to_use, prompt_tokens, completion_tokens) {
+            eprintln!(
+                "[Cloudflare LLM] Model: {} | In: {}, Out: {} tokens | Consumed: {:.2} Neurons (~${:.5})",
+                model_to_use, prompt_tokens, completion_tokens, neurons, cost
+            );
+            cf_neurons = Some(neurons);
+            cf_cost = Some(cost);
+        }
+    }
+
+    Ok(OperationResult {
+        text: result_text,
+        cf_neurons,
+        cf_cost,
+    })
 }
+
+#[tauri::command]
+fn get_cf_usage_summary(state: tauri::State<'_, AppState>) -> Result<db::CloudflareUsageSummary, String> {
+    state.db.get_cf_usage_summary()
+}
+
+#[tauri::command]
+fn clear_cf_usage_logs(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.db.clear_cf_usage_logs()
+}
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -636,7 +707,9 @@ pub fn run() {
             transform_with_llm,
             open_presets_folder,
             delete_preset_markdown,
-            restore_presets_defaults
+            restore_presets_defaults,
+            get_cf_usage_summary,
+            clear_cf_usage_logs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
