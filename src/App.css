@@ -184,14 +184,16 @@ body, html, #root {
 
 /* Top Navbar */
 .navbar {
-  height: 54px;
+  min-height: 54px;
+  height: auto;
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 20px;
+  padding: 6px 18px;
   background: var(--bg-primary);
   flex-shrink: 0;
+  box-sizing: border-box;
 }
 
 .navbar-left, .navbar-right {
@@ -697,7 +699,8 @@ body, html, #root {
   background: rgba(99, 102, 241, 0.2);
 }
 
-.btn-icon.pinned {
+.btn-icon.pinned,
+.nav-btn-pin.pinned {
   color: var(--accent);
   background: rgba(99, 102, 241, 0.15);
   border-color: var(--accent);
@@ -2024,10 +2027,50 @@ optgroup {
 }
 
 /* Responsive Action Menu & Nav Styles */
+.nav-engine-cluster {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .nav-inline-actions {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.nav-toggles-cluster,
+.nav-buttons-cluster {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nav-btn-pin,
+.nav-btn-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap !important;
+  transition: all 0.15s;
+}
+
+.nav-btn-pin:hover,
+.nav-btn-mini:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+.badge-engine,
+.badge-status,
+.auto-pill,
+.brand-name {
+  white-space: nowrap !important;
+  flex-shrink: 0;
 }
 
 .badge-text-full {
@@ -2038,9 +2081,47 @@ optgroup {
   display: none;
 }
 
+/* Stacked Layout for Compact / Resized / Non-Fullscreen Window */
+.navbar.compact-stacked {
+  padding: 5px 14px;
+}
+
+.navbar.compact-stacked .nav-engine-cluster {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+}
+
+.navbar.compact-stacked .nav-engine-cluster .badge-engine {
+  padding: 2px 7px;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+/* Automatically stack badges under 700px via Media Query */
+@media (max-width: 700px) {
+  .navbar {
+    padding: 5px 12px;
+  }
+
+  .nav-engine-cluster {
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 2px;
+  }
+
+  .nav-engine-cluster .badge-engine {
+    padding: 2px 7px;
+    font-size: 11px;
+    line-height: 1.2;
+  }
+}
+
 .nav-overflow-container {
   position: relative;
-  display: none;
+  display: block;
 }
 
 .nav-overflow-trigger {
@@ -2076,7 +2157,7 @@ optgroup {
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
-  width: 230px;
+  width: 240px;
   background: var(--bg-secondary);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -2087,6 +2168,27 @@ optgroup {
   flex-direction: column;
   gap: 3px;
   animation: fadeIn 0.12s ease-out;
+}
+
+.nav-overflow-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+.nav-overflow-settings-btn {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.nav-overflow-settings-btn:hover {
+  background: rgba(99, 102, 241, 0.15);
+  color: var(--text-primary);
+}
+
+.nav-overflow-hint {
+  font-size: 11px;
+  color: var(--text-secondary);
 }
 
 .nav-overflow-header {
@@ -2157,7 +2259,7 @@ optgroup {
 }
 
 /* Responsive Design Breakpoints */
-@media (max-width: 960px) {
+@media (max-width: 800px) {
   .badge-text-full {
     display: none;
   }
@@ -2169,6 +2271,13 @@ optgroup {
   }
   .nav-btn-mini-label {
     display: none;
+  }
+  .nav-btn-pin-label {
+    display: none;
+  }
+  .nav-btn-pin,
+  .nav-btn-mini {
+    padding: 3px 6px !important;
   }
 }
 
@@ -2182,13 +2291,7 @@ optgroup {
   }
 }
 
-@media (max-width: 768px) {
-  .nav-inline-actions {
-    display: none;
-  }
-  .nav-overflow-container {
-    display: block;
-  }
+@media (max-width: 660px) {
   .sidebar {
     position: absolute;
     top: 0;

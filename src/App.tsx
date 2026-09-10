@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
 
 interface Note {
@@ -74,6 +75,23 @@ interface ModelMemoryStatus {
   idle_timeout_mins: number;
   estimated_ram_mb: number;
   port?: number;
+}
+
+function getDisplayModelName(settings: AppSettings): string {
+  if (settings.engine_mode === "local") {
+    return `Whisper (${settings.local_model_size})`;
+  }
+  const raw = (settings.model || "").trim();
+  if (!raw) return "whisper-1";
+  if (raw.startsWith("@cf/")) {
+    const parts = raw.split("/");
+    return parts[parts.length - 1] || raw;
+  }
+  if (raw.includes("/") && !raw.startsWith("http")) {
+    const parts = raw.split("/");
+    return parts[parts.length - 1] || raw;
+  }
+  return raw;
 }
 
 function deriveTitle(text: string): string {
@@ -334,6 +352,10 @@ export default function App() {
   const [editingProviderId, setEditingProviderId] = useState<string>("CLOUDFLARE_DEFAULT");
   const [navOverflowOpen, setNavOverflowOpen] = useState(false);
   const navOverflowRef = useRef<HTMLDivElement>(null);
+  const [isFullScreen, setIsFullScreen] = useState(false);
+  const [windowWidth, setWindowWidth] = useState(
+    typeof window !== "undefined" ? window.innerWidth : 1200
+  );
 
   const [logs, setLogs] = useState<LogEntry[]>(() => {
     try {
@@ -605,6 +627,41 @@ export default function App() {
       document.removeEventListener("mousedown", handleClickOutside);
     };
   }, [navOverflowOpen]);
+
+  // Track fullscreen / maximized state and window dimensions for stacked navbar
+  useEffect(() => {
+    let unlistenResize: (() => void) | undefined;
+
+    const updateWindowMetrics = async () => {
+      setWindowWidth(window.innerWidth);
+      try {
+        const win = getCurrentWindow();
+        const [max, fs] = await Promise.all([win.isMaximized(), win.isFullscreen()]);
+        setIsFullScreen(Boolean(max || fs));
+      } catch {
+        setIsFullScreen(window.innerWidth >= 1200);
+      }
+    };
+
+    updateWindowMetrics();
+    window.addEventListener("resize", updateWindowMetrics);
+
+    try {
+      const win = getCurrentWindow();
+      win.onResized(() => {
+        updateWindowMetrics();
+      }).then((unlisten) => {
+        unlistenResize = unlisten;
+      }).catch(() => {});
+    } catch {}
+
+    return () => {
+      window.removeEventListener("resize", updateWindowMetrics);
+      if (unlistenResize) unlistenResize();
+    };
+  }, []);
+
+  const isStackedNav = !isFullScreen || windowWidth < 1150;
 
   async function loadNotes() {
     try {
@@ -1278,22 +1335,6 @@ export default function App() {
           title="Expand to Full Note Editor (Alt+M)"
         >
           ⛶
-        </button>
-
-        <button
-          className={`btn-mini-float ${settings.always_on_top ? "pinned" : ""}`}
-          onMouseDown={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            e.stopPropagation();
-            toggleAlwaysOnTop();
-          }}
-          title={
-            settings.always_on_top
-              ? "Always on Top: ON (Click to unpin)"
-              : "Always on Top: OFF (Click to pin)"
-          }
-        >
-          📌
         </button>
       </div>
     );
@@ -3010,9 +3051,10 @@ export default function App() {
       ) : (
         <main className="main-view">
           {/* Navbar */}
-          <header className="navbar">
+          <header className={`navbar ${isStackedNav ? "compact-stacked" : ""}`}>
             <div className="navbar-left">
               <button
+                type="button"
                 className="btn-icon"
                 onClick={() => setSidebarOpen(!sidebarOpen)}
                 title="Toggle sidebar"
@@ -3040,111 +3082,54 @@ export default function App() {
                 </div>
               )}
 
-              <div
-                className="badge-engine"
-                onClick={() => openSettings("asr")}
-                title="Click to configure ASR speech engine in Settings"
-              >
-                {settings.engine_mode === "local" ? (
-                  <span>
-                    ⚡ <span className="badge-text-full">{settings.local_engine === "whisper_cpu"
-                      ? "Whisper CPU"
-                      : settings.local_engine === "faster_whisper"
-                      ? "Faster-Whisper"
-                      : "Vulkan GPU"}{" "}
-                    ({settings.local_model_size})</span>
-                    <span className="badge-text-short">Local</span>
-                  </span>
-                ) : (
-                  <span>
-                    🌐 <span className="badge-text-full">API ({settings.model || "OpenAI-Compatible"})</span>
-                    <span className="badge-text-short">API</span>
-                  </span>
-                )}
-              </div>
-
-              {llmSettings.enabled && (
+              {/* Speech & LLM engine badges */}
+              <div className="nav-engine-cluster">
                 <div
-                  className="badge-engine badge-llm"
-                  onClick={() => openSettings("llm")}
-                  title="Click to configure LLM post-processing in Settings"
-                  style={{ background: "rgba(99, 102, 241, 0.15)", borderColor: "rgba(99, 102, 241, 0.35)" }}
+                  className="badge-engine"
+                  onClick={() => openSettings("asr")}
+                  title={`ASR Engine: ${settings.engine_mode === "local" ? settings.local_engine : "API"} (${settings.model || settings.local_model_size}). Click to configure`}
                 >
                   <span>
-                    🤖 <span className="badge-text-full">LLM: {llmSettings.voice_preset.replace("_", " ")} {llmSettings.auto_mode ? "⚡(Auto)" : ""}</span>
-                    <span className="badge-text-short">LLM</span>
+                    {settings.engine_mode === "local" ? "⚡" : "🌐"} {getDisplayModelName(settings)}
                   </span>
                 </div>
-              )}
+
+                {llmSettings.enabled && (
+                  <div
+                    className="badge-engine badge-llm"
+                    onClick={() => openSettings("llm")}
+                    title={`LLM Preset: ${llmSettings.voice_preset.replace("_", " ")} (${llmSettings.auto_mode ? "Auto Transform ON" : "Manual"}). Click to configure`}
+                    style={{ background: "rgba(99, 102, 241, 0.15)", borderColor: "rgba(99, 102, 241, 0.35)" }}
+                  >
+                    <span>
+                      🤖 LLM{llmSettings.auto_mode ? " Auto" : ""}
+                    </span>
+                  </div>
+                )}
+              </div>
             </div>
 
             <div className="navbar-right">
-              {/* Desktop / Tablet Inline Toggles (compacts or hides responsively) */}
-              <div className="nav-inline-actions">
-                {llmSettings.enabled && (
-                  <label className="auto-mode-toggle" title="Toggle automatic LLM transformation immediately on recording stop">
-                    <input
-                      type="checkbox"
-                      checked={llmSettings.auto_mode}
-                      onChange={(e) =>
-                        updateAndSaveLlmSettings({ auto_mode: e.target.checked })
-                      }
-                    />
-                    <span className={`auto-pill ${llmSettings.auto_mode ? "active" : ""}`}>
-                      <span className="auto-pill-icon">⚡</span>
-                      <span className="auto-pill-label"> Auto Transform: </span>
-                      <span className="auto-pill-status">{llmSettings.auto_mode ? "ON" : "OFF"}</span>
-                    </span>
-                  </label>
-                )}
+              <button
+                type="button"
+                className="btn btn-secondary nav-btn-mini"
+                onClick={() => toggleMiniMode(true)}
+                title="Switch to compact floating wizard (Alt+M)"
+              >
+                <span>⊡</span>
+                <span className="nav-btn-mini-label"> Mini Wizard</span>
+              </button>
 
-                <label className="auto-mode-toggle" title="Toggle automatic copying to clipboard">
-                  <input
-                    type="checkbox"
-                    checked={settings.auto_copy}
-                    onChange={(e) =>
-                      updateAndSaveSettings({ auto_copy: e.target.checked })
-                    }
-                  />
-                  <span className={`auto-pill ${settings.auto_copy ? "active" : ""}`}>
-                    <span className="auto-pill-icon">📋</span>
-                    <span className="auto-pill-label"> Auto Copy: </span>
-                    <span className="auto-pill-status">{settings.auto_copy ? "ON" : "OFF"}</span>
-                  </span>
-                </label>
-
-                <button
-                  className={`btn-icon ${settings.always_on_top ? "pinned" : ""}`}
-                  onClick={() => toggleAlwaysOnTop()}
-                  title={
-                    settings.always_on_top
-                      ? "Always on Top: ON (Click to unpin)"
-                      : "Always on Top: OFF (Click to pin)"
-                  }
-                >
-                  📌
-                </button>
-                <button
-                  className="btn btn-secondary nav-btn-mini"
-                  onClick={() => toggleMiniMode(true)}
-                  title="Switch to compact floating wizard (Alt+M)"
-                  style={{ fontSize: "12px", padding: "5px 10px" }}
-                >
-                  <span>⊡</span>
-                  <span className="nav-btn-mini-label"> Mini Wizard</span>
-                </button>
-              </div>
-
-              {/* Collapsible Action Dropdown for compact/narrow screens */}
+              {/* Stacked Quick Controls & Settings Dropdown */}
               <div className="nav-overflow-container" ref={navOverflowRef}>
                 <button
                   type="button"
                   className={`btn-icon nav-overflow-trigger ${navOverflowOpen ? "active" : ""}`}
                   onClick={() => setNavOverflowOpen(!navOverflowOpen)}
-                  title="Quick Actions & Toggles"
-                  aria-label="Quick Actions"
+                  title="Settings & Quick Controls"
+                  aria-label="Settings & Quick Controls"
                 >
-                  ⋯
+                  ⚙
                   {(llmSettings.auto_mode || settings.auto_copy || settings.always_on_top) && (
                     <span className="nav-overflow-dot" />
                   )}
@@ -3217,31 +3202,25 @@ export default function App() {
                       </span>
                     </button>
 
+                    <div className="nav-overflow-divider" />
+
                     <button
                       type="button"
-                      className="nav-overflow-btn"
+                      className="nav-overflow-btn nav-overflow-settings-btn"
                       onClick={() => {
                         setNavOverflowOpen(false);
-                        toggleMiniMode(true);
+                        openSettings("asr");
                       }}
                     >
                       <span className="nav-overflow-item-left">
-                        <span>⊡</span>
-                        <span>Mini Wizard Mode</span>
+                        <span>⚙</span>
+                        <span>Settings</span>
                       </span>
-                      <span className="key-hint">Alt+M</span>
+                      <span className="nav-overflow-hint">Configure ↗</span>
                     </button>
                   </div>
                 )}
               </div>
-
-              <button
-                className="btn-icon"
-                onClick={() => openSettings("asr")}
-                title="Settings & Audio Engine"
-              >
-                ⚙
-              </button>
             </div>
           </header>
 
