@@ -1536,37 +1536,47 @@ export default function App() {
                     </div>
                   </div>
 
-                  {activePreset.id === "cloudflare" && (
-                    <div className={`preset-alert ${settings.api_base_url.includes("<account_id>") || settings.api_base_url.includes("{account_id}") ? "warning" : "info"}`}>
-                      {settings.api_base_url.includes("<account_id>") || settings.api_base_url.includes("{account_id}") ? (
-                        <>
-                          ⚠️ <strong>Action Needed:</strong> Replace <code>&lt;account_id&gt;</code> in the URL below with your actual Cloudflare Account ID (found in Cloudflare Dashboard &rarr; Workers &amp; Pages).
-                        </>
-                      ) : (
-                        <>
-                          ℹ️ <strong>Cloudflare Workers AI:</strong> Audio will be dispatched directly to <code>{settings.model || "@cf/openai/whisper"}</code> (supports standard binary and large-v3-turbo). Make sure your API Token has <em>Workers AI: Read</em> permissions.
-                        </>
-                      )}
+                  {activePreset.id === "cloudflare" ? (
+                    <div className="form-group">
+                      <label className="form-label">Cloudflare Account ID</label>
+                      <input
+                        type="text"
+                        className="form-input"
+                        placeholder="e.g. c3a0b12984ef... (found in Cloudflare Dashboard)"
+                        value={(() => {
+                          const match = settings.api_base_url.match(/accounts\/([a-zA-Z0-9_-]+)/);
+                          return match && match[1] !== "<account_id>" && match[1] !== "{account_id}" ? match[1] : "";
+                        })()}
+                        onChange={(e) => {
+                          const acc = e.target.value.trim();
+                          const newUrl = acc ? `https://api.cloudflare.com/client/v4/accounts/${acc}/ai/v1` : "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1";
+                          setSettings((prev) => ({ ...prev, api_base_url: newUrl }));
+                          updateAndSaveSettings({ api_base_url: newUrl });
+                        }}
+                      />
+                      <span className="form-hint">
+                        Found in Cloudflare Dashboard &rarr; Workers &amp; Pages overview (right sidebar). URL is added automatically.
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="form-group">
+                      <label className="form-label">API Endpoint URL</label>
+                      <input
+                        type="text"
+                        className="form-input"
+                        placeholder="https://api.openai.com/v1, https://api.groq.com/openai/v1, or http://localhost:8000/v1"
+                        value={settings.api_base_url}
+                        onChange={(e) =>
+                          setSettings({ ...settings, api_base_url: e.target.value })
+                        }
+                        onBlur={() => updateAndSaveSettings({ api_base_url: settings.api_base_url })}
+                        required
+                      />
+                      <span className="form-hint">
+                        {activePreset.urlHint}
+                      </span>
                     </div>
                   )}
-
-                  <div className="form-group">
-                    <label className="form-label">API Endpoint URL</label>
-                    <input
-                      type="text"
-                      className="form-input"
-                      placeholder="https://api.openai.com/v1, https://api.groq.com/openai/v1, or http://localhost:8000/v1"
-                      value={settings.api_base_url}
-                      onChange={(e) =>
-                        setSettings({ ...settings, api_base_url: e.target.value })
-                      }
-                      onBlur={() => updateAndSaveSettings({ api_base_url: settings.api_base_url })}
-                      required
-                    />
-                    <span className="form-hint">
-                      {activePreset.urlHint}
-                    </span>
-                  </div>
 
                   <div className="form-group">
                     <label className="form-label">API Key / Token {activePreset.id === "local" ? "(Optional)" : ""}</label>
@@ -2282,21 +2292,31 @@ export default function App() {
                           {cur.provider_type === "cloudflare" && (
                             <>
                               <div className="form-group">
-                                <label className="form-label">API Endpoint URL</label>
+                                <label className="form-label">Cloudflare Account ID</label>
                                 <input
                                   type="text"
                                   className="form-input"
-                                  placeholder="https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1"
-                                  value={cur.base_url || (cur.account_id ? `https://api.cloudflare.com/client/v4/accounts/${cur.account_id}/ai/v1` : "")}
-                                  onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
+                                  placeholder="e.g. c3a0b12984ef... (found in Cloudflare Dashboard)"
+                                  value={cur.account_id || (() => {
+                                    const match = cur.base_url?.match(/accounts\/([a-zA-Z0-9_-]+)/);
+                                    return match && match[1] !== "<account_id>" && match[1] !== "{account_id}" ? match[1] : "";
+                                  })()}
+                                  onChange={(e) => {
+                                    const acc = e.target.value.trim();
+                                    const targetUrl = acc ? `https://api.cloudflare.com/client/v4/accounts/${acc}/ai/v1` : "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1";
+                                    handleUpdateProvider(cur.id, {
+                                      account_id: acc,
+                                      base_url: targetUrl,
+                                    });
+                                  }}
                                 />
                                 <span className="form-hint">
-                                  From Cloudflare Dashboard &rarr; Workers AI (paste your account endpoint URL directly).
+                                  Found in Cloudflare Dashboard &rarr; Workers &amp; Pages overview (right sidebar). URL is added automatically.
                                 </span>
                               </div>
 
                               <div className="form-group">
-                                <label className="form-label">Cloudflare API Token</label>
+                                <label className="form-label">API Key / Token</label>
                                 <input
                                   type="password"
                                   className="form-input"
