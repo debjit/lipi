@@ -36,6 +36,8 @@ pub fn normalize_base_url(base_url: &str) -> String {
         && !trimmed.ends_with("/models")
     {
         format!("{}/v1", trimmed)
+    } else if trimmed.contains("cloudflare.com") && trimmed.ends_with("/ai") {
+        format!("{}/v1", trimmed)
     } else {
         trimmed.to_string()
     }
@@ -396,6 +398,14 @@ mod tests {
         assert_eq!(
             normalize_base_url("https://api.groq.com/openai/v1"),
             "https://api.groq.com/openai/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.cloudflare.com/client/v4/accounts/c3a0/ai"),
+            "https://api.cloudflare.com/client/v4/accounts/c3a0/ai/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.cloudflare.com/client/v4/accounts/c3a0/ai/v1"),
+            "https://api.cloudflare.com/client/v4/accounts/c3a0/ai/v1"
         );
     }
 }

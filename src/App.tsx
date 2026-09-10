@@ -290,7 +290,7 @@ export default function App() {
         provider_type: "cloudflare",
         api_key: "",
         account_id: "",
-        base_url: "",
+        base_url: "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1",
       },
       {
         id: "GROQ_DEFAULT",
@@ -331,7 +331,6 @@ export default function App() {
   const [isTransforming, setIsTransforming] = useState(false);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
-  const [showAdvancedUrl, setShowAdvancedUrl] = useState(false);
   const [editingProviderId, setEditingProviderId] = useState<string>("CLOUDFLARE_DEFAULT");
   const [navOverflowOpen, setNavOverflowOpen] = useState(false);
   const navOverflowRef = useRef<HTMLDivElement>(null);
@@ -836,7 +835,9 @@ export default function App() {
       api_key: "",
       account_id: "",
       base_url:
-        type === "groq"
+        type === "cloudflare"
+          ? "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1"
+          : type === "groq"
           ? "https://api.groq.com/openai/v1"
           : type === "openai"
           ? "https://api.openai.com/v1"
@@ -862,6 +863,7 @@ export default function App() {
     if (p.provider_type === "groq" && url === "https://api.groq.com/openai/v1") return false;
     if (p.provider_type === "openai" && url === "https://api.openai.com/v1") return false;
     if (p.provider_type === "ollama" && url === "http://localhost:11434/v1") return false;
+    if (p.provider_type === "cloudflare" && (url.includes("<account_id>") || url === "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1")) return false;
     return true;
   }
 
@@ -2279,21 +2281,17 @@ export default function App() {
 
                           {cur.provider_type === "cloudflare" && (
                             <>
-                              <div className="preset-alert info">
-                                ℹ️ <strong>Cloudflare Workers AI:</strong> Audio &amp; LLM are handled via your Cloudflare account. Enter only your Account ID and API Token.
-                              </div>
-
                               <div className="form-group">
-                                <label className="form-label">Cloudflare Account ID (User ID)</label>
+                                <label className="form-label">API Endpoint URL</label>
                                 <input
                                   type="text"
                                   className="form-input"
-                                  placeholder="e.g. c3a0b12984ef... (found in Cloudflare Dashboard)"
-                                  value={cur.account_id}
-                                  onChange={(e) => handleUpdateProvider(cur.id, { account_id: e.target.value })}
+                                  placeholder="https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1"
+                                  value={cur.base_url || (cur.account_id ? `https://api.cloudflare.com/client/v4/accounts/${cur.account_id}/ai/v1` : "")}
+                                  onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
                                 />
                                 <span className="form-hint">
-                                  Found in Cloudflare Dashboard &rarr; Workers &amp; Pages overview (right sidebar).
+                                  From Cloudflare Dashboard &rarr; Workers AI (paste your account endpoint URL directly).
                                 </span>
                               </div>
 
@@ -2307,31 +2305,8 @@ export default function App() {
                                   onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
                                 />
                                 <span className="form-hint">
-                                  Stored securely in local .env configuration.
+                                  Needs <em>Workers AI: Read</em> permissions. Stored securely in local configuration.
                                 </span>
-                              </div>
-
-                              <div style={{ marginTop: "4px" }}>
-                                <button
-                                  type="button"
-                                  className="btn-icon"
-                                  style={{ fontSize: "11px", color: "var(--text-secondary)", display: "inline-flex", gap: "4px", padding: 0 }}
-                                  onClick={() => setShowAdvancedUrl(!showAdvancedUrl)}
-                                >
-                                  {showAdvancedUrl ? "▼ Hide Advanced Base URL" : "▶ Show Advanced Base URL"}
-                                </button>
-                                {showAdvancedUrl && (
-                                  <div className="form-group" style={{ marginTop: "8px" }}>
-                                    <label className="form-label">Custom Base URL Override (Optional)</label>
-                                    <input
-                                      type="text"
-                                      className="form-input"
-                                      placeholder={`Default: https://api.cloudflare.com/client/v4/accounts/${cur.account_id || "<account_id>"}/ai/v1`}
-                                      value={cur.base_url}
-                                      onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
-                                    />
-                                  </div>
-                                )}
                               </div>
                             </>
                           )}

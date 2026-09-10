@@ -2,7 +2,8 @@
 name = "lipi"
 version = "0.1.0"
 description = "Lipi - Local voice transcription and notes"
-authors = ["you"]
+authors = ["Debjit Biswas <debjit012@gmail.com>"]
+license = "MIT"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

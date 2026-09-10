@@ -36,7 +36,11 @@ impl LlmProvider {
         match self.provider_type.to_lowercase().as_str() {
             "cloudflare" => {
                 let acc = self.account_id.trim();
-                format!("https://api.cloudflare.com/client/v4/accounts/{}/ai/v1", acc)
+                if !acc.is_empty() {
+                    format!("https://api.cloudflare.com/client/v4/accounts/{}/ai/v1", acc)
+                } else {
+                    "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1".to_string()
+                }
             }
             "groq" => "https://api.groq.com/openai/v1".to_string(),
             "openai" => "https://api.openai.com/v1".to_string(),
@@ -92,7 +96,7 @@ impl Default for LlmSettings {
                     provider_type: "cloudflare".into(),
                     api_key: String::new(),
                     account_id: String::new(),
-                    base_url: String::new(),
+                    base_url: "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1".into(),
                 },
                 LlmProvider {
                     id: "GROQ_DEFAULT".into(),
