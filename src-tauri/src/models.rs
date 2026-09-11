@@ -385,6 +385,7 @@ async fn download_faster_whisper_weights(
 
     let mut downloaded: u64 = 0;
     let mut last_emit_percent: i64 = -1;
+    let start_time = std::time::Instant::now();
 
     while let Some(chunk) = response
         .chunk()
@@ -403,6 +404,14 @@ async fn download_faster_whisper_weights(
 
         if percent != last_emit_percent {
             last_emit_percent = percent;
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let speed_bps = if elapsed > 0.4 { (downloaded as f64) / elapsed } else { 0.0 };
+            let eta_secs = if speed_bps > 1000.0 && total_size > downloaded {
+                ((total_size - downloaded) as f64) / speed_bps
+            } else {
+                0.0
+            };
+
             let _ = app_handle.emit(
                 "model-download-progress",
                 serde_json::json!({
@@ -410,7 +419,9 @@ async fn download_faster_whisper_weights(
                     "model_size": model_size,
                     "downloaded": downloaded,
                     "total": total_size,
-                    "percentage": percent
+                    "percentage": percent,
+                    "speed_bps": speed_bps,
+                    "eta_secs": eta_secs
                 }),
             );
         }
@@ -430,7 +441,9 @@ async fn download_faster_whisper_weights(
             "model_size": model_size,
             "downloaded": downloaded,
             "total": total_size,
-            "percentage": 100
+            "percentage": 100,
+            "speed_bps": 0.0,
+            "eta_secs": 0.0
         }),
     );
 
@@ -475,6 +488,7 @@ pub async fn download_model_weights(
 
     let mut downloaded: u64 = 0;
     let mut last_emit_percent: i64 = -1;
+    let start_time = std::time::Instant::now();
 
     while let Some(chunk) = response
         .chunk()
@@ -493,6 +507,14 @@ pub async fn download_model_weights(
 
         if percent != last_emit_percent {
             last_emit_percent = percent;
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let speed_bps = if elapsed > 0.4 { (downloaded as f64) / elapsed } else { 0.0 };
+            let eta_secs = if speed_bps > 1000.0 && total_size > downloaded {
+                ((total_size - downloaded) as f64) / speed_bps
+            } else {
+                0.0
+            };
+
             let _ = app_handle.emit(
                 "model-download-progress",
                 serde_json::json!({
@@ -500,7 +522,9 @@ pub async fn download_model_weights(
                     "model_size": model_size,
                     "downloaded": downloaded,
                     "total": total_size,
-                    "percentage": percent
+                    "percentage": percent,
+                    "speed_bps": speed_bps,
+                    "eta_secs": eta_secs
                 }),
             );
         }
@@ -523,7 +547,9 @@ pub async fn download_model_weights(
             "model_size": model_size,
             "downloaded": downloaded,
             "total": total_size,
-            "percentage": 100
+            "percentage": 100,
+            "speed_bps": 0.0,
+            "eta_secs": 0.0
         }),
     );
 
