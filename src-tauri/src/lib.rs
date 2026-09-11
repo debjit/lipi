@@ -528,17 +528,27 @@ async fn transform_with_llm(
     preset: String,
     custom_prompt: Option<String>,
 ) -> Result<OperationResult, String> {
-    let settings = env_config::load_llm_settings(&state.app_data_dir);
+    let mut settings = env_config::load_llm_settings(&state.app_data_dir);
     let active_id = provider_id.unwrap_or_else(|| settings.active_provider_id.clone());
 
-    let provider = settings
-        .providers
-        .iter()
-        .find(|p| p.id == active_id)
-        .ok_or_else(|| format!("Provider '{}' not found in configuration", active_id))?;
+    let (base_url, api_key, provider_type, provider_model) = {
+        let provider = settings
+            .providers
+            .iter()
+            .find(|p| p.id == active_id)
+            .ok_or_else(|| format!("Provider '{}' not found in configuration", active_id))?;
+        (
+            provider.resolved_base_url(),
+            provider.api_key.clone(),
+            provider.provider_type.clone(),
+            provider.model.clone(),
+        )
+    };
 
-    let base_url = provider.resolved_base_url();
-    let model_to_use = model.unwrap_or_else(|| settings.model.clone());
+    let model_to_use = model
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| if !provider_model.trim().is_empty() { Some(provider_model) } else { None })
+        .unwrap_or_else(|| settings.model.clone());
 
     let system_prompt = if preset == "custom" {
         let p = custom_prompt.unwrap_or_else(|| settings.custom_prompt.clone());
@@ -562,7 +572,7 @@ async fn transform_with_llm(
 
     let (result_text, prompt_tokens, completion_tokens) = llm::transform_text_with_prompt(
         &base_url,
-        &provider.api_key,
+        &api_key,
         &model_to_use,
         &system_prompt,
         &text,
@@ -570,10 +580,24 @@ async fn transform_with_llm(
     )
     .await?;
 
+    // Record used model in provider's model & recent_models
+    if !model_to_use.trim().is_empty() {
+        let trimmed_m = model_to_use.trim().to_string();
+        if let Some(p) = settings.providers.iter_mut().find(|p| p.id == active_id) {
+            p.model = trimmed_m.clone();
+            if !p.recent_models.contains(&trimmed_m) {
+                p.recent_models.insert(0, trimmed_m);
+                p.recent_models.truncate(6);
+            }
+            settings.model = model_to_use.clone();
+            let _ = env_config::save_llm_settings(&state.app_data_dir, &settings);
+        }
+    }
+
     let mut cf_neurons = None;
     let mut cf_cost = None;
 
-    if base_url.contains("cloudflare.com") || provider.provider_type == "cloudflare" {
+    if base_url.contains("cloudflare.com") || provider_type == "cloudflare" {
         if let Ok((neurons, cost)) = state.db.log_cf_llm_usage(&model_to_use, prompt_tokens, completion_tokens) {
             eprintln!(
                 "[Cloudflare LLM] Model: {} | In: {}, Out: {} tokens | Consumed: {:.2} Neurons (~${:.5})",

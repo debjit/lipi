@@ -36,6 +36,8 @@ interface LlmProvider {
   api_key: string;
   account_id: string;
   base_url: string;
+  model?: string;
+  recent_models?: string[];
 }
 
 interface PromptPreset {
@@ -736,8 +738,11 @@ export default function App() {
   async function loadLlmSettings() {
     try {
       const cfg: LlmSettings = await invoke("get_llm_config");
+      const activeP = (cfg.providers || []).find((p) => p.id === cfg.active_provider_id);
+      const activeModel = cfg.model || activeP?.model || "";
       const normalized: LlmSettings = {
         ...cfg,
+        model: activeModel,
         presets: cfg.presets && cfg.presets.length > 0 ? cfg.presets : DEFAULT_PRESETS,
       };
       setLlmSettings(normalized);
@@ -760,6 +765,25 @@ export default function App() {
       console.error("Failed saving LLM config:", e);
       setErrorMsg(String(e));
     }
+  }
+
+  function handleSelectOrUpdateModel(newModel: string) {
+    const activeId = llmSettingsRef.current.active_provider_id;
+    const trimmed = newModel.trim();
+    const updatedProviders = (llmSettingsRef.current.providers || []).map((p) => {
+      if (p.id === activeId) {
+        const recents = p.recent_models || [];
+        const newRecents = trimmed && !recents.includes(trimmed)
+          ? [trimmed, ...recents.filter((m) => m !== trimmed)].slice(0, 6)
+          : recents;
+        return { ...p, model: trimmed, recent_models: newRecents };
+      }
+      return p;
+    });
+    updateAndSaveLlmSettings({
+      model: newModel,
+      providers: updatedProviders,
+    });
   }
 
   function handleStartAddPreset() {
@@ -2728,9 +2752,13 @@ export default function App() {
                         value={llmSettings.active_provider_id}
                         onChange={(e) => {
                           const newPid = e.target.value;
-                          updateAndSaveLlmSettings({ active_provider_id: newPid });
+                          const targetProv = llmSettings.providers.find((p) => p.id === newPid);
+                          const newModel = targetProv?.model || "";
+                          updateAndSaveLlmSettings({
+                            active_provider_id: newPid,
+                            model: newModel,
+                          });
                           setAvailableModels([]);
-                          handleFetchModels(newPid);
                         }}
                       >
                         {llmSettings.providers.map((p) => (
@@ -2770,9 +2798,16 @@ export default function App() {
                         <input
                           type="text"
                           className="form-input"
-                          placeholder="llama3.2, @cf/meta/llama-3.1-8b-instruct, or gpt-4o-mini"
+                          placeholder={(() => {
+                            const cur = llmSettings.providers.find((p) => p.id === llmSettings.active_provider_id);
+                            if (cur?.provider_type === "cloudflare") return "e.g. @cf/meta/llama-3.3-70b-instruct-fp8-fast";
+                            if (cur?.name?.toLowerCase().includes("nvidia")) return "e.g. nvidia/nemotron-3.5-lightning-30b-a3b";
+                            if (cur?.provider_type === "groq") return "e.g. llama-3.3-70b-versatile";
+                            if (cur?.provider_type === "ollama") return "e.g. llama3.2";
+                            return "e.g. model-name";
+                          })()}
                           value={llmSettings.model}
-                          onChange={(e) => updateAndSaveLlmSettings({ model: e.target.value })}
+                          onChange={(e) => handleSelectOrUpdateModel(e.target.value)}
                           list="available-models-list"
                         />
                         {availableModels.length > 0 && (
@@ -2791,7 +2826,7 @@ export default function App() {
                             value={availableModels.includes(llmSettings.model) ? llmSettings.model : ""}
                             onChange={(e) => {
                               if (e.target.value) {
-                                updateAndSaveLlmSettings({ model: e.target.value });
+                                handleSelectOrUpdateModel(e.target.value);
                               }
                             }}
                           >
@@ -2807,55 +2842,63 @@ export default function App() {
                         </div>
                       )}
 
-                      <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
-                        {(() => {
-                          const cur = llmSettings.providers.find((p) => p.id === llmSettings.active_provider_id) || llmSettings.providers[0];
-                          const isOllama = cur?.provider_type === "ollama";
-                          const isCf = cur?.provider_type === "cloudflare";
-                          const isGroq = cur?.provider_type === "groq";
+                      {(() => {
+                        const cur = llmSettings.providers.find((p) => p.id === llmSettings.active_provider_id) || llmSettings.providers[0];
+                        const isCf = cur?.provider_type === "cloudflare";
 
-                          if (isOllama) {
-                            return [
-                              { id: "llama3.2", label: "Llama 3.2 (3B)" },
-                              { id: "llama3.2:1b", label: "Llama 3.2 1B (Ultra-Light)" },
-                              { id: "qwen2.5:3b", label: "Qwen 2.5 3B" },
-                              { id: "qwen2.5:7b", label: "Qwen 2.5 7B" },
-                              { id: "phi3:mini", label: "Phi-3 Mini" },
-                              { id: "mistral", label: "Mistral 7B" },
-                            ];
-                          }
-                          if (isCf) {
-                            return [
-                              { id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", label: "Llama 3.3 70B (Quality)" },
-                              { id: "@cf/meta/llama-3.1-8b-instruct-fp8", label: "Llama 3.1 8B (Fast)" },
-                              { id: "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", label: "DeepSeek R1 32B" },
-                              { id: "@cf/qwen/qwen2.5-coder-32b-instruct", label: "Qwen 2.5 Coder 32B" },
-                              { id: "@cf/openai/gpt-oss-120b", label: "GPT-OSS 120B" },
-                            ];
-                          }
-                          if (isGroq) {
-                            return [
-                              { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B (Fast)" },
-                              { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B (Instant)" },
-                              { id: "mixtral-8x7b-32768", label: "Mixtral 8x7B" },
-                            ];
-                          }
-                          return [
-                            { id: "gpt-4o-mini", label: "GPT-4o Mini" },
-                            { id: "gpt-4o", label: "GPT-4o" },
-                          ];
-                        })().map((item) => (
-                          <button
-                            key={item.id}
-                            type="button"
-                            className={`provider-chip ${llmSettings.model === item.id ? "active" : ""}`}
-                            style={{ fontSize: "11px", padding: "3px 8px" }}
-                            onClick={() => updateAndSaveLlmSettings({ model: item.id })}
-                          >
-                            {item.label}
-                          </button>
-                        ))}
-                      </div>
+                        if (isCf) {
+                          // The Cloudflare LLMs are fine as predefined quick chips
+                          return (
+                            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
+                              {[
+                                { id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", label: "Llama 3.3 70B (Quality)" },
+                                { id: "@cf/meta/llama-3.1-8b-instruct-fp8", label: "Llama 3.1 8B (Fast)" },
+                                { id: "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", label: "DeepSeek R1 32B" },
+                                { id: "@cf/qwen/qwen2.5-coder-32b-instruct", label: "Qwen 2.5 Coder 32B" },
+                                { id: "@cf/openai/gpt-oss-120b", label: "GPT-OSS 120B" },
+                              ].map((item) => (
+                                <button
+                                  key={item.id}
+                                  type="button"
+                                  className={`provider-chip ${llmSettings.model === item.id ? "active" : ""}`}
+                                  style={{ fontSize: "11px", padding: "3px 8px" }}
+                                  onClick={() => handleSelectOrUpdateModel(item.id)}
+                                >
+                                  {item.label}
+                                </button>
+                              ))}
+                            </div>
+                          );
+                        }
+
+                        // Not predefined for other LLM providers: show previously used models for this provider
+                        const previousModels = [
+                          ...(cur?.recent_models || []),
+                          ...(cur?.model && !(cur?.recent_models || []).includes(cur.model) ? [cur.model] : []),
+                        ].filter((m) => m && m.trim().length > 0);
+
+                        if (previousModels.length === 0) {
+                          return null;
+                        }
+
+                        return (
+                          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px", alignItems: "center" }}>
+                            <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>Previously used:</span>
+                            {previousModels.map((m) => (
+                              <button
+                                key={m}
+                                type="button"
+                                className={`provider-chip ${llmSettings.model === m ? "active" : ""}`}
+                                style={{ fontSize: "11px", padding: "3px 8px" }}
+                                onClick={() => handleSelectOrUpdateModel(m)}
+                                title={`Switch to model: ${m}`}
+                              >
+                                {m}
+                              </button>
+                            ))}
+                          </div>
+                        );
+                      })()}
                     </div>
 
                     {/* Default Voice / Rectify Preset */}
