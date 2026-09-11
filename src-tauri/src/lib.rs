@@ -5,6 +5,7 @@ mod env_config;
 mod llm;
 mod models;
 mod presets;
+mod specs;
 mod transcribe;
 
 use audio::AudioRecorder;
@@ -625,6 +626,16 @@ fn clear_cf_usage_logs(state: tauri::State<'_, AppState>) -> Result<(), String> 
     state.db.clear_cf_usage_logs()
 }
 
+#[tauri::command]
+fn get_system_specs() -> specs::SystemSpecs {
+    specs::detect_system_specs()
+}
+
+#[tauri::command]
+async fn test_and_fetch_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
+    llm::fetch_models(&base_url, &api_key).await
+}
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -743,7 +754,9 @@ pub fn run() {
             delete_preset_markdown,
             restore_presets_defaults,
             get_cf_usage_summary,
-            clear_cf_usage_logs
+            clear_cf_usage_logs,
+            get_system_specs,
+            test_and_fetch_models
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

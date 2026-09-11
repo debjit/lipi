@@ -27,6 +27,7 @@ pub struct AppSettings {
     pub request_timeout_secs: u32,
     pub mini_record_mode: String,
     pub provider_id: Option<String>,
+    pub wizard_completed: bool,
 }
 
 impl Default for AppSettings {
@@ -46,6 +47,7 @@ impl Default for AppSettings {
             request_timeout_secs: 180,
             mini_record_mode: "new_note".into(),
             provider_id: None,
+            wizard_completed: false,
         }
     }
 }
@@ -263,6 +265,7 @@ impl Database {
             request_timeout_secs: get_val("request_timeout_secs").and_then(|v| v.parse().ok()).unwrap_or(180).max(180),
             mini_record_mode: get_val("mini_record_mode").unwrap_or_else(|| "new_note".into()),
             provider_id: get_val("provider_id").filter(|s| !s.is_empty()),
+            wizard_completed: get_val("wizard_completed").map(|v| v == "true" || v == "1").unwrap_or(false),
         })
     }
 
@@ -290,6 +293,7 @@ impl Database {
         set_val("request_timeout_secs", &settings.request_timeout_secs.max(180).to_string()).map_err(|e| e.to_string())?;
         set_val("mini_record_mode", &settings.mini_record_mode).map_err(|e| e.to_string())?;
         set_val("provider_id", settings.provider_id.as_deref().unwrap_or("")).map_err(|e| e.to_string())?;
+        set_val("wizard_completed", if settings.wizard_completed { "true" } else { "false" }).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -506,6 +510,7 @@ mod tests {
             request_timeout_secs: 240,
             mini_record_mode: "append".into(),
             provider_id: Some("GROQ_DEFAULT".into()),
+            wizard_completed: true,
         };
         db.save_settings(&new_settings).unwrap();
         let loaded = db.get_settings().unwrap();
@@ -523,6 +528,7 @@ mod tests {
         assert_eq!(loaded.request_timeout_secs, 240);
         assert_eq!(loaded.mini_record_mode, "append");
         assert_eq!(loaded.provider_id, Some("GROQ_DEFAULT".into()));
+        assert_eq!(loaded.wizard_completed, true);
     }
 
     #[test]

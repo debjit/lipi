@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
+import { SetupWizard } from "./SetupWizard";
 
 interface Note {
   id: number;
@@ -27,6 +28,7 @@ interface AppSettings {
   request_timeout_secs?: number;
   mini_record_mode?: "new_note" | "append";
   provider_id?: string;
+  wizard_completed?: boolean;
 }
 
 interface LlmProvider {
@@ -220,10 +222,13 @@ export default function App() {
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [memoryStatus, setMemoryStatus] = useState<ModelMemoryStatus | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
+  const [downloadSpeedBps, setDownloadSpeedBps] = useState<number>(0);
+  const [downloadEtaSecs, setDownloadEtaSecs] = useState<number>(0);
   const [isDownloading, setIsDownloading] = useState(false);
   const [isInstallingDeps, setIsInstallingDeps] = useState(false);
   const [isPreloading, setIsPreloading] = useState(false);
   const [isFreeingRam, setIsFreeingRam] = useState(false);
+  const [wizardOpen, setWizardOpen] = useState(false);
 
   const [settings, setSettings] = useState<AppSettings>({
     api_base_url: "https://api.openai.com/v1",
@@ -458,11 +463,19 @@ export default function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
-    listen<{ percentage: number }>("model-download-progress", (event) => {
+    listen<{ percentage: number; speed_bps?: number; eta_secs?: number }>("model-download-progress", (event) => {
       setDownloadProgress(event.payload.percentage);
+      if (event.payload.speed_bps !== undefined) {
+        setDownloadSpeedBps(event.payload.speed_bps);
+      }
+      if (event.payload.eta_secs !== undefined) {
+        setDownloadEtaSecs(event.payload.eta_secs);
+      }
       if (event.payload.percentage >= 100) {
         setTimeout(() => {
           setDownloadProgress(null);
+          setDownloadSpeedBps(0);
+          setDownloadEtaSecs(0);
           setIsDownloading(false);
           refreshModelStatus();
         }, 600);
@@ -1098,8 +1111,42 @@ export default function App() {
       await refreshModelStatus(s.local_engine, s.local_model_size);
       await refreshMemoryStatus();
       await loadLlmSettings();
+
+      // Check first-run wizard
+      if (!s.wizard_completed && !s.api_key && s.engine_mode !== "local") {
+        setWizardOpen(true);
+      }
     } catch (e) {
       console.error("Failed to load settings:", e);
+    }
+  }
+
+  async function handleFinishWizard(
+    settingsPatch: any,
+    llmPatch?: any
+  ) {
+    await updateAndSaveSettings(settingsPatch);
+    if (llmPatch) {
+      if (llmPatch.provider) {
+        const existing = llmSettingsRef.current.providers || [];
+        const provIdx = existing.findIndex((p) => p.id === llmPatch.provider.id);
+        const updatedProviders =
+          provIdx >= 0
+            ? existing.map((p, i) => (i === provIdx ? { ...p, ...llmPatch.provider } : p))
+            : [...existing, llmPatch.provider];
+        await updateAndSaveLlmSettings({
+          enabled: llmPatch.enabled,
+          active_provider_id: llmPatch.active_provider_id,
+          model: llmPatch.model,
+          providers: updatedProviders,
+        });
+      } else {
+        await updateAndSaveLlmSettings({
+          enabled: llmPatch.enabled,
+          active_provider_id: llmPatch.active_provider_id,
+          model: llmPatch.model,
+        });
+      }
     }
   }
 
@@ -3295,6 +3342,18 @@ export default function App() {
                   <span>Preferences</span>
                 </div>
 
+                <div className="form-group" style={{ marginBottom: "20px", padding: "14px 16px", background: "var(--bg-secondary)", borderRadius: "8px", border: "1px solid var(--border)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px" }}>
+                    <div>
+                      <div style={{ fontWeight: 600, fontSize: "14px", color: "var(--text-primary)" }}>🚀 First-Time Setup Wizard</div>
+                      <div className="form-hint" style={{ marginTop: "2px" }}>Inspect machine specs, check RAM recommendations, or reconfigure local/cloud modes.</div>
+                    </div>
+                    <button type="button" className="btn btn-secondary" onClick={() => setWizardOpen(true)}>
+                      Launch Wizard
+                    </button>
+                  </div>
+                </div>
+
                 <div className="form-group">
                   <label className="checkbox-label">
                     <input
@@ -3963,6 +4022,24 @@ export default function App() {
           </footer>
         </main>
       )}
+
+      {/* First-Time Setup Wizard Modal */}
+      <SetupWizard
+        isOpen={wizardOpen}
+        onClose={() => setWizardOpen(false)}
+        onFinish={handleFinishWizard}
+        currentSettings={settings}
+        modelStatus={modelStatus}
+        downloadProgress={downloadProgress}
+        downloadSpeedBps={downloadSpeedBps}
+        downloadEtaSecs={downloadEtaSecs}
+        isDownloading={isDownloading}
+        onDownloadModel={async (engine, size) => {
+          await updateAndSaveSettings({ local_engine: engine, local_model_size: size });
+          await handleDownloadModel();
+        }}
+        showToast={showToast}
+      />
     </div>
   );
 }
