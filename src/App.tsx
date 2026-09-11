@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
 
 interface Note {
@@ -24,15 +25,19 @@ interface AppSettings {
   models_folder?: string;
   model_idle_timeout_mins?: number;
   request_timeout_secs?: number;
+  mini_record_mode?: "new_note" | "append";
+  provider_id?: string;
 }
 
 interface LlmProvider {
   id: string;
   name: string;
-  provider_type: "cloudflare" | "groq" | "openai" | "custom";
+  provider_type: "cloudflare" | "groq" | "openai" | "ollama" | "custom";
   api_key: string;
   account_id: string;
   base_url: string;
+  model?: string;
+  recent_models?: string[];
 }
 
 interface PromptPreset {
@@ -76,6 +81,81 @@ interface ModelMemoryStatus {
   port?: number;
 }
 
+interface CloudflareUsagePeriod {
+  label: string;
+  total_neurons: number;
+  total_cost_usd: number;
+  asr_audio_secs: number;
+  asr_count: number;
+  llm_tokens: number;
+  llm_count: number;
+}
+
+interface OperationResult {
+  text: string;
+  cf_neurons?: number | null;
+  cf_cost?: number | null;
+}
+
+interface CloudflareUsageSummary {
+  today: CloudflareUsagePeriod;
+  current_month: CloudflareUsagePeriod;
+  all_time: CloudflareUsagePeriod;
+  monthly_history: CloudflareUsagePeriod[];
+}
+
+function formatNeurons(n: number): string {
+  if (!n || n <= 0) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  if (n % 1 !== 0) return n.toFixed(1);
+  return Math.round(n).toString();
+}
+
+function formatCostUsd(c: number): string {
+  if (!c || c <= 0) return "$0.00";
+  if (c < 0.0001) return "<$0.0001";
+  if (c < 0.01) return `$${c.toFixed(4)}`;
+  return `$${c.toFixed(2)}`;
+}
+
+function formatDurationSecs(secs: number): string {
+  const s = Math.round(secs);
+  const mins = Math.floor(s / 60);
+  const remSecs = s % 60;
+  if (mins === 0) return `${remSecs}s`;
+  return `${mins}m ${remSecs}s`;
+}
+
+function maskAccountId(id: string): string {
+  const trimmed = (id || "").trim();
+  if (!trimmed || trimmed === "<account_id>" || trimmed === "{account_id}") return "";
+  if (trimmed.length <= 6) return trimmed;
+  return "*".repeat(trimmed.length - 6) + trimmed.slice(-6);
+}
+
+function getDisplayModelName(settings: AppSettings): string {
+  if (settings.engine_mode === "local") {
+    // Strictly zero-cost / local offline
+    return `Whisper (${settings.local_model_size})`;
+  }
+  const raw = (settings.model || "").trim();
+  let baseName = raw;
+  if (!baseName) baseName = "whisper-1";
+  else if (baseName.startsWith("@cf/")) {
+    const parts = baseName.split("/");
+    baseName = parts[parts.length - 1] || baseName;
+    if (baseName === "whisper-large-v3-turbo") {
+      baseName = "turbo";
+    }
+  } else if (baseName.includes("/") && !baseName.startsWith("http")) {
+    const parts = baseName.split("/");
+    baseName = parts[parts.length - 1] || baseName;
+  }
+
+  return baseName;
+}
+
 function deriveTitle(text: string): string {
   const trimmed = text.trim();
   if (!trimmed) return "Untitled Note";
@@ -103,17 +183,6 @@ function formatDuration(seconds: number): string {
   return `${m}m ${s}s`;
 }
 
-interface ProviderPreset {
-  id: string;
-  name: string;
-  icon: string;
-  url: string;
-  defaultModel: string;
-  keyPlaceholder: string;
-  keyHint: string;
-  urlHint: string;
-}
-
 interface LogEntry {
   id: string;
   timestamp: string;
@@ -124,76 +193,6 @@ interface LogEntry {
   endpoint?: string;
   message: string;
   details?: string;
-}
-
-const PROVIDER_PRESETS: ProviderPreset[] = [
-  {
-    id: "groq",
-    name: "Groq",
-    icon: "⚡",
-    url: "https://api.groq.com/openai/v1",
-    defaultModel: "whisper-large-v3-turbo",
-    keyPlaceholder: "gsk_...",
-    keyHint: "Groq Cloud API Key (from console.groq.com/keys).",
-    urlHint: "Ultra-fast Whisper hosted on Groq LPU inference engine.",
-  },
-  {
-    id: "cloudflare",
-    name: "Cloudflare Workers AI",
-    icon: "☁",
-    url: "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1",
-    defaultModel: "@cf/openai/whisper",
-    keyPlaceholder: "Cloudflare API Token",
-    keyHint: "Cloudflare API Token with Workers AI Read permissions.",
-    urlHint: "Cloudflare Workers AI serverless endpoint.",
-  },
-  {
-    id: "openai",
-    name: "OpenAI",
-    icon: "🤖",
-    url: "https://api.openai.com/v1",
-    defaultModel: "whisper-1",
-    keyPlaceholder: "sk-...",
-    keyHint: "OpenAI Secret API Key.",
-    urlHint: "Official OpenAI audio transcription endpoint.",
-  },
-  {
-    id: "local",
-    name: "Local / Self-Hosted",
-    icon: "🖥",
-    url: "http://localhost:8000/v1",
-    defaultModel: "whisper-1",
-    keyPlaceholder: "(Optional for local servers)",
-    keyHint: "Optional auth token if required by your local server.",
-    urlHint: "Local vLLM, Ollama, Speaches, or whisper-asr server.",
-  },
-  {
-    id: "custom",
-    name: "Custom",
-    icon: "⚙",
-    url: "",
-    defaultModel: "",
-    keyPlaceholder: "Bearer token or API key",
-    keyHint: "Authorization Bearer token.",
-    urlHint: "Custom OpenAI-compatible transcription endpoint.",
-  },
-];
-
-function getActivePreset(url: string): ProviderPreset {
-  const trimmed = (url || "").trim();
-  if (trimmed.includes("api.groq.com")) {
-    return PROVIDER_PRESETS[0];
-  }
-  if (trimmed.includes("api.cloudflare.com")) {
-    return PROVIDER_PRESETS[1];
-  }
-  if (trimmed.includes("api.openai.com")) {
-    return PROVIDER_PRESETS[2];
-  }
-  if (trimmed.includes("localhost") || trimmed.includes("127.0.0.1") || trimmed.includes("0.0.0.0")) {
-    return PROVIDER_PRESETS[3];
-  }
-  return PROVIDER_PRESETS[4];
 }
 
 function isFullScreenMode(): boolean {
@@ -239,9 +238,8 @@ export default function App() {
     models_folder: "",
     model_idle_timeout_mins: 10,
     request_timeout_secs: 180,
+    mini_record_mode: "new_note",
   });
-
-  const activePreset = getActivePreset(settings.api_base_url);
 
   const DEFAULT_PRESETS: PromptPreset[] = [
     {
@@ -290,7 +288,7 @@ export default function App() {
         provider_type: "cloudflare",
         api_key: "",
         account_id: "",
-        base_url: "",
+        base_url: "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1",
       },
       {
         id: "GROQ_DEFAULT",
@@ -299,6 +297,14 @@ export default function App() {
         api_key: "",
         account_id: "",
         base_url: "https://api.groq.com/openai/v1",
+      },
+      {
+        id: "OLLAMA_DEFAULT",
+        name: "Ollama (Local)",
+        provider_type: "ollama",
+        api_key: "",
+        account_id: "",
+        base_url: "http://localhost:11434/v1",
       },
     ],
     presets: DEFAULT_PRESETS,
@@ -323,10 +329,13 @@ export default function App() {
   const [isTransforming, setIsTransforming] = useState(false);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
-  const [showAdvancedUrl, setShowAdvancedUrl] = useState(false);
   const [editingProviderId, setEditingProviderId] = useState<string>("CLOUDFLARE_DEFAULT");
   const [navOverflowOpen, setNavOverflowOpen] = useState(false);
   const navOverflowRef = useRef<HTMLDivElement>(null);
+  const [isFullScreen, setIsFullScreen] = useState(false);
+  const [windowWidth, setWindowWidth] = useState(
+    typeof window !== "undefined" ? window.innerWidth : 1200
+  );
 
   const [logs, setLogs] = useState<LogEntry[]>(() => {
     try {
@@ -375,7 +384,48 @@ export default function App() {
     showToast("✓ Diagnostic logs copied!");
   };
 
-  const [settingsNavTab, setSettingsNavTab] = useState<"asr" | "llm" | "preferences" | "logs">("asr");
+  const [settingsNavTab, setSettingsNavTab] = useState<"providers" | "asr" | "llm" | "preferences" | "logs">("providers");
+
+  const [cfUsage, setCfUsage] = useState<CloudflareUsageSummary | null>(null);
+  const [loadingCfUsage, setLoadingCfUsage] = useState<boolean>(false);
+  const [revealAccountId, setRevealAccountId] = useState<boolean>(false);
+  const [focusedAccountId, setFocusedAccountId] = useState<string | null>(null);
+
+  const currentAsrProvider = (llmSettings.providers || []).find((p) => p.id === (settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id)));
+  const isCloudflareAsr = settings.engine_mode === "cloud" && (settings.api_base_url.includes("api.cloudflare.com") || currentAsrProvider?.provider_type === "cloudflare");
+  const activeLlmProvider = (llmSettings.providers || []).find((p) => p.id === llmSettings.active_provider_id);
+  const isCloudflareLlm = llmSettings.enabled && (
+    activeLlmProvider?.provider_type === "cloudflare" ||
+    (activeLlmProvider?.base_url || "").includes("cloudflare.com")
+  );
+  const isCloudflareActive = isCloudflareAsr || isCloudflareLlm;
+
+  async function loadCfUsage(): Promise<CloudflareUsageSummary | null> {
+    try {
+      setLoadingCfUsage(true);
+      const summary: CloudflareUsageSummary = await invoke("get_cf_usage_summary");
+      setCfUsage(summary);
+      return summary;
+    } catch (err) {
+      console.error("Failed to load Cloudflare usage summary:", err);
+      return null;
+    } finally {
+      setLoadingCfUsage(false);
+    }
+  }
+
+  async function handleClearCfUsage() {
+    if (!window.confirm("Are you sure you want to clear your local Cloudflare usage records? This cannot be undone.")) {
+      return;
+    }
+    try {
+      await invoke("clear_cf_usage_logs");
+      await loadCfUsage();
+      showToast("✓ Cloudflare usage history cleared");
+    } catch (err) {
+      showToast(`Failed to clear usage: ${err}`);
+    }
+  }
 
   const activeViewRef = useRef(activeView);
   activeViewRef.current = activeView;
@@ -403,6 +453,7 @@ export default function App() {
     loadNotes();
     loadSettings();
     loadLlmSettings();
+    loadCfUsage();
   }, []);
 
   useEffect(() => {
@@ -599,6 +650,41 @@ export default function App() {
     };
   }, [navOverflowOpen]);
 
+  // Track fullscreen / maximized state and window dimensions for stacked navbar
+  useEffect(() => {
+    let unlistenResize: (() => void) | undefined;
+
+    const updateWindowMetrics = async () => {
+      setWindowWidth(window.innerWidth);
+      try {
+        const win = getCurrentWindow();
+        const [max, fs] = await Promise.all([win.isMaximized(), win.isFullscreen()]);
+        setIsFullScreen(Boolean(max || fs));
+      } catch {
+        setIsFullScreen(window.innerWidth >= 1200);
+      }
+    };
+
+    updateWindowMetrics();
+    window.addEventListener("resize", updateWindowMetrics);
+
+    try {
+      const win = getCurrentWindow();
+      win.onResized(() => {
+        updateWindowMetrics();
+      }).then((unlisten) => {
+        unlistenResize = unlisten;
+      }).catch(() => {});
+    } catch {}
+
+    return () => {
+      window.removeEventListener("resize", updateWindowMetrics);
+      if (unlistenResize) unlistenResize();
+    };
+  }, []);
+
+  const isStackedNav = !isFullScreen || windowWidth < 1150;
+
   async function loadNotes() {
     try {
       const list: Note[] = await invoke("get_notes");
@@ -652,8 +738,11 @@ export default function App() {
   async function loadLlmSettings() {
     try {
       const cfg: LlmSettings = await invoke("get_llm_config");
+      const activeP = (cfg.providers || []).find((p) => p.id === cfg.active_provider_id);
+      const activeModel = cfg.model || activeP?.model || "";
       const normalized: LlmSettings = {
         ...cfg,
+        model: activeModel,
         presets: cfg.presets && cfg.presets.length > 0 ? cfg.presets : DEFAULT_PRESETS,
       };
       setLlmSettings(normalized);
@@ -676,6 +765,25 @@ export default function App() {
       console.error("Failed saving LLM config:", e);
       setErrorMsg(String(e));
     }
+  }
+
+  function handleSelectOrUpdateModel(newModel: string) {
+    const activeId = llmSettingsRef.current.active_provider_id;
+    const trimmed = newModel.trim();
+    const updatedProviders = (llmSettingsRef.current.providers || []).map((p) => {
+      if (p.id === activeId) {
+        const recents = p.recent_models || [];
+        const newRecents = trimmed && !recents.includes(trimmed)
+          ? [trimmed, ...recents.filter((m) => m !== trimmed)].slice(0, 6)
+          : recents;
+        return { ...p, model: trimmed, recent_models: newRecents };
+      }
+      return p;
+    });
+    updateAndSaveLlmSettings({
+      model: newModel,
+      providers: updatedProviders,
+    });
   }
 
   function handleStartAddPreset() {
@@ -795,9 +903,22 @@ export default function App() {
       p.id === id ? { ...p, ...patch } : p
     );
     updateAndSaveLlmSettings({ providers: updated });
+
+    const currentAsrPid = settingsRef.current.provider_id || (llmSettingsRef.current.providers.find(p => p.base_url === settingsRef.current.api_base_url)?.id);
+    if (currentAsrPid === id) {
+      const p = updated.find((x) => x.id === id);
+      if (p) {
+        const asrPatch: Partial<AppSettings> = {};
+        if (patch.base_url !== undefined) asrPatch.api_base_url = p.base_url;
+        if (patch.api_key !== undefined) asrPatch.api_key = p.api_key;
+        if (Object.keys(asrPatch).length > 0) {
+          updateAndSaveSettings(asrPatch);
+        }
+      }
+    }
   }
 
-  function handleAddProvider(type: "cloudflare" | "groq" | "openai" | "custom") {
+  function handleAddProvider(type: "cloudflare" | "groq" | "openai" | "ollama" | "custom") {
     const rand = Math.floor(1000 + Math.random() * 9000);
     const newId =
       type === "cloudflare"
@@ -806,6 +927,8 @@ export default function App() {
         ? `GROQ_${rand}`
         : type === "openai"
         ? `OPENAI_${rand}`
+        : type === "ollama"
+        ? `OLLAMA_${rand}`
         : `CUSTOM_${rand}`;
 
     const newName =
@@ -815,6 +938,8 @@ export default function App() {
         ? `Groq Cloud ${rand}`
         : type === "openai"
         ? `OpenAI ${rand}`
+        : type === "ollama"
+        ? `Ollama Local ${rand}`
         : `Custom Provider ${rand}`;
 
     const newProvider: LlmProvider = {
@@ -824,12 +949,16 @@ export default function App() {
       api_key: "",
       account_id: "",
       base_url:
-        type === "groq"
+        type === "cloudflare"
+          ? "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1"
+          : type === "groq"
           ? "https://api.groq.com/openai/v1"
           : type === "openai"
           ? "https://api.openai.com/v1"
-          : type === "custom"
+          : type === "ollama"
           ? "http://localhost:11434/v1"
+          : type === "custom"
+          ? "http://localhost:8000/v1"
           : "",
     };
 
@@ -841,10 +970,28 @@ export default function App() {
     setEditingProviderId(newId);
   }
 
+  function hasCustomProviderInfo(p: LlmProvider): boolean {
+    if (p.api_key?.trim() || p.account_id?.trim()) return true;
+    const url = p.base_url?.trim() || "";
+    if (!url) return false;
+    if (p.provider_type === "groq" && url === "https://api.groq.com/openai/v1") return false;
+    if (p.provider_type === "openai" && url === "https://api.openai.com/v1") return false;
+    if (p.provider_type === "ollama" && url === "http://localhost:11434/v1") return false;
+    if (p.provider_type === "cloudflare" && (url.includes("<account_id>") || url === "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1")) return false;
+    return true;
+  }
+
   function handleDeleteProvider(id: string) {
     if (llmSettingsRef.current.providers.length <= 1) {
       showToast("Cannot delete the only configured provider");
       return;
+    }
+    const target = llmSettingsRef.current.providers.find((p) => p.id === id);
+    if (target && hasCustomProviderInfo(target)) {
+      const ok = window.confirm(
+        `Delete provider "${target.name}"?\n\nThis provider has saved credentials or custom configuration.`
+      );
+      if (!ok) return;
     }
     const filtered = llmSettingsRef.current.providers.filter((p) => p.id !== id);
     const nextActive =
@@ -869,7 +1016,7 @@ export default function App() {
     setIsTransforming(true);
     setErrorMsg(null);
     try {
-      const transformed: string = await invoke("transform_with_llm", {
+      const res: OperationResult = await invoke("transform_with_llm", {
         text,
         providerId: llmSettingsRef.current.active_provider_id,
         model: llmSettingsRef.current.model,
@@ -877,18 +1024,48 @@ export default function App() {
         customPrompt: llmSettingsRef.current.custom_prompt || undefined,
       });
 
+      const transformed = (res && typeof res === "object" ? res.text : String(res || "")).trim();
+      const itemNeurons = res?.cf_neurons ?? null;
+      const itemCost = res?.cf_cost ?? null;
+
       setLlmResult(transformed);
 
       const activeId = activeIdRef.current;
       await persistNote(transformed, activeId);
+
+      await loadCfUsage();
+      const activeProvider = (llmSettingsRef.current.providers || []).find((p) => p.id === llmSettingsRef.current.active_provider_id);
+      const isCfLlm = llmSettingsRef.current.enabled && (
+        activeProvider?.provider_type === "cloudflare" ||
+        (activeProvider?.base_url || "").includes("cloudflare.com")
+      );
+      const isLocalLlm = activeProvider?.provider_type === "ollama" || (activeProvider?.base_url || "").includes("localhost") || (activeProvider?.base_url || "").includes("127.0.0.1");
+
+      let logMsg = `Transformed ${text.split(/\s+/).filter(Boolean).length} words -> ${transformed.split(/\s+/).filter(Boolean).length} words.`;
+      if (isCfLlm) {
+        if (itemNeurons !== null && itemNeurons !== undefined) {
+          logMsg += ` Consumed: ${formatNeurons(itemNeurons)} Ⓝ (${formatCostUsd(itemCost || 0)})`;
+        }
+      } else if (isLocalLlm) {
+        logMsg += ` (Local LLM - zero cost)`;
+      }
+
+      let logDetails = `Raw Input:\n${text}\n\nTransformed Output:\n${transformed}`;
+      if (isCfLlm) {
+        if (itemNeurons !== null && itemNeurons !== undefined) {
+          logDetails += `\n\nCloudflare LLM Consumed: ${formatNeurons(itemNeurons)} Neurons (~${formatCostUsd(itemCost || 0)})`;
+        }
+      } else if (isLocalLlm) {
+        logDetails += `\n\nLocal model inference - 100% offline, zero cloud cost.`;
+      }
 
       addLog({
         level: "success",
         title: "LLM Transformation Succeeded",
         engine: `LLM (${llmSettingsRef.current.voice_preset})`,
         model: llmSettingsRef.current.model,
-        message: `Transformed ${text.split(/\s+/).filter(Boolean).length} words -> ${transformed.split(/\s+/).filter(Boolean).length} words`,
-        details: `Raw Input:\n${text}\n\nTransformed Output:\n${transformed}`,
+        message: logMsg,
+        details: logDetails,
       });
 
       if (settingsRef.current.auto_copy) {
@@ -941,10 +1118,11 @@ export default function App() {
     }
   }
 
-  function openSettings(tab: "asr" | "llm" | "preferences" | "logs" = "asr") {
+  function openSettings(tab: "providers" | "asr" | "llm" | "preferences" | "logs" = "asr") {
     setSettingsNavTab(tab);
     loadSettings();
     loadLlmSettings();
+    loadCfUsage();
     refreshModelStatus();
     refreshMemoryStatus();
     setActiveView("settings");
@@ -974,6 +1152,7 @@ export default function App() {
       const saved: Note = await invoke("save_note", { title, content: text });
       await loadNotes();
       setActiveNoteId(saved.id);
+      activeIdRef.current = saved.id;
       return saved.id;
     }
   }
@@ -998,25 +1177,70 @@ export default function App() {
       setIsRecording(false);
       setIsTranscribing(true);
       try {
-        const transcript: string = await invoke("stop_recording_and_transcribe");
+        const res: OperationResult = await invoke("stop_recording_and_transcribe");
+        const transcript = (res && typeof res === "object" ? res.text : String(res || "")).trim();
+        const itemNeurons = res?.cf_neurons ?? null;
+        const itemCost = res?.cf_cost ?? null;
+
         if (transcript) {
+          const isMini = miniModeRef.current;
+          const shouldCreateNewNote = isMini && (settingsRef.current.mini_record_mode !== "append");
+          await loadCfUsage();
+
+          const isCfAsr = settingsRef.current.engine_mode === "cloud" && (settingsRef.current.api_base_url || "").includes("api.cloudflare.com");
+          const isLocalAsr = settingsRef.current.engine_mode === "local";
+          const isTinyEn = isCfAsr && (settingsRef.current.model || "").includes("tiny");
+
+          let asrMsg = `Transcribed ${transcript.trim().split(/\s+/).filter(Boolean).length} words.`;
+          if (isTinyEn) {
+            asrMsg += ` (whisper-tiny-en · Beta)`;
+          } else if (isCfAsr) {
+            if (itemNeurons !== null && itemNeurons !== undefined) {
+              asrMsg += ` Consumed: ${formatNeurons(itemNeurons)} Ⓝ (${formatCostUsd(itemCost || 0)})`;
+            }
+          } else if (isLocalAsr) {
+            asrMsg += ` (Local engine - zero cost)`;
+          }
+
+          let asrDetails = `Result: "${transcript.slice(0, 200)}${transcript.length > 200 ? "..." : ""}"`;
+          if (isTinyEn) {
+            asrDetails += `\n\nCloudflare Workers AI (whisper-tiny-en Beta · Fast) - zero neuron billing.`;
+          } else if (isCfAsr) {
+            if (itemNeurons !== null && itemNeurons !== undefined) {
+              asrDetails += `\n\nCloudflare ASR Consumed: ${formatNeurons(itemNeurons)} Neurons (~${formatCostUsd(itemCost || 0)})`;
+            }
+          } else if (isLocalAsr) {
+            asrDetails += `\n\nLocal engine (${settingsRef.current.local_engine}) - 100% offline, zero cloud cost.`;
+          }
+
           if (llmSettingsRef.current.enabled) {
-            // Dual-field multi-clip accumulation
-            const currentRaw = rawTranscriptRef.current;
-            const nextRaw = currentRaw ? `${currentRaw.trim()} ${transcript}` : transcript;
+            // Dual-field multi-clip accumulation or fresh item
+            let nextRaw: string;
+            let targetNoteId: number | null;
+
+            if (shouldCreateNewNote) {
+              nextRaw = transcript;
+              targetNoteId = null;
+              setLlmResult("");
+            } else {
+              const currentRaw = rawTranscriptRef.current;
+              nextRaw = currentRaw ? `${currentRaw.trim()} ${transcript}` : transcript;
+              targetNoteId = activeIdRef.current;
+            }
+
             setRawTranscript(nextRaw);
             rawTranscriptRef.current = nextRaw;
             setContent(nextRaw);
-            await persistNote(nextRaw, activeIdRef.current);
+            await persistNote(nextRaw, targetNoteId);
 
             addLog({
               level: "success",
               title: "Transcription Successful",
-              engine: settingsRef.current.engine_mode === "cloud" ? "Remote API" : `Local (${settingsRef.current.local_engine})`,
+              engine: settingsRef.current.engine_mode === "cloud" ? (isCfAsr ? "Cloudflare Workers AI" : "Remote API") : `Local (${settingsRef.current.local_engine})`,
               model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
               endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
-              message: `Transcribed ${transcript.trim().split(/\s+/).filter(Boolean).length} words.`,
-              details: `Result: "${transcript.slice(0, 200)}${transcript.length > 200 ? "..." : ""}"`,
+              message: asrMsg,
+              details: asrDetails,
             });
 
             if (llmSettingsRef.current.auto_mode) {
@@ -1029,22 +1253,33 @@ export default function App() {
               }
             }
           } else {
-            // Standard scratchpad behavior
-            const current = activeContentRef.current;
-            const nextContent = current ? `${current.trim()} ${transcript}` : transcript;
+            // Standard scratchpad behavior or fresh item
+            let nextContent: string;
+            let targetNoteId: number | null;
+
+            if (shouldCreateNewNote) {
+              nextContent = transcript;
+              targetNoteId = null;
+              setLlmResult("");
+            } else {
+              const current = activeContentRef.current;
+              nextContent = current ? `${current.trim()} ${transcript}` : transcript;
+              targetNoteId = activeIdRef.current;
+            }
+
             setContent(nextContent);
             setRawTranscript(nextContent);
             rawTranscriptRef.current = nextContent;
-            await persistNote(nextContent, activeIdRef.current);
+            await persistNote(nextContent, targetNoteId);
 
             addLog({
               level: "success",
               title: "Transcription Successful",
-              engine: settingsRef.current.engine_mode === "cloud" ? "Remote API" : `Local (${settingsRef.current.local_engine})`,
+              engine: settingsRef.current.engine_mode === "cloud" ? (isCfAsr ? "Cloudflare Workers AI" : "Remote API") : `Local (${settingsRef.current.local_engine})`,
               model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
               endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
-              message: `Transcribed ${transcript.trim().split(/\s+/).filter(Boolean).length} words.`,
-              details: `Result: "${transcript.slice(0, 200)}${transcript.length > 200 ? "..." : ""}"`,
+              message: asrMsg,
+              details: asrDetails,
             });
 
             if (settingsRef.current.auto_copy) {
@@ -1235,6 +1470,16 @@ export default function App() {
           {isRecording ? "■" : isTranscribing ? "…" : copiedNotification ? "✓" : "●"}
         </button>
 
+        {isRecording && (
+          <span
+            className="mini-elapsed-pill"
+            onMouseDown={(e) => e.stopPropagation()}
+            title={`Recording: ${formatTimer(recordSeconds)}`}
+          >
+            {formatTimer(recordSeconds)}
+          </span>
+        )}
+
         <button
           className="btn-mini-float"
           onMouseDown={(e) => e.stopPropagation()}
@@ -1245,22 +1490,6 @@ export default function App() {
           title="Expand to Full Note Editor (Alt+M)"
         >
           ⛶
-        </button>
-
-        <button
-          className={`btn-mini-float ${settings.always_on_top ? "pinned" : ""}`}
-          onMouseDown={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            e.stopPropagation();
-            toggleAlwaysOnTop();
-          }}
-          title={
-            settings.always_on_top
-              ? "Always on Top: ON (Click to unpin)"
-              : "Always on Top: OFF (Click to pin)"
-          }
-        >
-          📌
         </button>
       </div>
     );
@@ -1343,22 +1572,80 @@ export default function App() {
 
       {/* Main Content Area: Switch between Notes Scratchpad and Full-Page Settings */}
       {activeView === "settings" ? (
-        <main className="settings-page">
-          <header className="settings-page-header">
-            <div className="settings-header-left">
+        <div className="settings-page">
+          {/* Full-Height Left Navigation Sidebar */}
+          <aside className="settings-sidebar">
+            <div className="settings-sidebar-header">
               <button
                 type="button"
                 className="btn-back"
                 onClick={closeSettings}
                 title="Return to notes editor (Esc)"
               >
-                ← Back to Notes <kbd className="key-hint">Esc</kbd>
+                ← Back <kbd className="key-hint">Esc</kbd>
               </button>
               <h2 className="settings-page-title">Settings</h2>
             </div>
-            <div className="settings-header-right">
-              {settings.engine_mode === "local" && (
-                memoryStatus?.is_loaded ? (
+
+            <nav className="settings-sidebar-nav" aria-label="Settings Navigation">
+              <button
+                type="button"
+                className={`settings-nav-tab ${settingsNavTab === "providers" ? "active" : ""}`}
+                onClick={() => {
+                  setSettingsNavTab("providers");
+                  loadLlmSettings();
+                  loadCfUsage();
+                }}
+              >
+                <span className="settings-nav-icon">🔌</span>
+                <span className="settings-nav-label">Providers</span>
+              </button>
+              <button
+                type="button"
+                className={`settings-nav-tab ${settingsNavTab === "asr" ? "active" : ""}`}
+                onClick={() => setSettingsNavTab("asr")}
+              >
+                <span className="settings-nav-icon">🎙</span>
+                <span className="settings-nav-label">Audio / ASR</span>
+              </button>
+              <button
+                type="button"
+                className={`settings-nav-tab ${settingsNavTab === "llm" ? "active" : ""}`}
+                onClick={() => {
+                  setSettingsNavTab("llm");
+                  loadLlmSettings();
+                }}
+              >
+                <span className="settings-nav-icon">🤖</span>
+                <span className="settings-nav-label">LLM Transform</span>
+                {llmSettings.enabled && <span className="settings-badge-on">ON</span>}
+              </button>
+              <button
+                type="button"
+                className={`settings-nav-tab ${settingsNavTab === "preferences" ? "active" : ""}`}
+                onClick={() => setSettingsNavTab("preferences")}
+              >
+                <span className="settings-nav-icon">⚙</span>
+                <span className="settings-nav-label">Preferences</span>
+              </button>
+              <button
+                type="button"
+                className={`settings-nav-tab ${settingsNavTab === "logs" ? "active" : ""}`}
+                onClick={() => setSettingsNavTab("logs")}
+              >
+                <span className="settings-nav-icon">📋</span>
+                <span className="settings-nav-label">Diagnostic Logs</span>
+                {logs.filter((l) => l.level === "error").length > 0 && (
+                  <span className="tab-error-pill">
+                    {logs.filter((l) => l.level === "error").length}
+                  </span>
+                )}
+              </button>
+            </nav>
+
+            {settings.engine_mode === "local" && (
+              <div className="settings-sidebar-footer">
+                {memoryStatus?.is_loaded ? (
                   <div className="memory-badge-loaded">
                     <span className="memory-pulse-dot"></span>
                     <span>RAM: ~{memoryStatus.estimated_ram_mb} MB</span>
@@ -1367,52 +1654,14 @@ export default function App() {
                   <div className="memory-badge-cold">
                     <span>○ RAM: Inactive (0 MB)</span>
                   </div>
-                )
-              )}
-            </div>
-          </header>
+                )}
+              </div>
+            )}
+          </aside>
 
-          {/* Top-Level Settings Navigation Tabs */}
-          <div className="settings-nav-tabs">
-            <button
-              type="button"
-              className={`settings-nav-tab ${settingsNavTab === "asr" ? "active" : ""}`}
-              onClick={() => setSettingsNavTab("asr")}
-            >
-              🎙 ASR
-            </button>
-            <button
-              type="button"
-              className={`settings-nav-tab ${settingsNavTab === "llm" ? "active" : ""}`}
-              onClick={() => {
-                setSettingsNavTab("llm");
-                loadLlmSettings();
-              }}
-            >
-              🤖 LLM {llmSettings.enabled ? "(ON)" : ""}
-            </button>
-            <button
-              type="button"
-              className={`settings-nav-tab ${settingsNavTab === "preferences" ? "active" : ""}`}
-              onClick={() => setSettingsNavTab("preferences")}
-            >
-              ⚙ Preferences
-            </button>
-            <button
-              type="button"
-              className={`settings-nav-tab ${settingsNavTab === "logs" ? "active" : ""}`}
-              onClick={() => setSettingsNavTab("logs")}
-            >
-              📋 Diagnostic Logs
-              {logs.filter((l) => l.level === "error").length > 0 && (
-                <span className="tab-error-pill">
-                  {logs.filter((l) => l.level === "error").length}
-                </span>
-              )}
-            </button>
-          </div>
-
-          <div className="settings-content">
+          {/* Settings Main Content Area */}
+          <main className="settings-main">
+            <div className="settings-content">
             {errorMsg && (
               <div className="toast-error" style={{ position: "relative", top: 0, left: 0, transform: "none", width: "100%", maxWidth: "100%", marginBottom: "14px" }}>
                 <div className="toast-error-header">
@@ -1436,6 +1685,377 @@ export default function App() {
                   </button>
                 </div>
               </div>
+            )}
+
+            {settingsNavTab === "providers" && (
+              <>
+                <div className="settings-section-card">
+                  <div className="settings-section-heading" style={{ justifyContent: "space-between" }}>
+                    <span>Configured AI &amp; Speech Providers</span>
+                    <div style={{ display: "flex", gap: "6px" }}>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => handleAddProvider("cloudflare")}
+                        title="Add Cloudflare Workers AI"
+                      >
+                        + Cloudflare
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => handleAddProvider("groq")}
+                        title="Add Groq Cloud"
+                      >
+                        + Groq
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => handleAddProvider("openai")}
+                        title="Add OpenAI"
+                      >
+                        + OpenAI
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => handleAddProvider("ollama")}
+                        title="Add local Ollama"
+                      >
+                        + Ollama
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => handleAddProvider("custom")}
+                        title="Add Custom endpoint"
+                      >
+                        + Custom
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="form-hint" style={{ marginBottom: "12px" }}>
+                    Endpoints and API keys saved here are shared across both 🎙 ASR (Audio) and 🤖 LLM tabs.
+                  </div>
+
+                  <div className="llm-provider-list" style={{ marginBottom: "16px" }}>
+                    {llmSettings.providers.map((p) => {
+                      const isSelected = editingProviderId === p.id;
+                      const isLlmActive = llmSettings.active_provider_id === p.id;
+                      const currentAsrPid = settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id);
+                      const isAsrActive = currentAsrPid === p.id;
+                      return (
+                        <div
+                          key={p.id}
+                          className={`llm-provider-card ${isSelected ? "active" : ""}`}
+                          onClick={() => setEditingProviderId(p.id)}
+                        >
+                          <div className="llm-provider-info">
+                            <span className="llm-provider-icon">
+                              {p.provider_type === "cloudflare"
+                                ? "☁"
+                                : p.provider_type === "groq"
+                                ? "⚡"
+                                : p.provider_type === "openai"
+                                ? "🤖"
+                                : p.provider_type === "ollama"
+                                ? "🦙"
+                                : "⚙"}
+                            </span>
+                            <div>
+                              <div className="llm-provider-name">{p.name}</div>
+                              <div className="llm-provider-type">
+                                {p.provider_type} • {p.api_key?.trim() ? "Key set" : p.provider_type === "ollama" ? "Local" : "No key"}
+                              </div>
+                            </div>
+                          </div>
+                          <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                            {isAsrActive && (
+                              <span className="badge-pill installed" title="Selected for Audio transcription" style={{ fontSize: "10px", padding: "2px 6px" }}>
+                                🎙 Audio
+                              </span>
+                            )}
+                            {isLlmActive && (
+                              <span className="badge-pill installed" title="Selected for LLM assistant" style={{ fontSize: "10px", padding: "2px 6px" }}>
+                                🤖 LLM
+                              </span>
+                            )}
+                            {llmSettings.providers.length > 1 && (
+                              <button
+                                type="button"
+                                className="btn-icon"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteProvider(p.id);
+                                }}
+                                title="Delete provider"
+                              >
+                                ✕
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {(() => {
+                    const cur = llmSettings.providers.find((p) => p.id === editingProviderId) || llmSettings.providers[0];
+                    if (!cur) return null;
+                    return (
+                      <div style={{ background: "var(--bg-primary)", padding: "14px", borderRadius: "8px", border: "1px solid var(--border)", display: "flex", flexDirection: "column", gap: "12px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <span style={{ fontSize: "13px", fontWeight: 600 }}>
+                            Configure {cur.name} Credentials
+                          </span>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => handleFetchModels(cur.id)}
+                            disabled={isFetchingModels}
+                            title="Query provider endpoint to verify credentials"
+                          >
+                            {isFetchingModels ? "Testing..." : "🔍 Test Connection"}
+                          </button>
+                        </div>
+
+                        <div className="form-group">
+                          <label className="form-label">Provider Label</label>
+                          <input
+                            type="text"
+                            className="form-input"
+                            value={cur.name}
+                            onChange={(e) => handleUpdateProvider(cur.id, { name: e.target.value })}
+                          />
+                        </div>
+
+                        {cur.provider_type === "cloudflare" && (
+                          <>
+                            <div className="form-group">
+                              <label className="form-label">Cloudflare Account ID</label>
+                              <div className="input-with-button">
+                                <input
+                                  type="text"
+                                  className="form-input"
+                                  placeholder="e.g. c3a0b12984ef... (found in Cloudflare Dashboard)"
+                                  value={(() => {
+                                    const raw = cur.account_id || (() => {
+                                      const match = cur.base_url?.match(/accounts\/([a-zA-Z0-9_-]+)/);
+                                      return match && match[1] !== "<account_id>" && match[1] !== "{account_id}" ? match[1] : "";
+                                    })();
+                                    return revealAccountId || focusedAccountId === cur.id
+                                      ? raw
+                                      : maskAccountId(raw);
+                                  })()}
+                                  onFocus={() => setFocusedAccountId(cur.id)}
+                                  onBlur={() => setFocusedAccountId(null)}
+                                  onChange={(e) => {
+                                    const acc = e.target.value.trim();
+                                    const targetUrl = acc ? `https://api.cloudflare.com/client/v4/accounts/${acc}/ai/v1` : "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1";
+                                    handleUpdateProvider(cur.id, {
+                                      account_id: acc,
+                                      base_url: targetUrl,
+                                    });
+                                  }}
+                                />
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary btn-sm"
+                                  style={{ minWidth: "56px" }}
+                                  onClick={() => setRevealAccountId(!revealAccountId)}
+                                  title={revealAccountId ? "Mask Account ID" : "Reveal full Account ID"}
+                                >
+                                  {revealAccountId ? "Mask" : "Show"}
+                                </button>
+                              </div>
+                              <span className="form-hint">
+                                Found in Cloudflare Dashboard &rarr; Workers &amp; Pages overview (right sidebar). URL is added automatically.
+                              </span>
+                            </div>
+
+                            <div className="form-group">
+                              <label className="form-label">API Key / Token</label>
+                              <input
+                                type="password"
+                                className="form-input"
+                                placeholder="Cloudflare API Token with Workers AI Read permissions"
+                                value={cur.api_key}
+                                onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                              />
+                              <span className="form-hint">
+                                Needs <em>Workers AI: Read</em> permissions. Stored securely in local configuration.
+                              </span>
+                            </div>
+
+                            <div className="cf-usage-panel" style={{ marginTop: "12px" }}>
+                              <div className="cf-usage-panel-header">
+                                <div className="cf-usage-panel-title">
+                                  <span>⚡</span>
+                                  <span>Cloudflare Consumed Workers AI Usage</span>
+                                </div>
+                                <div className="cf-usage-reset-badge">
+                                  Resets 00:00 UTC ({cfUsage?.today?.label || "Today"})
+                                </div>
+                              </div>
+
+                              <div className="cf-usage-panel-stats">
+                                <div className="cf-panel-stat-box">
+                                  <span className="cf-panel-stat-label">Today's Consumed</span>
+                                  <span className="cf-panel-stat-val">
+                                    {formatNeurons(cfUsage?.today?.total_neurons ?? 0)}
+                                    <span className="cf-panel-stat-sub"> Ⓝ</span>
+                                  </span>
+                                </div>
+
+                                <div className="cf-panel-stat-box">
+                                  <span className="cf-panel-stat-label">Consumed Cost</span>
+                                  <span className="cf-panel-stat-val">
+                                    {formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}
+                                    <span className="cf-panel-stat-sub"> @ $0.011/1k</span>
+                                  </span>
+                                </div>
+
+                                <div className="cf-panel-stat-box">
+                                  <span className="cf-panel-stat-label">Today's Speech</span>
+                                  <span className="cf-panel-stat-val">
+                                    {formatDurationSecs(cfUsage?.today?.asr_audio_secs ?? 0)}
+                                    <span className="cf-panel-stat-sub"> ({cfUsage?.today?.asr_count ?? 0} {cfUsage?.today?.asr_count === 1 ? "rec" : "recs"})</span>
+                                  </span>
+                                </div>
+
+                                <div className="cf-panel-stat-box">
+                                  <span className="cf-panel-stat-label">Today's LLM Tokens</span>
+                                  <span className="cf-panel-stat-val">
+                                    {(cfUsage?.today?.llm_tokens ?? 0).toLocaleString()}
+                                    <span className="cf-panel-stat-sub"> ({cfUsage?.today?.llm_count ?? 0} {cfUsage?.today?.llm_count === 1 ? "tx" : "txs"})</span>
+                                  </span>
+                                </div>
+
+                                <div className="cf-panel-stat-box">
+                                  <span className="cf-panel-stat-label">This Month Consumed</span>
+                                  <span className="cf-panel-stat-val">
+                                    {formatNeurons(cfUsage?.current_month?.total_neurons ?? 0)} Ⓝ
+                                    <span className="cf-panel-stat-sub"> ({formatCostUsd(cfUsage?.current_month?.total_cost_usd ?? 0)})</span>
+                                  </span>
+                                </div>
+                              </div>
+
+                              <div className="cf-usage-panel-footer">
+                                <span className="cf-panel-hint">
+                                  Tracks Neurons consumed directly within Lipi (ASR + LLM). Cloudflare free tier resets at 00:00 UTC.
+                                </span>
+                                <div style={{ display: "flex", gap: "6px" }}>
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary"
+                                    style={{ fontSize: "11px", padding: "2px 8px" }}
+                                    onClick={() => loadCfUsage()}
+                                    disabled={loadingCfUsage}
+                                    title="Refresh Cloudflare usage statistics"
+                                  >
+                                    🔄 Refresh
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary"
+                                    style={{ fontSize: "11px", padding: "2px 8px", color: "var(--text-danger, #ef4444)" }}
+                                    onClick={handleClearCfUsage}
+                                    title="Reset local Cloudflare usage tracking data"
+                                  >
+                                    🗑 Reset
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          </>
+                        )}
+
+                        {cur.provider_type === "groq" && (
+                          <div className="form-group">
+                            <label className="form-label">Groq API Key</label>
+                            <input
+                              type="password"
+                              className="form-input"
+                              placeholder="gsk_..."
+                              value={cur.api_key}
+                              onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                            />
+                            <span className="form-hint">From console.groq.com/keys.</span>
+                          </div>
+                        )}
+
+                        {cur.provider_type === "openai" && (
+                          <div className="form-group">
+                            <label className="form-label">OpenAI API Key</label>
+                            <input
+                              type="password"
+                              className="form-input"
+                              placeholder="sk-..."
+                              value={cur.api_key}
+                              onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                            />
+                          </div>
+                        )}
+
+                        {cur.provider_type === "ollama" && (
+                          <>
+                            <div className="form-group">
+                              <label className="form-label">Ollama API Base URL</label>
+                              <input
+                                type="text"
+                                className="form-input"
+                                placeholder="http://localhost:11434/v1"
+                                value={cur.base_url || "http://localhost:11434/v1"}
+                                onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
+                              />
+                              <span className="form-hint">
+                                Runs locally via Ollama API. Make sure Ollama is running (<code>ollama serve</code>). No API key needed.
+                              </span>
+                            </div>
+                            <div className="form-group">
+                              <label className="form-label">API Key / Token (Optional)</label>
+                              <input
+                                type="password"
+                                className="form-input"
+                                placeholder="Optional (not required for local Ollama)"
+                                value={cur.api_key}
+                                onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                              />
+                            </div>
+                          </>
+                        )}
+
+                        {cur.provider_type === "custom" && (
+                          <>
+                            <div className="form-group">
+                              <label className="form-label">Base URL</label>
+                              <input
+                                type="text"
+                                className="form-input"
+                                placeholder="http://localhost:11434/v1 or http://localhost:8000/v1"
+                                value={cur.base_url}
+                                onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
+                              />
+                            </div>
+                            <div className="form-group">
+                              <label className="form-label">API Key / Token (Optional)</label>
+                              <input
+                                type="password"
+                                className="form-input"
+                                placeholder="Bearer token if required by server"
+                                value={cur.api_key}
+                                onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                              />
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </>
             )}
 
             {settingsNavTab === "asr" && (
@@ -1468,130 +2088,147 @@ export default function App() {
 
               {settings.engine_mode === "cloud" ? (
                 <div style={{ display: "flex", flexDirection: "column", gap: "12px", marginTop: "10px" }}>
+                  {/* Unified Provider Selection */}
                   <div className="form-group">
-                    <label className="form-label">Provider Preset</label>
-                    <div className="provider-presets">
-                      {PROVIDER_PRESETS.map((preset) => {
-                        const isActive = activePreset.id === preset.id;
-                        return (
-                          <button
-                            key={preset.id}
-                            type="button"
-                            className={`provider-chip ${isActive ? "active" : ""}`}
-                            onClick={() => {
-                              if (preset.id === "custom") return;
-                              let targetUrl = preset.url;
-                              if (preset.id === "cloudflare") {
-                                const match = settings.api_base_url.match(/accounts\/([a-zA-Z0-9_-]+)\/ai/);
-                                if (match && match[1] && match[1] !== "<account_id>") {
-                                  targetUrl = `https://api.cloudflare.com/client/v4/accounts/${match[1]}/ai/v1`;
-                                }
-                              }
-                              const updated = {
-                                api_base_url: targetUrl,
-                                model: preset.defaultModel,
-                              };
-                              setSettings((prev) => ({ ...prev, ...updated }));
-                              updateAndSaveSettings(updated);
-                            }}
-                          >
-                            <span className="provider-icon">{preset.icon}</span>
-                            <span className="provider-name">{preset.name}</span>
-                          </button>
-                        );
-                      })}
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                      <label className="form-label" style={{ margin: 0 }}>Transcription Provider</label>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => {
+                          const curPid = settings.provider_id || (llmSettings.providers.find((p) => p.base_url === settings.api_base_url)?.id) || llmSettings.providers[0]?.id;
+                          if (curPid) setEditingProviderId(curPid);
+                          setSettingsNavTab("providers");
+                        }}
+                      >
+                        ⚙ Manage Providers
+                      </button>
                     </div>
+                    <select
+                      className="form-input form-select"
+                      value={settings.provider_id || (llmSettings.providers.find((p) => p.base_url === settings.api_base_url)?.id) || llmSettings.providers[0]?.id || ""}
+                      onChange={(e) => {
+                        const pid = e.target.value;
+                        const prov = llmSettings.providers.find((p) => p.id === pid);
+                        if (prov) {
+                          let defaultModel = settings.model;
+                          if (prov.provider_type === "groq") defaultModel = "whisper-large-v3-turbo";
+                          else if (prov.provider_type === "cloudflare") defaultModel = "@cf/openai/whisper";
+                          else if (prov.provider_type === "openai" || prov.provider_type === "ollama") defaultModel = "whisper-1";
+                          const updated: Partial<AppSettings> = {
+                            provider_id: prov.id,
+                            api_base_url: prov.base_url,
+                            api_key: prov.api_key,
+                            model: defaultModel,
+                          };
+                          setSettings((prev) => ({ ...prev, ...updated }));
+                          updateAndSaveSettings(updated);
+                        }
+                      }}
+                    >
+                      {llmSettings.providers.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} ({p.provider_type})
+                        </option>
+                      ))}
+                    </select>
+                    {(() => {
+                      const curPid = settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id) || llmSettings.providers[0]?.id;
+                      const prov = llmSettings.providers.find((p) => p.id === curPid);
+                      if (!prov) return null;
+                      return (
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "4px", fontSize: "12px", color: "var(--text-secondary)" }}>
+                          <span>Endpoint: {prov.base_url || "Default"}</span>
+                          <span>{prov.api_key?.trim() ? "✓ Key Configured" : prov.provider_type === "ollama" ? "✓ Local Server" : "⚠ Key Missing in Providers tab"}</span>
+                        </div>
+                      );
+                    })()}
                   </div>
 
-                  {activePreset.id === "cloudflare" && (
-                    <div className={`preset-alert ${settings.api_base_url.includes("<account_id>") || settings.api_base_url.includes("{account_id}") ? "warning" : "info"}`}>
-                      {settings.api_base_url.includes("<account_id>") || settings.api_base_url.includes("{account_id}") ? (
-                        <>
-                          ⚠️ <strong>Action Needed:</strong> Replace <code>&lt;account_id&gt;</code> in the URL below with your actual Cloudflare Account ID (found in Cloudflare Dashboard &rarr; Workers &amp; Pages).
-                        </>
-                      ) : (
-                        <>
-                          ℹ️ <strong>Cloudflare Workers AI:</strong> Audio will be dispatched directly to <code>{settings.model || "@cf/openai/whisper"}</code> (supports standard binary and large-v3-turbo). Make sure your API Token has <em>Workers AI: Read</em> permissions.
-                        </>
-                      )}
-                    </div>
-                  )}
-
                   <div className="form-group">
-                    <label className="form-label">API Endpoint URL</label>
+                    <label className="form-label">Audio Model Name</label>
                     <input
                       type="text"
                       className="form-input"
-                      placeholder="https://api.openai.com/v1, https://api.groq.com/openai/v1, or http://localhost:8000/v1"
-                      value={settings.api_base_url}
-                      onChange={(e) =>
-                        setSettings({ ...settings, api_base_url: e.target.value })
-                      }
-                      onBlur={() => updateAndSaveSettings({ api_base_url: settings.api_base_url })}
-                      required
-                    />
-                    <span className="form-hint">
-                      {activePreset.urlHint}
-                    </span>
-                  </div>
-
-                  <div className="form-group">
-                    <label className="form-label">API Key / Token {activePreset.id === "local" ? "(Optional)" : ""}</label>
-                    <input
-                      type="password"
-                      className="form-input"
-                      placeholder={activePreset.keyPlaceholder}
-                      value={settings.api_key}
-                      onChange={(e) =>
-                        setSettings({ ...settings, api_key: e.target.value })
-                      }
-                      onBlur={() => updateAndSaveSettings({ api_key: settings.api_key })}
-                    />
-                    <span className="form-hint">
-                      {activePreset.keyHint} Stored securely in local SQLite.
-                    </span>
-                  </div>
-
-                  <div className="form-group">
-                    <label className="form-label">Model Name</label>
-                    <input
-                      type="text"
-                      className="form-input"
-                      placeholder={activePreset.defaultModel || "whisper-1"}
+                      placeholder="whisper-1, whisper-large-v3-turbo, or @cf/openai/whisper"
                       value={settings.model}
-                      onChange={(e) =>
-                        setSettings({ ...settings, model: e.target.value })
-                      }
+                      onChange={(e) => setSettings({ ...settings, model: e.target.value })}
                       onBlur={() => updateAndSaveSettings({ model: settings.model })}
                     />
-                    {activePreset.id === "cloudflare" && (
-                      <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
-                        {[
-                          { id: "@cf/openai/whisper", label: "whisper (Standard)" },
-                          { id: "@cf/openai/whisper-large-v3-turbo", label: "large-v3-turbo (Accurate)" },
-                          { id: "@cf/openai/whisper-tiny-en", label: "tiny-en (Fast)" },
-                        ].map((item) => (
-                          <button
-                            key={item.id}
-                            type="button"
-                            className={`provider-chip ${settings.model === item.id ? "active" : ""}`}
-                            style={{ fontSize: "11px", padding: "3px 8px" }}
-                            onClick={() => {
-                              setSettings({ ...settings, model: item.id });
-                              updateAndSaveSettings({ model: item.id });
-                            }}
-                          >
-                            {item.label}
-                          </button>
-                        ))}
-                      </div>
-                    )}
+                    {(() => {
+                      const curPid = settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id) || llmSettings.providers[0]?.id;
+                      const prov = llmSettings.providers.find((p) => p.id === curPid);
+                      const pType = prov?.provider_type;
+                      if (pType === "cloudflare") {
+                        return (
+                          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
+                            {[
+                              { id: "@cf/openai/whisper", label: "whisper (Standard · ~41.1 Ⓝ/min)" },
+                              { id: "@cf/openai/whisper-large-v3-turbo", label: "large-v3-turbo (Turbo · ~46.6 Ⓝ/min)" },
+                              { id: "@cf/openai/whisper-tiny-en", label: "whisper-tiny-en (Beta · Fast)" },
+                            ].map((item) => (
+                              <button
+                                key={item.id}
+                                type="button"
+                                className={`provider-chip ${settings.model === item.id ? "active" : ""}`}
+                                style={{ fontSize: "11px", padding: "3px 8px" }}
+                                onClick={() => {
+                                  setSettings({ ...settings, model: item.id });
+                                  updateAndSaveSettings({ model: item.id });
+                                }}
+                              >
+                                {item.label}
+                              </button>
+                            ))}
+                          </div>
+                        );
+                      }
+                      if (pType === "groq") {
+                        return (
+                          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
+                            {[
+                              { id: "whisper-large-v3-turbo", label: "whisper-large-v3-turbo (Ultra-Fast)" },
+                              { id: "whisper-large-v3", label: "whisper-large-v3" },
+                            ].map((item) => (
+                              <button
+                                key={item.id}
+                                type="button"
+                                className={`provider-chip ${settings.model === item.id ? "active" : ""}`}
+                                style={{ fontSize: "11px", padding: "3px 8px" }}
+                                onClick={() => {
+                                  setSettings({ ...settings, model: item.id });
+                                  updateAndSaveSettings({ model: item.id });
+                                }}
+                              >
+                                {item.label}
+                              </button>
+                            ))}
+                          </div>
+                        );
+                      }
+                      return (
+                        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
+                          {[
+                            { id: "whisper-1", label: "whisper-1 (OpenAI standard)" },
+                          ].map((item) => (
+                            <button
+                              key={item.id}
+                              type="button"
+                              className={`provider-chip ${settings.model === item.id ? "active" : ""}`}
+                              style={{ fontSize: "11px", padding: "3px 8px" }}
+                              onClick={() => {
+                                setSettings({ ...settings, model: item.id });
+                                updateAndSaveSettings({ model: item.id });
+                              }}
+                            >
+                              {item.label}
+                            </button>
+                          ))}
+                        </div>
+                      );
+                    })()}
                     <span className="form-hint">
-                      {activePreset.id === "groq"
-                        ? "Default: 'whisper-large-v3-turbo' (or 'whisper-large-v3')."
-                        : activePreset.id === "cloudflare"
-                        ? "Supports: '@cf/openai/whisper', '@cf/openai/whisper-large-v3-turbo', '@cf/openai/whisper-tiny-en'."
-                        : "e.g. 'whisper-1' (OpenAI / local standard)."}
+                      Model used for speech-to-text with the selected provider.
                     </span>
                   </div>
 
@@ -2104,245 +2741,52 @@ export default function App() {
 
                 {llmSettings.enabled && (
                   <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-                    {/* Provider Selection */}
+                    {/* Active LLM Provider Selection */}
                     <div className="form-group">
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
-                        <label className="form-label" style={{ margin: 0 }}>Configured Providers</label>
-                        <div style={{ display: "flex", gap: "6px" }}>
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => handleAddProvider("cloudflare")}
-                            title="Add a Cloudflare Workers AI account"
-                          >
-                            + Cloudflare
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => handleAddProvider("groq")}
-                            title="Add a Groq account"
-                          >
-                            + Groq
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => handleAddProvider("openai")}
-                            title="Add an OpenAI account"
-                          >
-                            + OpenAI
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => handleAddProvider("custom")}
-                            title="Add a Custom / Local Ollama / vLLM endpoint"
-                          >
-                            + Custom
-                          </button>
-                        </div>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                        <label className="form-label" style={{ margin: 0 }}>Active LLM Provider</label>
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => {
+                            setEditingProviderId(llmSettings.active_provider_id);
+                            setSettingsNavTab("providers");
+                          }}
+                        >
+                          ⚙ Manage Providers
+                        </button>
                       </div>
-
-                      <div className="llm-provider-list">
-                        {llmSettings.providers.map((p) => {
-                          const isSelected = editingProviderId === p.id;
-                          const isActive = llmSettings.active_provider_id === p.id;
-                          return (
-                            <div
-                              key={p.id}
-                              className={`llm-provider-card ${isSelected ? "active" : ""}`}
-                              onClick={() => setEditingProviderId(p.id)}
-                            >
-                              <div className="llm-provider-info">
-                                <span className="llm-provider-icon">
-                                  {p.provider_type === "cloudflare" ? "☁" : p.provider_type === "groq" ? "⚡" : p.provider_type === "openai" ? "🤖" : "⚙"}
-                                </span>
-                                <div>
-                                  <div className="llm-provider-name">{p.name}</div>
-                                  <div className="llm-provider-type">{p.provider_type}</div>
-                                </div>
-                              </div>
-                              <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                                {isActive ? (
-                                  <span className="badge-pill installed">Active</span>
-                                ) : (
-                                  <button
-                                    type="button"
-                                    className="btn btn-secondary btn-sm"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      updateAndSaveLlmSettings({ active_provider_id: p.id });
-                                      setEditingProviderId(p.id);
-                                    }}
-                                  >
-                                    Use this
-                                  </button>
-                                )}
-                                {llmSettings.providers.length > 1 && (
-                                  <button
-                                    type="button"
-                                    className="btn-icon"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      handleDeleteProvider(p.id);
-                                    }}
-                                    title="Delete provider"
-                                  >
-                                    ✕
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
+                      <select
+                        className="form-input form-select"
+                        value={llmSettings.active_provider_id}
+                        onChange={(e) => {
+                          const newPid = e.target.value;
+                          const targetProv = llmSettings.providers.find((p) => p.id === newPid);
+                          const newModel = targetProv?.model || "";
+                          updateAndSaveLlmSettings({
+                            active_provider_id: newPid,
+                            model: newModel,
+                          });
+                          setAvailableModels([]);
+                        }}
+                      >
+                        {llmSettings.providers.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name} ({p.provider_type})
+                          </option>
+                        ))}
+                      </select>
+                      {(() => {
+                        const cur = llmSettings.providers.find((p) => p.id === llmSettings.active_provider_id);
+                        if (!cur) return null;
+                        return (
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "4px", fontSize: "12px", color: "var(--text-secondary)" }}>
+                            <span>Endpoint: {cur.base_url || "Default endpoint"}</span>
+                            <span>{cur.api_key?.trim() ? "✓ Key Configured" : cur.provider_type === "ollama" ? "✓ Local Server" : "⚠ Key Missing in Providers tab"}</span>
+                          </div>
+                        );
+                      })()}
                     </div>
-
-                    {/* Active / Selected Provider Credentials */}
-                    {(() => {
-                      const cur = llmSettings.providers.find((p) => p.id === editingProviderId) || llmSettings.providers[0];
-                      if (!cur) return null;
-                      return (
-                        <div style={{ background: "var(--bg-primary)", padding: "14px", borderRadius: "8px", border: "1px solid var(--border)", display: "flex", flexDirection: "column", gap: "12px" }}>
-                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                            <span style={{ fontSize: "13px", fontWeight: 600 }}>
-                              Configure {cur.name} Credentials
-                            </span>
-                            {cur.id !== llmSettings.active_provider_id && (
-                              <button
-                                type="button"
-                                className="btn btn-secondary btn-sm"
-                                onClick={() => updateAndSaveLlmSettings({ active_provider_id: cur.id })}
-                              >
-                                Set as Active Provider
-                              </button>
-                            )}
-                          </div>
-
-                          <div className="form-group">
-                            <label className="form-label">Provider Label</label>
-                            <input
-                              type="text"
-                              className="form-input"
-                              value={cur.name}
-                              onChange={(e) => handleUpdateProvider(cur.id, { name: e.target.value })}
-                            />
-                          </div>
-
-                          {cur.provider_type === "cloudflare" && (
-                            <>
-                              <div className="preset-alert info">
-                                ℹ️ <strong>Cloudflare Workers AI:</strong> Audio &amp; LLM are handled via your Cloudflare account. Enter only your Account ID and API Token.
-                              </div>
-
-                              <div className="form-group">
-                                <label className="form-label">Cloudflare Account ID (User ID)</label>
-                                <input
-                                  type="text"
-                                  className="form-input"
-                                  placeholder="e.g. c3a0b12984ef... (found in Cloudflare Dashboard)"
-                                  value={cur.account_id}
-                                  onChange={(e) => handleUpdateProvider(cur.id, { account_id: e.target.value })}
-                                />
-                                <span className="form-hint">
-                                  Found in Cloudflare Dashboard &rarr; Workers &amp; Pages overview (right sidebar).
-                                </span>
-                              </div>
-
-                              <div className="form-group">
-                                <label className="form-label">Cloudflare API Token</label>
-                                <input
-                                  type="password"
-                                  className="form-input"
-                                  placeholder="Cloudflare API Token with Workers AI Read permissions"
-                                  value={cur.api_key}
-                                  onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
-                                />
-                                <span className="form-hint">
-                                  Stored securely in local .env configuration.
-                                </span>
-                              </div>
-
-                              <div style={{ marginTop: "4px" }}>
-                                <button
-                                  type="button"
-                                  className="btn-icon"
-                                  style={{ fontSize: "11px", color: "var(--text-secondary)", display: "inline-flex", gap: "4px", padding: 0 }}
-                                  onClick={() => setShowAdvancedUrl(!showAdvancedUrl)}
-                                >
-                                  {showAdvancedUrl ? "▼ Hide Advanced Base URL" : "▶ Show Advanced Base URL"}
-                                </button>
-                                {showAdvancedUrl && (
-                                  <div className="form-group" style={{ marginTop: "8px" }}>
-                                    <label className="form-label">Custom Base URL Override (Optional)</label>
-                                    <input
-                                      type="text"
-                                      className="form-input"
-                                      placeholder={`Default: https://api.cloudflare.com/client/v4/accounts/${cur.account_id || "<account_id>"}/ai/v1`}
-                                      value={cur.base_url}
-                                      onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
-                                    />
-                                  </div>
-                                )}
-                              </div>
-                            </>
-                          )}
-
-                          {cur.provider_type === "groq" && (
-                            <div className="form-group">
-                              <label className="form-label">Groq API Key</label>
-                              <input
-                                type="password"
-                                className="form-input"
-                                placeholder="gsk_..."
-                                value={cur.api_key}
-                                onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
-                              />
-                              <span className="form-hint">From console.groq.com/keys.</span>
-                            </div>
-                          )}
-
-                          {cur.provider_type === "openai" && (
-                            <div className="form-group">
-                              <label className="form-label">OpenAI API Key</label>
-                              <input
-                                type="password"
-                                className="form-input"
-                                placeholder="sk-..."
-                                value={cur.api_key}
-                                onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
-                              />
-                            </div>
-                          )}
-
-                          {cur.provider_type === "custom" && (
-                            <>
-                              <div className="form-group">
-                                <label className="form-label">Base URL</label>
-                                <input
-                                  type="text"
-                                  className="form-input"
-                                  placeholder="http://localhost:11434/v1 or http://localhost:8000/v1"
-                                  value={cur.base_url}
-                                  onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
-                                />
-                              </div>
-                              <div className="form-group">
-                                <label className="form-label">API Key / Token (Optional)</label>
-                                <input
-                                  type="password"
-                                  className="form-input"
-                                  placeholder="Bearer token if required by server"
-                                  value={cur.api_key}
-                                  onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
-                                />
-                              </div>
-                            </>
-                          )}
-                        </div>
-                      );
-                    })()}
 
                     {/* Model Selection with Fetch Models */}
                     <div className="form-group">
@@ -2363,9 +2807,16 @@ export default function App() {
                         <input
                           type="text"
                           className="form-input"
-                          placeholder="@cf/meta/llama-3.1-8b-instruct or llama-3.3-70b-versatile"
+                          placeholder={(() => {
+                            const cur = llmSettings.providers.find((p) => p.id === llmSettings.active_provider_id);
+                            if (cur?.provider_type === "cloudflare") return "e.g. @cf/meta/llama-3.3-70b-instruct-fp8-fast";
+                            if (cur?.name?.toLowerCase().includes("nvidia")) return "e.g. nvidia/nemotron-3.5-lightning-30b-a3b";
+                            if (cur?.provider_type === "groq") return "e.g. llama-3.3-70b-versatile";
+                            if (cur?.provider_type === "ollama") return "e.g. llama3.2";
+                            return "e.g. model-name";
+                          })()}
                           value={llmSettings.model}
-                          onChange={(e) => updateAndSaveLlmSettings({ model: e.target.value })}
+                          onChange={(e) => handleSelectOrUpdateModel(e.target.value)}
                           list="available-models-list"
                         />
                         {availableModels.length > 0 && (
@@ -2377,36 +2828,86 @@ export default function App() {
                         )}
                       </div>
 
-                      <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
-                        {(editingProviderId.includes("cloudflare")
-                          ? [
-                              { id: "@cf/meta/llama-3.1-8b-instruct", label: "Llama 3.1 8B (Fast)" },
-                              { id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", label: "Llama 3.3 70B (Quality)" },
-                              { id: "@cf/qwen/qwen2.5-7b-instruct", label: "Qwen 2.5 7B" },
-                              { id: "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", label: "DeepSeek R1 32B" },
-                            ]
-                          : editingProviderId.includes("groq")
-                          ? [
-                              { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B (Fast)" },
-                              { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B (Instant)" },
-                              { id: "mixtral-8x7b-32768", label: "Mixtral 8x7B" },
-                            ]
-                          : [
-                              { id: "gpt-4o-mini", label: "GPT-4o Mini" },
-                              { id: "gpt-4o", label: "GPT-4o" },
-                            ]
-                        ).map((item) => (
-                          <button
-                            key={item.id}
-                            type="button"
-                            className={`provider-chip ${llmSettings.model === item.id ? "active" : ""}`}
-                            style={{ fontSize: "11px", padding: "3px 8px" }}
-                            onClick={() => updateAndSaveLlmSettings({ model: item.id })}
+                      {availableModels.length > 0 && (
+                        <div style={{ marginTop: "6px" }}>
+                          <select
+                            className="form-input form-select"
+                            value={availableModels.includes(llmSettings.model) ? llmSettings.model : ""}
+                            onChange={(e) => {
+                              if (e.target.value) {
+                                handleSelectOrUpdateModel(e.target.value);
+                              }
+                            }}
                           >
-                            {item.label}
-                          </button>
-                        ))}
-                      </div>
+                            <option value="" disabled>
+                              -- Select from {availableModels.length} fetched models --
+                            </option>
+                            {availableModels.map((m) => (
+                              <option key={m} value={m}>
+                                {m}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+
+                      {(() => {
+                        const cur = llmSettings.providers.find((p) => p.id === llmSettings.active_provider_id) || llmSettings.providers[0];
+                        const isCf = cur?.provider_type === "cloudflare";
+
+                        if (isCf) {
+                          // The Cloudflare LLMs are fine as predefined quick chips
+                          return (
+                            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
+                              {[
+                                { id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", label: "Llama 3.3 70B (Quality)" },
+                                { id: "@cf/meta/llama-3.1-8b-instruct-fp8", label: "Llama 3.1 8B (Fast)" },
+                                { id: "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", label: "DeepSeek R1 32B" },
+                                { id: "@cf/qwen/qwen2.5-coder-32b-instruct", label: "Qwen 2.5 Coder 32B" },
+                                { id: "@cf/openai/gpt-oss-120b", label: "GPT-OSS 120B" },
+                              ].map((item) => (
+                                <button
+                                  key={item.id}
+                                  type="button"
+                                  className={`provider-chip ${llmSettings.model === item.id ? "active" : ""}`}
+                                  style={{ fontSize: "11px", padding: "3px 8px" }}
+                                  onClick={() => handleSelectOrUpdateModel(item.id)}
+                                >
+                                  {item.label}
+                                </button>
+                              ))}
+                            </div>
+                          );
+                        }
+
+                        // Not predefined for other LLM providers: show previously used models for this provider
+                        const previousModels = [
+                          ...(cur?.recent_models || []),
+                          ...(cur?.model && !(cur?.recent_models || []).includes(cur.model) ? [cur.model] : []),
+                        ].filter((m) => m && m.trim().length > 0);
+
+                        if (previousModels.length === 0) {
+                          return null;
+                        }
+
+                        return (
+                          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px", alignItems: "center" }}>
+                            <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>Previously used:</span>
+                            {previousModels.map((m) => (
+                              <button
+                                key={m}
+                                type="button"
+                                className={`provider-chip ${llmSettings.model === m ? "active" : ""}`}
+                                style={{ fontSize: "11px", padding: "3px 8px" }}
+                                onClick={() => handleSelectOrUpdateModel(m)}
+                                title={`Switch to model: ${m}`}
+                              >
+                                {m}
+                              </button>
+                            ))}
+                          </div>
+                        );
+                      })()}
                     </div>
 
                     {/* Default Voice / Rectify Preset */}
@@ -2827,8 +3328,58 @@ export default function App() {
                     Prevents other windows from covering this app.
                   </span>
                 </div>
+
+                <div className="form-group" style={{ marginTop: "18px", paddingTop: "14px", borderTop: "1px solid var(--border)" }}>
+                  <label className="form-label" style={{ fontWeight: 600, display: "block", marginBottom: "8px" }}>
+                    Mini Wizard Recording Behavior
+                  </label>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                    <label className="radio-label" style={{ display: "flex", alignItems: "flex-start", gap: "10px", cursor: "pointer" }}>
+                      <input
+                        type="radio"
+                        name="mini_record_mode"
+                        value="new_note"
+                        checked={settings.mini_record_mode !== "append"}
+                        onChange={() => updateAndSaveSettings({ mini_record_mode: "new_note" })}
+                        style={{ marginTop: "3px" }}
+                      />
+                      <div>
+                        <span style={{ fontWeight: 500, color: "var(--text-primary)" }}>
+                          Create a new note for each recording (Default)
+                        </span>
+                        <div className="form-hint" style={{ marginTop: "2px" }}>
+                          Each recording finished in the Mini Wizard saves as an independent new note.
+                        </div>
+                      </div>
+                    </label>
+
+                    <label className="radio-label" style={{ display: "flex", alignItems: "flex-start", gap: "10px", cursor: "pointer" }}>
+                      <input
+                        type="radio"
+                        name="mini_record_mode"
+                        value="append"
+                        checked={settings.mini_record_mode === "append"}
+                        onChange={() => updateAndSaveSettings({ mini_record_mode: "append" })}
+                        style={{ marginTop: "3px" }}
+                      />
+                      <div>
+                        <span style={{ fontWeight: 500, color: "var(--text-primary)" }}>
+                          Append to current active note
+                        </span>
+                        <div className="form-hint" style={{ marginTop: "2px" }}>
+                          Appends transcribed speech onto the end of the currently selected note.
+                        </div>
+                      </div>
+                    </label>
+                  </div>
+                  <span className="form-hint" style={{ display: "block", marginTop: "10px", fontStyle: "italic" }}>
+                    Note: In full screen mode, recordings append to the active note by default, and you can create a fresh note anytime using the "New Note" button.
+                  </span>
+                </div>
               </div>
             )}
+
+
 
             {/* Section 4: Diagnostic & Activity Logs */}
             {settingsNavTab === "logs" && (
@@ -2919,12 +3470,14 @@ export default function App() {
             </div>
           </div>
         </main>
-      ) : (
+      </div>
+    ) : (
         <main className="main-view">
           {/* Navbar */}
-          <header className="navbar">
+          <header className={`navbar ${isStackedNav ? "compact-stacked" : ""}`}>
             <div className="navbar-left">
               <button
+                type="button"
                 className="btn-icon"
                 onClick={() => setSidebarOpen(!sidebarOpen)}
                 title="Toggle sidebar"
@@ -2952,111 +3505,54 @@ export default function App() {
                 </div>
               )}
 
-              <div
-                className="badge-engine"
-                onClick={() => openSettings("asr")}
-                title="Click to configure ASR speech engine in Settings"
-              >
-                {settings.engine_mode === "local" ? (
-                  <span>
-                    ⚡ <span className="badge-text-full">{settings.local_engine === "whisper_cpu"
-                      ? "Whisper CPU"
-                      : settings.local_engine === "faster_whisper"
-                      ? "Faster-Whisper"
-                      : "Vulkan GPU"}{" "}
-                    ({settings.local_model_size})</span>
-                    <span className="badge-text-short">Local</span>
-                  </span>
-                ) : (
-                  <span>
-                    🌐 <span className="badge-text-full">API ({settings.model || "OpenAI-Compatible"})</span>
-                    <span className="badge-text-short">API</span>
-                  </span>
-                )}
-              </div>
-
-              {llmSettings.enabled && (
+              {/* Speech & LLM engine badges */}
+              <div className="nav-engine-cluster">
                 <div
-                  className="badge-engine badge-llm"
-                  onClick={() => openSettings("llm")}
-                  title="Click to configure LLM post-processing in Settings"
-                  style={{ background: "rgba(99, 102, 241, 0.15)", borderColor: "rgba(99, 102, 241, 0.35)" }}
+                  className="badge-engine"
+                  onClick={() => openSettings("asr")}
+                  title={`ASR Engine: ${settings.engine_mode === "local" ? settings.local_engine : "API"} (${settings.model || settings.local_model_size}). Click to configure`}
                 >
                   <span>
-                    🤖 <span className="badge-text-full">LLM: {llmSettings.voice_preset.replace("_", " ")} {llmSettings.auto_mode ? "⚡(Auto)" : ""}</span>
-                    <span className="badge-text-short">LLM</span>
+                    {settings.engine_mode === "local" ? "⚡" : "🌐"} {getDisplayModelName(settings)}
                   </span>
                 </div>
-              )}
+
+                {llmSettings.enabled && (
+                  <div
+                    className="badge-engine badge-llm"
+                    onClick={() => openSettings("llm")}
+                    title={`LLM Preset: ${llmSettings.voice_preset.replace("_", " ")} (${llmSettings.auto_mode ? "Auto Transform ON" : "Manual"}). Click to configure`}
+                    style={{ background: "rgba(99, 102, 241, 0.15)", borderColor: "rgba(99, 102, 241, 0.35)" }}
+                  >
+                    <span>
+                      🤖 LLM{llmSettings.auto_mode ? " Auto" : ""}
+                    </span>
+                  </div>
+                )}
+              </div>
             </div>
 
             <div className="navbar-right">
-              {/* Desktop / Tablet Inline Toggles (compacts or hides responsively) */}
-              <div className="nav-inline-actions">
-                {llmSettings.enabled && (
-                  <label className="auto-mode-toggle" title="Toggle automatic LLM transformation immediately on recording stop">
-                    <input
-                      type="checkbox"
-                      checked={llmSettings.auto_mode}
-                      onChange={(e) =>
-                        updateAndSaveLlmSettings({ auto_mode: e.target.checked })
-                      }
-                    />
-                    <span className={`auto-pill ${llmSettings.auto_mode ? "active" : ""}`}>
-                      <span className="auto-pill-icon">⚡</span>
-                      <span className="auto-pill-label"> Auto Transform: </span>
-                      <span className="auto-pill-status">{llmSettings.auto_mode ? "ON" : "OFF"}</span>
-                    </span>
-                  </label>
-                )}
+              <button
+                type="button"
+                className="btn btn-secondary nav-btn-mini"
+                onClick={() => toggleMiniMode(true)}
+                title="Switch to compact floating wizard (Alt+M)"
+              >
+                <span>⊡</span>
+                <span className="nav-btn-mini-label"> Mini Wizard</span>
+              </button>
 
-                <label className="auto-mode-toggle" title="Toggle automatic copying to clipboard">
-                  <input
-                    type="checkbox"
-                    checked={settings.auto_copy}
-                    onChange={(e) =>
-                      updateAndSaveSettings({ auto_copy: e.target.checked })
-                    }
-                  />
-                  <span className={`auto-pill ${settings.auto_copy ? "active" : ""}`}>
-                    <span className="auto-pill-icon">📋</span>
-                    <span className="auto-pill-label"> Auto Copy: </span>
-                    <span className="auto-pill-status">{settings.auto_copy ? "ON" : "OFF"}</span>
-                  </span>
-                </label>
-
-                <button
-                  className={`btn-icon ${settings.always_on_top ? "pinned" : ""}`}
-                  onClick={() => toggleAlwaysOnTop()}
-                  title={
-                    settings.always_on_top
-                      ? "Always on Top: ON (Click to unpin)"
-                      : "Always on Top: OFF (Click to pin)"
-                  }
-                >
-                  📌
-                </button>
-                <button
-                  className="btn btn-secondary nav-btn-mini"
-                  onClick={() => toggleMiniMode(true)}
-                  title="Switch to compact floating wizard (Alt+M)"
-                  style={{ fontSize: "12px", padding: "5px 10px" }}
-                >
-                  <span>⊡</span>
-                  <span className="nav-btn-mini-label"> Mini Wizard</span>
-                </button>
-              </div>
-
-              {/* Collapsible Action Dropdown for compact/narrow screens */}
+              {/* Stacked Quick Controls & Settings Dropdown */}
               <div className="nav-overflow-container" ref={navOverflowRef}>
                 <button
                   type="button"
                   className={`btn-icon nav-overflow-trigger ${navOverflowOpen ? "active" : ""}`}
                   onClick={() => setNavOverflowOpen(!navOverflowOpen)}
-                  title="Quick Actions & Toggles"
-                  aria-label="Quick Actions"
+                  title="Settings & Quick Controls"
+                  aria-label="Settings & Quick Controls"
                 >
-                  ⋯
+                  ⚙
                   {(llmSettings.auto_mode || settings.auto_copy || settings.always_on_top) && (
                     <span className="nav-overflow-dot" />
                   )}
@@ -3129,31 +3625,27 @@ export default function App() {
                       </span>
                     </button>
 
+
+
+                    <div className="nav-overflow-divider" />
+
                     <button
                       type="button"
-                      className="nav-overflow-btn"
+                      className="nav-overflow-btn nav-overflow-settings-btn"
                       onClick={() => {
                         setNavOverflowOpen(false);
-                        toggleMiniMode(true);
+                        openSettings("asr");
                       }}
                     >
                       <span className="nav-overflow-item-left">
-                        <span>⊡</span>
-                        <span>Mini Wizard Mode</span>
+                        <span>⚙</span>
+                        <span>Settings</span>
                       </span>
-                      <span className="key-hint">Alt+M</span>
+                      <span className="nav-overflow-hint">Configure ↗</span>
                     </button>
                   </div>
                 )}
               </div>
-
-              <button
-                className="btn-icon"
-                onClick={() => openSettings("asr")}
-                title="Settings & Audio Engine"
-              >
-                ⚙
-              </button>
             </div>
           </header>
 
@@ -3437,18 +3929,35 @@ export default function App() {
                 title="Shortcut: Alt+R"
               >
                 {isRecording ? (
-                  <>■ <span className="btn-record-text">Stop ({formatTimer(recordSeconds)})</span></>
+                  <>■ <span className="btn-record-text">Stop</span></>
                 ) : isTranscribing ? (
                   <>⌛ <span className="btn-record-text">Processing...</span></>
                 ) : (
                   <>● <span className="btn-record-text">Record</span> <span className="btn-record-hint">[Alt+R]</span></>
                 )}
               </button>
+
+              {isRecording && (
+                <div className="record-elapsed-pill" title="Recording elapsed time">
+                  <span className="record-elapsed-dot pulse" />
+                  <span className="record-elapsed-time">{formatTimer(recordSeconds)}</span>
+                </div>
+              )}
             </div>
 
             <div className="bottom-right">
               <span className="stat-counter">
                 {wordCount} {wordCount === 1 ? "word" : "words"} · {content.length} chars
+                {isCloudflareActive && !settings.model?.includes("tiny") && (
+                  <span
+                    className="stat-counter-cf"
+                    onClick={() => openSettings("providers")}
+                    title={`Cloudflare Workers AI: Today consumed ${formatNeurons(cfUsage?.today?.total_neurons ?? 0)} Ⓝ (${formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}) in Lipi. Click to view providers.`}
+                    style={{ cursor: "pointer" }}
+                  >
+                    {" "}· {formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}
+                  </span>
+                )}
               </span>
             </div>
           </footer>

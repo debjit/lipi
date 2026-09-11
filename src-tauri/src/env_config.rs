@@ -21,10 +21,14 @@ pub fn sanitize_id(id: &str) -> String {
 pub struct LlmProvider {
     pub id: String,
     pub name: String,
-    pub provider_type: String, // "cloudflare" | "groq" | "openai" | "custom"
+    pub provider_type: String, // "cloudflare" | "groq" | "openai" | "ollama" | "custom"
     pub api_key: String,
     pub account_id: String,
     pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub recent_models: Vec<String>,
 }
 
 impl LlmProvider {
@@ -36,10 +40,15 @@ impl LlmProvider {
         match self.provider_type.to_lowercase().as_str() {
             "cloudflare" => {
                 let acc = self.account_id.trim();
-                format!("https://api.cloudflare.com/client/v4/accounts/{}/ai/v1", acc)
+                if !acc.is_empty() {
+                    format!("https://api.cloudflare.com/client/v4/accounts/{}/ai/v1", acc)
+                } else {
+                    "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1".to_string()
+                }
             }
             "groq" => "https://api.groq.com/openai/v1".to_string(),
             "openai" => "https://api.openai.com/v1".to_string(),
+            "ollama" => "http://localhost:11434/v1".to_string(),
             _ => "http://localhost:8000/v1".to_string(),
         }
     }
@@ -91,7 +100,9 @@ impl Default for LlmSettings {
                     provider_type: "cloudflare".into(),
                     api_key: String::new(),
                     account_id: String::new(),
-                    base_url: String::new(),
+                    base_url: "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1".into(),
+                    model: "@cf/meta/llama-3.1-8b-instruct".into(),
+                    recent_models: vec!["@cf/meta/llama-3.1-8b-instruct".into()],
                 },
                 LlmProvider {
                     id: "GROQ_DEFAULT".into(),
@@ -100,6 +111,18 @@ impl Default for LlmSettings {
                     api_key: String::new(),
                     account_id: String::new(),
                     base_url: "https://api.groq.com/openai/v1".into(),
+                    model: String::new(),
+                    recent_models: vec![],
+                },
+                LlmProvider {
+                    id: "OLLAMA_DEFAULT".into(),
+                    name: "Ollama (Local)".into(),
+                    provider_type: "ollama".into(),
+                    api_key: String::new(),
+                    account_id: String::new(),
+                    base_url: "http://localhost:11434/v1".into(),
+                    model: String::new(),
+                    recent_models: vec![],
                 },
             ],
             presets: default_prompt_presets(),
@@ -192,6 +215,8 @@ pub fn load_llm_settings(app_data_dir: &Path) -> LlmSettings {
                     "groq".into()
                 } else if pid.contains("OPENAI") {
                     "openai".into()
+                } else if pid.contains("OLLAMA") {
+                    "ollama".into()
                 } else {
                     "custom".into()
                 }
@@ -204,6 +229,8 @@ pub fn load_llm_settings(app_data_dir: &Path) -> LlmSettings {
                     "Groq Cloud".into()
                 } else if provider_type == "openai" {
                     "OpenAI".into()
+                } else if provider_type == "ollama" {
+                    "Ollama (Local)".into()
                 } else {
                     format!("Provider {}", pid)
                 }
@@ -213,6 +240,21 @@ pub fn load_llm_settings(app_data_dir: &Path) -> LlmSettings {
             let api_key = map.get(&key_key).cloned().unwrap_or_default();
             let base_url = map.get(&url_key).cloned().unwrap_or_default();
 
+            let model_key = format!("PROVIDER_{}_MODEL", pid);
+            let recent_models_key = format!("PROVIDER_{}_RECENT_MODELS", pid);
+
+            let mut model = map.get(&model_key).cloned().unwrap_or_default();
+            let mut recent_models: Vec<String> = map.get(&recent_models_key)
+                .map(|s| s.split(',').map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect())
+                .unwrap_or_default();
+
+            if pid == settings.active_provider_id && model.is_empty() && !settings.model.is_empty() {
+                model = settings.model.clone();
+                if !recent_models.contains(&model) {
+                    recent_models.push(model.clone());
+                }
+            }
+
             loaded_providers.push(LlmProvider {
                 id: pid,
                 name,
@@ -220,6 +262,8 @@ pub fn load_llm_settings(app_data_dir: &Path) -> LlmSettings {
                 api_key,
                 account_id,
                 base_url,
+                model,
+                recent_models,
             });
         }
 
@@ -317,6 +361,10 @@ pub fn save_llm_settings(app_data_dir: &Path, settings: &LlmSettings) -> Result<
         out.push_str(&format!("PROVIDER_{}_ACCOUNT_ID=\"{}\"\n", pid, escape_env_val(&p.account_id)));
         out.push_str(&format!("PROVIDER_{}_API_KEY=\"{}\"\n", pid, escape_env_val(&p.api_key)));
         out.push_str(&format!("PROVIDER_{}_BASE_URL=\"{}\"\n", pid, escape_env_val(&p.base_url)));
+        out.push_str(&format!("PROVIDER_{}_MODEL=\"{}\"\n", pid, escape_env_val(&p.model)));
+        if !p.recent_models.is_empty() {
+            out.push_str(&format!("PROVIDER_{}_RECENT_MODELS=\"{}\"\n", pid, escape_env_val(&p.recent_models.join(","))));
+        }
         out.push_str(&format!("# --- END PROVIDER: {} ---\n\n", pid));
     }
 
@@ -364,6 +412,8 @@ mod tests {
                 api_key: "tok_cf".into(),
                 account_id: "acc_cf".into(),
                 base_url: String::new(),
+                model: "@cf/meta/llama-3.1-8b-instruct".into(),
+                recent_models: vec!["@cf/meta/llama-3.1-8b-instruct".into()],
             },
             LlmProvider {
                 id: "CUSTOM_OLLAMA".into(),
@@ -372,6 +422,8 @@ mod tests {
                 api_key: String::new(),
                 account_id: String::new(),
                 base_url: "http://localhost:11434/v1".into(),
+                model: "llama3.2".into(),
+                recent_models: vec!["llama3.2".into()],
             },
         ];
         settings.request_timeout_secs = 240;
