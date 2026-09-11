@@ -1572,22 +1572,80 @@ export default function App() {
 
       {/* Main Content Area: Switch between Notes Scratchpad and Full-Page Settings */}
       {activeView === "settings" ? (
-        <main className="settings-page">
-          <header className="settings-page-header">
-            <div className="settings-header-left">
+        <div className="settings-page">
+          {/* Full-Height Left Navigation Sidebar */}
+          <aside className="settings-sidebar">
+            <div className="settings-sidebar-header">
               <button
                 type="button"
                 className="btn-back"
                 onClick={closeSettings}
                 title="Return to notes editor (Esc)"
               >
-                ← Back to Notes <kbd className="key-hint">Esc</kbd>
+                ← Back <kbd className="key-hint">Esc</kbd>
               </button>
               <h2 className="settings-page-title">Settings</h2>
             </div>
-            <div className="settings-header-right">
-              {settings.engine_mode === "local" && (
-                memoryStatus?.is_loaded ? (
+
+            <nav className="settings-sidebar-nav" aria-label="Settings Navigation">
+              <button
+                type="button"
+                className={`settings-nav-tab ${settingsNavTab === "providers" ? "active" : ""}`}
+                onClick={() => {
+                  setSettingsNavTab("providers");
+                  loadLlmSettings();
+                  loadCfUsage();
+                }}
+              >
+                <span className="settings-nav-icon">🔌</span>
+                <span className="settings-nav-label">Providers</span>
+              </button>
+              <button
+                type="button"
+                className={`settings-nav-tab ${settingsNavTab === "asr" ? "active" : ""}`}
+                onClick={() => setSettingsNavTab("asr")}
+              >
+                <span className="settings-nav-icon">🎙</span>
+                <span className="settings-nav-label">Audio / ASR</span>
+              </button>
+              <button
+                type="button"
+                className={`settings-nav-tab ${settingsNavTab === "llm" ? "active" : ""}`}
+                onClick={() => {
+                  setSettingsNavTab("llm");
+                  loadLlmSettings();
+                }}
+              >
+                <span className="settings-nav-icon">🤖</span>
+                <span className="settings-nav-label">LLM Transform</span>
+                {llmSettings.enabled && <span className="settings-badge-on">ON</span>}
+              </button>
+              <button
+                type="button"
+                className={`settings-nav-tab ${settingsNavTab === "preferences" ? "active" : ""}`}
+                onClick={() => setSettingsNavTab("preferences")}
+              >
+                <span className="settings-nav-icon">⚙</span>
+                <span className="settings-nav-label">Preferences</span>
+              </button>
+              <button
+                type="button"
+                className={`settings-nav-tab ${settingsNavTab === "logs" ? "active" : ""}`}
+                onClick={() => setSettingsNavTab("logs")}
+              >
+                <span className="settings-nav-icon">📋</span>
+                <span className="settings-nav-label">Diagnostic Logs</span>
+                {logs.filter((l) => l.level === "error").length > 0 && (
+                  <span className="tab-error-pill">
+                    {logs.filter((l) => l.level === "error").length}
+                  </span>
+                )}
+              </button>
+            </nav>
+
+            {settings.engine_mode === "local" && (
+              <div className="settings-sidebar-footer">
+                {memoryStatus?.is_loaded ? (
                   <div className="memory-badge-loaded">
                     <span className="memory-pulse-dot"></span>
                     <span>RAM: ~{memoryStatus.estimated_ram_mb} MB</span>
@@ -1596,63 +1654,14 @@ export default function App() {
                   <div className="memory-badge-cold">
                     <span>○ RAM: Inactive (0 MB)</span>
                   </div>
-                )
-              )}
-            </div>
-          </header>
+                )}
+              </div>
+            )}
+          </aside>
 
-          {/* Top-Level Settings Navigation Tabs */}
-          <div className="settings-nav-tabs">
-            <button
-              type="button"
-              className={`settings-nav-tab ${settingsNavTab === "providers" ? "active" : ""}`}
-              onClick={() => {
-                setSettingsNavTab("providers");
-                loadLlmSettings();
-                loadCfUsage();
-              }}
-            >
-              🔌 Providers
-            </button>
-            <button
-              type="button"
-              className={`settings-nav-tab ${settingsNavTab === "asr" ? "active" : ""}`}
-              onClick={() => setSettingsNavTab("asr")}
-            >
-              🎙 ASR
-            </button>
-            <button
-              type="button"
-              className={`settings-nav-tab ${settingsNavTab === "llm" ? "active" : ""}`}
-              onClick={() => {
-                setSettingsNavTab("llm");
-                loadLlmSettings();
-              }}
-            >
-              🤖 LLM {llmSettings.enabled ? "(ON)" : ""}
-            </button>
-            <button
-              type="button"
-              className={`settings-nav-tab ${settingsNavTab === "preferences" ? "active" : ""}`}
-              onClick={() => setSettingsNavTab("preferences")}
-            >
-              ⚙ Preferences
-            </button>
-            <button
-              type="button"
-              className={`settings-nav-tab ${settingsNavTab === "logs" ? "active" : ""}`}
-              onClick={() => setSettingsNavTab("logs")}
-            >
-              📋 Diagnostic Logs
-              {logs.filter((l) => l.level === "error").length > 0 && (
-                <span className="tab-error-pill">
-                  {logs.filter((l) => l.level === "error").length}
-                </span>
-              )}
-            </button>
-          </div>
-
-          <div className="settings-content">
+          {/* Settings Main Content Area */}
+          <main className="settings-main">
+            <div className="settings-content">
             {errorMsg && (
               <div className="toast-error" style={{ position: "relative", top: 0, left: 0, transform: "none", width: "100%", maxWidth: "100%", marginBottom: "14px" }}>
                 <div className="toast-error-header">
@@ -3461,7 +3470,8 @@ export default function App() {
             </div>
           </div>
         </main>
-      ) : (
+      </div>
+    ) : (
         <main className="main-view">
           {/* Navbar */}
           <header className={`navbar ${isStackedNav ? "compact-stacked" : ""}`}>
