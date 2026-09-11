@@ -46,10 +46,18 @@ pub fn normalize_base_url(base_url: &str) -> String {
 pub fn get_curated_fallback_models(base_url: &str) -> Vec<String> {
     if base_url.contains("cloudflare.com") {
         vec![
-            "@cf/meta/llama-3.1-8b-instruct".into(),
             "@cf/meta/llama-3.3-70b-instruct-fp8-fast".into(),
-            "@cf/qwen/qwen2.5-7b-instruct".into(),
+            "@cf/meta/llama-3.1-8b-instruct-fp8".into(),
+            "@cf/meta/llama-3.1-8b-instruct".into(),
+            "@cf/meta/llama-3.2-3b-instruct".into(),
+            "@cf/meta/llama-3.2-1b-instruct".into(),
             "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b".into(),
+            "@cf/deepseek-ai/deepseek-v4-flash-0731".into(),
+            "@cf/qwen/qwen2.5-coder-32b-instruct".into(),
+            "@cf/qwen/qwen2.5-7b-instruct".into(),
+            "@cf/openai/gpt-oss-120b".into(),
+            "@cf/openai/gpt-oss-20b".into(),
+            "@cf/mistralai/mistral-small-3.1-24b-instruct".into(),
         ]
     } else if base_url.contains("groq.com") {
         vec![
@@ -82,23 +90,58 @@ pub fn get_curated_fallback_models(base_url: &str) -> Vec<String> {
     }
 }
 
-pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
+pub fn resolve_models_url(base_url: &str) -> String {
     let normalized = normalize_base_url(base_url);
     let trimmed = normalized.trim().trim_end_matches('/');
     if trimmed.is_empty() {
-        return Err("Endpoint base URL is empty".into());
+        return String::new();
     }
 
-    let url = if trimmed.ends_with("/models") {
+    if trimmed.contains("cloudflare.com") {
+        if let Some(pos) = trimmed.find("/accounts/") {
+            let after = &trimmed[pos + "/accounts/".len()..];
+            let acc = after.split('/').next().unwrap_or("");
+            if !acc.is_empty() && acc != "<account_id>" && acc != "{account_id}" {
+                return format!(
+                    "https://api.cloudflare.com/client/v4/accounts/{}/ai/models/search?per_page=100",
+                    acc
+                );
+            }
+        }
+    }
+
+    if trimmed.ends_with("/models") {
         trimmed.to_string()
     } else {
         format!("{}/models", trimmed)
-    };
+    }
+}
+
+pub fn format_reqwest_error(e: &reqwest::Error) -> String {
+    let mut msg = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(s) = source {
+        let s_str = s.to_string();
+        if !msg.contains(&s_str) {
+            msg.push_str(&format!(": {}", s_str));
+        }
+        source = std::error::Error::source(s);
+    }
+    msg
+}
+
+pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let url = resolve_models_url(base_url);
+    if url.is_empty() {
+        return Err("Endpoint base URL is empty".into());
+    }
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
+        .user_agent("Lipi/0.1.0")
+        .timeout(std::time::Duration::from_secs(15))
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format_reqwest_error(&e))?;
 
     let mut req = client.get(&url);
     let trimmed_key = api_key.trim();
@@ -151,6 +194,7 @@ pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, 
 
             if !model_names.is_empty() {
                 model_names.sort();
+                model_names.dedup();
                 return Ok(model_names);
             }
 
@@ -233,9 +277,10 @@ pub async fn transform_text_with_prompt(
     };
 
     let client = reqwest::Client::builder()
+        .user_agent("Lipi/0.1.0")
         .timeout(std::time::Duration::from_secs(timeout_secs.max(180)))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        .map_err(|e| format!("Failed to create HTTP client: {}", format_reqwest_error(&e)))?;
 
     let payload = serde_json::json!({
         "model": model_to_use,
@@ -256,7 +301,7 @@ pub async fn transform_text_with_prompt(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("LLM request failed to {}: {}", endpoint, e))?;
+        .map_err(|e| format!("LLM request failed to {}: {}", endpoint, format_reqwest_error(&e)))?;
 
     let status = resp.status();
     let body_text = resp
@@ -425,5 +470,33 @@ mod tests {
             normalize_base_url("https://api.cloudflare.com/client/v4/accounts/c3a0/ai/v1"),
             "https://api.cloudflare.com/client/v4/accounts/c3a0/ai/v1"
         );
+    }
+
+    #[test]
+    fn test_resolve_models_url() {
+        assert_eq!(
+            resolve_models_url("https://api.cloudflare.com/client/v4/accounts/my_acc/ai/v1"),
+            "https://api.cloudflare.com/client/v4/accounts/my_acc/ai/models/search?per_page=100"
+        );
+        assert_eq!(
+            resolve_models_url("https://api.groq.com/openai/v1"),
+            "https://api.groq.com/openai/v1/models"
+        );
+        assert_eq!(
+            resolve_models_url("https://integrate.api.nvidia.com/v1"),
+            "https://integrate.api.nvidia.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn test_live_cloudflare_fetch_models() {
+        if let Ok(token) = std::env::var("CF_TEST_TOKEN") {
+            tauri::async_runtime::block_on(async {
+                let base_url = "https://api.cloudflare.com/client/v4/accounts/b67a31aae92890aa15406bbf58d8a8cc/ai/v1";
+                let models = fetch_models(base_url, &token).await.expect("Failed to fetch models");
+                assert!(models.len() > 20, "Expected > 20 models, got {}", models.len());
+                assert!(models.iter().any(|m| m.contains("llama")));
+            });
+        }
     }
 }

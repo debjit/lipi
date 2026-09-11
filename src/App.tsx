@@ -26,6 +26,7 @@ interface AppSettings {
   model_idle_timeout_mins?: number;
   request_timeout_secs?: number;
   mini_record_mode?: "new_note" | "append";
+  provider_id?: string;
 }
 
 interface LlmProvider {
@@ -124,6 +125,13 @@ function formatDurationSecs(secs: number): string {
   return `${mins}m ${remSecs}s`;
 }
 
+function maskAccountId(id: string): string {
+  const trimmed = (id || "").trim();
+  if (!trimmed || trimmed === "<account_id>" || trimmed === "{account_id}") return "";
+  if (trimmed.length <= 6) return trimmed;
+  return "*".repeat(trimmed.length - 6) + trimmed.slice(-6);
+}
+
 function getDisplayModelName(settings: AppSettings): string {
   if (settings.engine_mode === "local") {
     // Strictly zero-cost / local offline
@@ -173,17 +181,6 @@ function formatDuration(seconds: number): string {
   return `${m}m ${s}s`;
 }
 
-interface ProviderPreset {
-  id: string;
-  name: string;
-  icon: string;
-  url: string;
-  defaultModel: string;
-  keyPlaceholder: string;
-  keyHint: string;
-  urlHint: string;
-}
-
 interface LogEntry {
   id: string;
   timestamp: string;
@@ -194,76 +191,6 @@ interface LogEntry {
   endpoint?: string;
   message: string;
   details?: string;
-}
-
-const PROVIDER_PRESETS: ProviderPreset[] = [
-  {
-    id: "groq",
-    name: "Groq",
-    icon: "⚡",
-    url: "https://api.groq.com/openai/v1",
-    defaultModel: "whisper-large-v3-turbo",
-    keyPlaceholder: "gsk_...",
-    keyHint: "Groq Cloud API Key (from console.groq.com/keys).",
-    urlHint: "Ultra-fast Whisper hosted on Groq LPU inference engine.",
-  },
-  {
-    id: "cloudflare",
-    name: "Cloudflare Workers AI",
-    icon: "☁",
-    url: "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1",
-    defaultModel: "@cf/openai/whisper",
-    keyPlaceholder: "Cloudflare API Token",
-    keyHint: "Cloudflare API Token with Workers AI Read permissions.",
-    urlHint: "Cloudflare Workers AI serverless endpoint.",
-  },
-  {
-    id: "openai",
-    name: "OpenAI",
-    icon: "🤖",
-    url: "https://api.openai.com/v1",
-    defaultModel: "whisper-1",
-    keyPlaceholder: "sk-...",
-    keyHint: "OpenAI Secret API Key.",
-    urlHint: "Official OpenAI audio transcription endpoint.",
-  },
-  {
-    id: "local",
-    name: "Local / Self-Hosted",
-    icon: "🖥",
-    url: "http://localhost:8000/v1",
-    defaultModel: "whisper-1",
-    keyPlaceholder: "(Optional for local servers)",
-    keyHint: "Optional auth token if required by your local server.",
-    urlHint: "Local vLLM, Ollama, Speaches, or whisper-asr server.",
-  },
-  {
-    id: "custom",
-    name: "Custom",
-    icon: "⚙",
-    url: "",
-    defaultModel: "",
-    keyPlaceholder: "Bearer token or API key",
-    keyHint: "Authorization Bearer token.",
-    urlHint: "Custom OpenAI-compatible transcription endpoint.",
-  },
-];
-
-function getActivePreset(url: string): ProviderPreset {
-  const trimmed = (url || "").trim();
-  if (trimmed.includes("api.groq.com")) {
-    return PROVIDER_PRESETS[0];
-  }
-  if (trimmed.includes("api.cloudflare.com")) {
-    return PROVIDER_PRESETS[1];
-  }
-  if (trimmed.includes("api.openai.com")) {
-    return PROVIDER_PRESETS[2];
-  }
-  if (trimmed.includes("localhost") || trimmed.includes("127.0.0.1") || trimmed.includes("0.0.0.0")) {
-    return PROVIDER_PRESETS[3];
-  }
-  return PROVIDER_PRESETS[4];
 }
 
 function isFullScreenMode(): boolean {
@@ -311,8 +238,6 @@ export default function App() {
     request_timeout_secs: 180,
     mini_record_mode: "new_note",
   });
-
-  const activePreset = getActivePreset(settings.api_base_url);
 
   const DEFAULT_PRESETS: PromptPreset[] = [
     {
@@ -457,12 +382,15 @@ export default function App() {
     showToast("✓ Diagnostic logs copied!");
   };
 
-  const [settingsNavTab, setSettingsNavTab] = useState<"asr" | "llm" | "preferences" | "logs">("asr");
+  const [settingsNavTab, setSettingsNavTab] = useState<"providers" | "asr" | "llm" | "preferences" | "logs">("providers");
 
   const [cfUsage, setCfUsage] = useState<CloudflareUsageSummary | null>(null);
   const [loadingCfUsage, setLoadingCfUsage] = useState<boolean>(false);
+  const [revealAccountId, setRevealAccountId] = useState<boolean>(false);
+  const [focusedAccountId, setFocusedAccountId] = useState<string | null>(null);
 
-  const isCloudflareAsr = settings.engine_mode === "cloud" && settings.api_base_url.includes("api.cloudflare.com");
+  const currentAsrProvider = (llmSettings.providers || []).find((p) => p.id === (settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id)));
+  const isCloudflareAsr = settings.engine_mode === "cloud" && (settings.api_base_url.includes("api.cloudflare.com") || currentAsrProvider?.provider_type === "cloudflare");
   const activeLlmProvider = (llmSettings.providers || []).find((p) => p.id === llmSettings.active_provider_id);
   const isCloudflareLlm = llmSettings.enabled && (
     activeLlmProvider?.provider_type === "cloudflare" ||
@@ -951,6 +879,19 @@ export default function App() {
       p.id === id ? { ...p, ...patch } : p
     );
     updateAndSaveLlmSettings({ providers: updated });
+
+    const currentAsrPid = settingsRef.current.provider_id || (llmSettingsRef.current.providers.find(p => p.base_url === settingsRef.current.api_base_url)?.id);
+    if (currentAsrPid === id) {
+      const p = updated.find((x) => x.id === id);
+      if (p) {
+        const asrPatch: Partial<AppSettings> = {};
+        if (patch.base_url !== undefined) asrPatch.api_base_url = p.base_url;
+        if (patch.api_key !== undefined) asrPatch.api_key = p.api_key;
+        if (Object.keys(asrPatch).length > 0) {
+          updateAndSaveSettings(asrPatch);
+        }
+      }
+    }
   }
 
   function handleAddProvider(type: "cloudflare" | "groq" | "openai" | "ollama" | "custom") {
@@ -1153,7 +1094,7 @@ export default function App() {
     }
   }
 
-  function openSettings(tab: "asr" | "llm" | "preferences" | "logs" = "asr") {
+  function openSettings(tab: "providers" | "asr" | "llm" | "preferences" | "logs" = "asr") {
     setSettingsNavTab(tab);
     loadSettings();
     loadLlmSettings();
@@ -1640,6 +1581,17 @@ export default function App() {
           <div className="settings-nav-tabs">
             <button
               type="button"
+              className={`settings-nav-tab ${settingsNavTab === "providers" ? "active" : ""}`}
+              onClick={() => {
+                setSettingsNavTab("providers");
+                loadLlmSettings();
+                loadCfUsage();
+              }}
+            >
+              🔌 Providers
+            </button>
+            <button
+              type="button"
               className={`settings-nav-tab ${settingsNavTab === "asr" ? "active" : ""}`}
               onClick={() => setSettingsNavTab("asr")}
             >
@@ -1702,6 +1654,377 @@ export default function App() {
               </div>
             )}
 
+            {settingsNavTab === "providers" && (
+              <>
+                <div className="settings-section-card">
+                  <div className="settings-section-heading" style={{ justifyContent: "space-between" }}>
+                    <span>Configured AI &amp; Speech Providers</span>
+                    <div style={{ display: "flex", gap: "6px" }}>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => handleAddProvider("cloudflare")}
+                        title="Add Cloudflare Workers AI"
+                      >
+                        + Cloudflare
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => handleAddProvider("groq")}
+                        title="Add Groq Cloud"
+                      >
+                        + Groq
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => handleAddProvider("openai")}
+                        title="Add OpenAI"
+                      >
+                        + OpenAI
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => handleAddProvider("ollama")}
+                        title="Add local Ollama"
+                      >
+                        + Ollama
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => handleAddProvider("custom")}
+                        title="Add Custom endpoint"
+                      >
+                        + Custom
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="form-hint" style={{ marginBottom: "12px" }}>
+                    Endpoints and API keys saved here are shared across both 🎙 ASR (Audio) and 🤖 LLM tabs.
+                  </div>
+
+                  <div className="llm-provider-list" style={{ marginBottom: "16px" }}>
+                    {llmSettings.providers.map((p) => {
+                      const isSelected = editingProviderId === p.id;
+                      const isLlmActive = llmSettings.active_provider_id === p.id;
+                      const currentAsrPid = settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id);
+                      const isAsrActive = currentAsrPid === p.id;
+                      return (
+                        <div
+                          key={p.id}
+                          className={`llm-provider-card ${isSelected ? "active" : ""}`}
+                          onClick={() => setEditingProviderId(p.id)}
+                        >
+                          <div className="llm-provider-info">
+                            <span className="llm-provider-icon">
+                              {p.provider_type === "cloudflare"
+                                ? "☁"
+                                : p.provider_type === "groq"
+                                ? "⚡"
+                                : p.provider_type === "openai"
+                                ? "🤖"
+                                : p.provider_type === "ollama"
+                                ? "🦙"
+                                : "⚙"}
+                            </span>
+                            <div>
+                              <div className="llm-provider-name">{p.name}</div>
+                              <div className="llm-provider-type">
+                                {p.provider_type} • {p.api_key?.trim() ? "Key set" : p.provider_type === "ollama" ? "Local" : "No key"}
+                              </div>
+                            </div>
+                          </div>
+                          <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                            {isAsrActive && (
+                              <span className="badge-pill installed" title="Selected for Audio transcription" style={{ fontSize: "10px", padding: "2px 6px" }}>
+                                🎙 Audio
+                              </span>
+                            )}
+                            {isLlmActive && (
+                              <span className="badge-pill installed" title="Selected for LLM assistant" style={{ fontSize: "10px", padding: "2px 6px" }}>
+                                🤖 LLM
+                              </span>
+                            )}
+                            {llmSettings.providers.length > 1 && (
+                              <button
+                                type="button"
+                                className="btn-icon"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteProvider(p.id);
+                                }}
+                                title="Delete provider"
+                              >
+                                ✕
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {(() => {
+                    const cur = llmSettings.providers.find((p) => p.id === editingProviderId) || llmSettings.providers[0];
+                    if (!cur) return null;
+                    return (
+                      <div style={{ background: "var(--bg-primary)", padding: "14px", borderRadius: "8px", border: "1px solid var(--border)", display: "flex", flexDirection: "column", gap: "12px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <span style={{ fontSize: "13px", fontWeight: 600 }}>
+                            Configure {cur.name} Credentials
+                          </span>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => handleFetchModels(cur.id)}
+                            disabled={isFetchingModels}
+                            title="Query provider endpoint to verify credentials"
+                          >
+                            {isFetchingModels ? "Testing..." : "🔍 Test Connection"}
+                          </button>
+                        </div>
+
+                        <div className="form-group">
+                          <label className="form-label">Provider Label</label>
+                          <input
+                            type="text"
+                            className="form-input"
+                            value={cur.name}
+                            onChange={(e) => handleUpdateProvider(cur.id, { name: e.target.value })}
+                          />
+                        </div>
+
+                        {cur.provider_type === "cloudflare" && (
+                          <>
+                            <div className="form-group">
+                              <label className="form-label">Cloudflare Account ID</label>
+                              <div className="input-with-button">
+                                <input
+                                  type="text"
+                                  className="form-input"
+                                  placeholder="e.g. c3a0b12984ef... (found in Cloudflare Dashboard)"
+                                  value={(() => {
+                                    const raw = cur.account_id || (() => {
+                                      const match = cur.base_url?.match(/accounts\/([a-zA-Z0-9_-]+)/);
+                                      return match && match[1] !== "<account_id>" && match[1] !== "{account_id}" ? match[1] : "";
+                                    })();
+                                    return revealAccountId || focusedAccountId === cur.id
+                                      ? raw
+                                      : maskAccountId(raw);
+                                  })()}
+                                  onFocus={() => setFocusedAccountId(cur.id)}
+                                  onBlur={() => setFocusedAccountId(null)}
+                                  onChange={(e) => {
+                                    const acc = e.target.value.trim();
+                                    const targetUrl = acc ? `https://api.cloudflare.com/client/v4/accounts/${acc}/ai/v1` : "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1";
+                                    handleUpdateProvider(cur.id, {
+                                      account_id: acc,
+                                      base_url: targetUrl,
+                                    });
+                                  }}
+                                />
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary btn-sm"
+                                  style={{ minWidth: "56px" }}
+                                  onClick={() => setRevealAccountId(!revealAccountId)}
+                                  title={revealAccountId ? "Mask Account ID" : "Reveal full Account ID"}
+                                >
+                                  {revealAccountId ? "Mask" : "Show"}
+                                </button>
+                              </div>
+                              <span className="form-hint">
+                                Found in Cloudflare Dashboard &rarr; Workers &amp; Pages overview (right sidebar). URL is added automatically.
+                              </span>
+                            </div>
+
+                            <div className="form-group">
+                              <label className="form-label">API Key / Token</label>
+                              <input
+                                type="password"
+                                className="form-input"
+                                placeholder="Cloudflare API Token with Workers AI Read permissions"
+                                value={cur.api_key}
+                                onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                              />
+                              <span className="form-hint">
+                                Needs <em>Workers AI: Read</em> permissions. Stored securely in local configuration.
+                              </span>
+                            </div>
+
+                            <div className="cf-usage-panel" style={{ marginTop: "12px" }}>
+                              <div className="cf-usage-panel-header">
+                                <div className="cf-usage-panel-title">
+                                  <span>⚡</span>
+                                  <span>Cloudflare Consumed Workers AI Usage</span>
+                                </div>
+                                <div className="cf-usage-reset-badge">
+                                  Resets 00:00 UTC ({cfUsage?.today?.label || "Today"})
+                                </div>
+                              </div>
+
+                              <div className="cf-usage-panel-stats">
+                                <div className="cf-panel-stat-box">
+                                  <span className="cf-panel-stat-label">Today's Consumed</span>
+                                  <span className="cf-panel-stat-val">
+                                    {formatNeurons(cfUsage?.today?.total_neurons ?? 0)}
+                                    <span className="cf-panel-stat-sub"> Ⓝ</span>
+                                  </span>
+                                </div>
+
+                                <div className="cf-panel-stat-box">
+                                  <span className="cf-panel-stat-label">Consumed Cost</span>
+                                  <span className="cf-panel-stat-val">
+                                    {formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}
+                                    <span className="cf-panel-stat-sub"> @ $0.011/1k</span>
+                                  </span>
+                                </div>
+
+                                <div className="cf-panel-stat-box">
+                                  <span className="cf-panel-stat-label">Today's Speech</span>
+                                  <span className="cf-panel-stat-val">
+                                    {formatDurationSecs(cfUsage?.today?.asr_audio_secs ?? 0)}
+                                    <span className="cf-panel-stat-sub"> ({cfUsage?.today?.asr_count ?? 0} {cfUsage?.today?.asr_count === 1 ? "rec" : "recs"})</span>
+                                  </span>
+                                </div>
+
+                                <div className="cf-panel-stat-box">
+                                  <span className="cf-panel-stat-label">Today's LLM Tokens</span>
+                                  <span className="cf-panel-stat-val">
+                                    {(cfUsage?.today?.llm_tokens ?? 0).toLocaleString()}
+                                    <span className="cf-panel-stat-sub"> ({cfUsage?.today?.llm_count ?? 0} {cfUsage?.today?.llm_count === 1 ? "tx" : "txs"})</span>
+                                  </span>
+                                </div>
+
+                                <div className="cf-panel-stat-box">
+                                  <span className="cf-panel-stat-label">This Month Consumed</span>
+                                  <span className="cf-panel-stat-val">
+                                    {formatNeurons(cfUsage?.current_month?.total_neurons ?? 0)} Ⓝ
+                                    <span className="cf-panel-stat-sub"> ({formatCostUsd(cfUsage?.current_month?.total_cost_usd ?? 0)})</span>
+                                  </span>
+                                </div>
+                              </div>
+
+                              <div className="cf-usage-panel-footer">
+                                <span className="cf-panel-hint">
+                                  Tracks Neurons consumed directly within Lipi (ASR + LLM). Cloudflare free tier resets at 00:00 UTC.
+                                </span>
+                                <div style={{ display: "flex", gap: "6px" }}>
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary"
+                                    style={{ fontSize: "11px", padding: "2px 8px" }}
+                                    onClick={() => loadCfUsage()}
+                                    disabled={loadingCfUsage}
+                                    title="Refresh Cloudflare usage statistics"
+                                  >
+                                    🔄 Refresh
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary"
+                                    style={{ fontSize: "11px", padding: "2px 8px", color: "var(--text-danger, #ef4444)" }}
+                                    onClick={handleClearCfUsage}
+                                    title="Reset local Cloudflare usage tracking data"
+                                  >
+                                    🗑 Reset
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          </>
+                        )}
+
+                        {cur.provider_type === "groq" && (
+                          <div className="form-group">
+                            <label className="form-label">Groq API Key</label>
+                            <input
+                              type="password"
+                              className="form-input"
+                              placeholder="gsk_..."
+                              value={cur.api_key}
+                              onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                            />
+                            <span className="form-hint">From console.groq.com/keys.</span>
+                          </div>
+                        )}
+
+                        {cur.provider_type === "openai" && (
+                          <div className="form-group">
+                            <label className="form-label">OpenAI API Key</label>
+                            <input
+                              type="password"
+                              className="form-input"
+                              placeholder="sk-..."
+                              value={cur.api_key}
+                              onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                            />
+                          </div>
+                        )}
+
+                        {cur.provider_type === "ollama" && (
+                          <>
+                            <div className="form-group">
+                              <label className="form-label">Ollama API Base URL</label>
+                              <input
+                                type="text"
+                                className="form-input"
+                                placeholder="http://localhost:11434/v1"
+                                value={cur.base_url || "http://localhost:11434/v1"}
+                                onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
+                              />
+                              <span className="form-hint">
+                                Runs locally via Ollama API. Make sure Ollama is running (<code>ollama serve</code>). No API key needed.
+                              </span>
+                            </div>
+                            <div className="form-group">
+                              <label className="form-label">API Key / Token (Optional)</label>
+                              <input
+                                type="password"
+                                className="form-input"
+                                placeholder="Optional (not required for local Ollama)"
+                                value={cur.api_key}
+                                onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                              />
+                            </div>
+                          </>
+                        )}
+
+                        {cur.provider_type === "custom" && (
+                          <>
+                            <div className="form-group">
+                              <label className="form-label">Base URL</label>
+                              <input
+                                type="text"
+                                className="form-input"
+                                placeholder="http://localhost:11434/v1 or http://localhost:8000/v1"
+                                value={cur.base_url}
+                                onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
+                              />
+                            </div>
+                            <div className="form-group">
+                              <label className="form-label">API Key / Token (Optional)</label>
+                              <input
+                                type="password"
+                                className="form-input"
+                                placeholder="Bearer token if required by server"
+                                value={cur.api_key}
+                                onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
+                              />
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </>
+            )}
+
             {settingsNavTab === "asr" && (
               <>
                 {/* Section 1: ASR Engine Mode */}
@@ -1732,212 +2055,147 @@ export default function App() {
 
               {settings.engine_mode === "cloud" ? (
                 <div style={{ display: "flex", flexDirection: "column", gap: "12px", marginTop: "10px" }}>
+                  {/* Unified Provider Selection */}
                   <div className="form-group">
-                    <label className="form-label">Provider Preset</label>
-                    <div className="provider-presets">
-                      {PROVIDER_PRESETS.map((preset) => {
-                        const isActive = activePreset.id === preset.id;
-                        return (
-                          <button
-                            key={preset.id}
-                            type="button"
-                            className={`provider-chip ${isActive ? "active" : ""}`}
-                            onClick={() => {
-                              if (preset.id === "custom") return;
-                              let targetUrl = preset.url;
-                              if (preset.id === "cloudflare") {
-                                const match = settings.api_base_url.match(/accounts\/([a-zA-Z0-9_-]+)\/ai/);
-                                if (match && match[1] && match[1] !== "<account_id>") {
-                                  targetUrl = `https://api.cloudflare.com/client/v4/accounts/${match[1]}/ai/v1`;
-                                }
-                              }
-                              const updated = {
-                                api_base_url: targetUrl,
-                                model: preset.defaultModel,
-                              };
-                              setSettings((prev) => ({ ...prev, ...updated }));
-                              updateAndSaveSettings(updated);
-                            }}
-                          >
-                            <span className="provider-icon">{preset.icon}</span>
-                            <span className="provider-name">{preset.name}</span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  {activePreset.id === "cloudflare" ? (
-                    <div className="form-group">
-                      <label className="form-label">Cloudflare Account ID</label>
-                      <input
-                        type="text"
-                        className="form-input"
-                        placeholder="e.g. c3a0b12984ef... (found in Cloudflare Dashboard)"
-                        value={(() => {
-                          const match = settings.api_base_url.match(/accounts\/([a-zA-Z0-9_-]+)/);
-                          return match && match[1] !== "<account_id>" && match[1] !== "{account_id}" ? match[1] : "";
-                        })()}
-                        onChange={(e) => {
-                          const acc = e.target.value.trim();
-                          const newUrl = acc ? `https://api.cloudflare.com/client/v4/accounts/${acc}/ai/v1` : "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1";
-                          setSettings((prev) => ({ ...prev, api_base_url: newUrl }));
-                          updateAndSaveSettings({ api_base_url: newUrl });
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                      <label className="form-label" style={{ margin: 0 }}>Transcription Provider</label>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => {
+                          const curPid = settings.provider_id || (llmSettings.providers.find((p) => p.base_url === settings.api_base_url)?.id) || llmSettings.providers[0]?.id;
+                          if (curPid) setEditingProviderId(curPid);
+                          setSettingsNavTab("providers");
                         }}
-                      />
-                      <span className="form-hint">
-                        Found in Cloudflare Dashboard &rarr; Workers &amp; Pages overview (right sidebar). URL is added automatically.
-                      </span>
-                      <div className="cf-usage-panel">
-                        <div className="cf-usage-panel-header">
-                          <div className="cf-usage-panel-title">
-                            <span>⚡</span>
-                            <span>Cloudflare Consumed Workers AI Usage</span>
-                          </div>
-                          <div className="cf-usage-reset-badge">
-                            Resets 00:00 UTC ({cfUsage?.today?.label || "Today"})
-                          </div>
-                        </div>
-
-                        <div className="cf-usage-panel-stats">
-                          <div className="cf-panel-stat-box">
-                            <span className="cf-panel-stat-label">Today's Consumed</span>
-                            <span className="cf-panel-stat-val">
-                              {formatNeurons(cfUsage?.today?.total_neurons ?? 0)}
-                              <span className="cf-panel-stat-sub"> Ⓝ</span>
-                            </span>
-                          </div>
-
-                          <div className="cf-panel-stat-box">
-                            <span className="cf-panel-stat-label">Consumed Cost</span>
-                            <span className="cf-panel-stat-val">
-                              {formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}
-                              <span className="cf-panel-stat-sub"> @ $0.011/1k</span>
-                            </span>
-                          </div>
-
-                          <div className="cf-panel-stat-box">
-                            <span className="cf-panel-stat-label">Today's Speech</span>
-                            <span className="cf-panel-stat-val">
-                              {formatDurationSecs(cfUsage?.today?.asr_audio_secs ?? 0)}
-                              <span className="cf-panel-stat-sub"> ({cfUsage?.today?.asr_count ?? 0} {cfUsage?.today?.asr_count === 1 ? "rec" : "recs"})</span>
-                            </span>
-                          </div>
-
-                          <div className="cf-panel-stat-box">
-                            <span className="cf-panel-stat-label">This Month Consumed</span>
-                            <span className="cf-panel-stat-val">
-                              {formatNeurons(cfUsage?.current_month?.total_neurons ?? 0)} Ⓝ
-                              <span className="cf-panel-stat-sub"> ({formatCostUsd(cfUsage?.current_month?.total_cost_usd ?? 0)})</span>
-                            </span>
-                          </div>
-                        </div>
-
-                        <div className="cf-usage-panel-footer">
-                          <span className="cf-panel-hint">
-                            Tracks Neurons consumed directly within Lipi (does not track external usage on your Cloudflare account). Cloudflare free tier resets at 00:00 UTC.
-                          </span>
-                          <div style={{ display: "flex", gap: "6px" }}>
-                            <button
-                              type="button"
-                              className="btn btn-secondary"
-                              style={{ fontSize: "11px", padding: "2px 8px" }}
-                              onClick={() => loadCfUsage()}
-                              disabled={loadingCfUsage}
-                              title="Refresh Cloudflare usage statistics"
-                            >
-                              🔄 Refresh
-                            </button>
-                            <button
-                              type="button"
-                              className="btn btn-secondary"
-                              style={{ fontSize: "11px", padding: "2px 8px", color: "var(--text-danger, #ef4444)" }}
-                              onClick={handleClearCfUsage}
-                              title="Reset local Cloudflare usage tracking data"
-                            >
-                              🗑 Reset
-                            </button>
-                          </div>
-                        </div>
-                      </div>
+                      >
+                        ⚙ Manage Providers
+                      </button>
                     </div>
-                  ) : (
-                    <div className="form-group">
-                      <label className="form-label">API Endpoint URL</label>
-                      <input
-                        type="text"
-                        className="form-input"
-                        placeholder="https://api.openai.com/v1, https://api.groq.com/openai/v1, or http://localhost:8000/v1"
-                        value={settings.api_base_url}
-                        onChange={(e) =>
-                          setSettings({ ...settings, api_base_url: e.target.value })
+                    <select
+                      className="form-input form-select"
+                      value={settings.provider_id || (llmSettings.providers.find((p) => p.base_url === settings.api_base_url)?.id) || llmSettings.providers[0]?.id || ""}
+                      onChange={(e) => {
+                        const pid = e.target.value;
+                        const prov = llmSettings.providers.find((p) => p.id === pid);
+                        if (prov) {
+                          let defaultModel = settings.model;
+                          if (prov.provider_type === "groq") defaultModel = "whisper-large-v3-turbo";
+                          else if (prov.provider_type === "cloudflare") defaultModel = "@cf/openai/whisper";
+                          else if (prov.provider_type === "openai" || prov.provider_type === "ollama") defaultModel = "whisper-1";
+                          const updated: Partial<AppSettings> = {
+                            provider_id: prov.id,
+                            api_base_url: prov.base_url,
+                            api_key: prov.api_key,
+                            model: defaultModel,
+                          };
+                          setSettings((prev) => ({ ...prev, ...updated }));
+                          updateAndSaveSettings(updated);
                         }
-                        onBlur={() => updateAndSaveSettings({ api_base_url: settings.api_base_url })}
-                        required
-                      />
-                      <span className="form-hint">
-                        {activePreset.urlHint}
-                      </span>
-                    </div>
-                  )}
-
-                  <div className="form-group">
-                    <label className="form-label">API Key / Token {activePreset.id === "local" ? "(Optional)" : ""}</label>
-                    <input
-                      type="password"
-                      className="form-input"
-                      placeholder={activePreset.keyPlaceholder}
-                      value={settings.api_key}
-                      onChange={(e) =>
-                        setSettings({ ...settings, api_key: e.target.value })
-                      }
-                      onBlur={() => updateAndSaveSettings({ api_key: settings.api_key })}
-                    />
-                    <span className="form-hint">
-                      {activePreset.keyHint} Stored securely in local SQLite.
-                    </span>
+                      }}
+                    >
+                      {llmSettings.providers.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} ({p.provider_type})
+                        </option>
+                      ))}
+                    </select>
+                    {(() => {
+                      const curPid = settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id) || llmSettings.providers[0]?.id;
+                      const prov = llmSettings.providers.find((p) => p.id === curPid);
+                      if (!prov) return null;
+                      return (
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "4px", fontSize: "12px", color: "var(--text-secondary)" }}>
+                          <span>Endpoint: {prov.base_url || "Default"}</span>
+                          <span>{prov.api_key?.trim() ? "✓ Key Configured" : prov.provider_type === "ollama" ? "✓ Local Server" : "⚠ Key Missing in Providers tab"}</span>
+                        </div>
+                      );
+                    })()}
                   </div>
 
                   <div className="form-group">
-                    <label className="form-label">Model Name</label>
+                    <label className="form-label">Audio Model Name</label>
                     <input
                       type="text"
                       className="form-input"
-                      placeholder={activePreset.defaultModel || "whisper-1"}
+                      placeholder="whisper-1, whisper-large-v3-turbo, or @cf/openai/whisper"
                       value={settings.model}
-                      onChange={(e) =>
-                        setSettings({ ...settings, model: e.target.value })
-                      }
+                      onChange={(e) => setSettings({ ...settings, model: e.target.value })}
                       onBlur={() => updateAndSaveSettings({ model: settings.model })}
                     />
-                    {activePreset.id === "cloudflare" && (
-                      <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
-                        {[
-                          { id: "@cf/openai/whisper", label: "whisper (Standard · ~41.1 Ⓝ/min)" },
-                          { id: "@cf/openai/whisper-large-v3-turbo", label: "large-v3-turbo (Turbo · ~46.6 Ⓝ/min)" },
-                          { id: "@cf/openai/whisper-tiny-en", label: "whisper-tiny-en (Beta · Fast)" },
-                        ].map((item) => (
-                          <button
-                            key={item.id}
-                            type="button"
-                            className={`provider-chip ${settings.model === item.id ? "active" : ""}`}
-                            style={{ fontSize: "11px", padding: "3px 8px" }}
-                            onClick={() => {
-                              setSettings({ ...settings, model: item.id });
-                              updateAndSaveSettings({ model: item.id });
-                            }}
-                          >
-                            {item.label}
-                          </button>
-                        ))}
-                      </div>
-                    )}
+                    {(() => {
+                      const curPid = settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id) || llmSettings.providers[0]?.id;
+                      const prov = llmSettings.providers.find((p) => p.id === curPid);
+                      const pType = prov?.provider_type;
+                      if (pType === "cloudflare") {
+                        return (
+                          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
+                            {[
+                              { id: "@cf/openai/whisper", label: "whisper (Standard · ~41.1 Ⓝ/min)" },
+                              { id: "@cf/openai/whisper-large-v3-turbo", label: "large-v3-turbo (Turbo · ~46.6 Ⓝ/min)" },
+                              { id: "@cf/openai/whisper-tiny-en", label: "whisper-tiny-en (Beta · Fast)" },
+                            ].map((item) => (
+                              <button
+                                key={item.id}
+                                type="button"
+                                className={`provider-chip ${settings.model === item.id ? "active" : ""}`}
+                                style={{ fontSize: "11px", padding: "3px 8px" }}
+                                onClick={() => {
+                                  setSettings({ ...settings, model: item.id });
+                                  updateAndSaveSettings({ model: item.id });
+                                }}
+                              >
+                                {item.label}
+                              </button>
+                            ))}
+                          </div>
+                        );
+                      }
+                      if (pType === "groq") {
+                        return (
+                          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
+                            {[
+                              { id: "whisper-large-v3-turbo", label: "whisper-large-v3-turbo (Ultra-Fast)" },
+                              { id: "whisper-large-v3", label: "whisper-large-v3" },
+                            ].map((item) => (
+                              <button
+                                key={item.id}
+                                type="button"
+                                className={`provider-chip ${settings.model === item.id ? "active" : ""}`}
+                                style={{ fontSize: "11px", padding: "3px 8px" }}
+                                onClick={() => {
+                                  setSettings({ ...settings, model: item.id });
+                                  updateAndSaveSettings({ model: item.id });
+                                }}
+                              >
+                                {item.label}
+                              </button>
+                            ))}
+                          </div>
+                        );
+                      }
+                      return (
+                        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
+                          {[
+                            { id: "whisper-1", label: "whisper-1 (OpenAI standard)" },
+                          ].map((item) => (
+                            <button
+                              key={item.id}
+                              type="button"
+                              className={`provider-chip ${settings.model === item.id ? "active" : ""}`}
+                              style={{ fontSize: "11px", padding: "3px 8px" }}
+                              onClick={() => {
+                                setSettings({ ...settings, model: item.id });
+                                updateAndSaveSettings({ model: item.id });
+                              }}
+                            >
+                              {item.label}
+                            </button>
+                          ))}
+                        </div>
+                      );
+                    })()}
                     <span className="form-hint">
-                      {activePreset.id === "groq"
-                        ? "Default: 'whisper-large-v3-turbo' (or 'whisper-large-v3')."
-                        : activePreset.id === "cloudflare"
-                        ? "Supports: '@cf/openai/whisper' ($0.0005/min), '@cf/openai/whisper-large-v3-turbo' ($0.0005/min), and '@cf/openai/whisper-tiny-en' (Beta · Fast)."
-                        : "e.g. 'whisper-1' (OpenAI / local standard)."}
+                      Model used for speech-to-text with the selected provider.
                     </span>
                   </div>
 
@@ -2450,344 +2708,48 @@ export default function App() {
 
                 {llmSettings.enabled && (
                   <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-                    {/* Provider Selection */}
+                    {/* Active LLM Provider Selection */}
                     <div className="form-group">
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
-                        <label className="form-label" style={{ margin: 0 }}>Configured Providers</label>
-                        <div style={{ display: "flex", gap: "6px" }}>
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => handleAddProvider("cloudflare")}
-                            title="Add a Cloudflare Workers AI account"
-                          >
-                            + Cloudflare
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => handleAddProvider("groq")}
-                            title="Add a Groq account"
-                          >
-                            + Groq
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => handleAddProvider("openai")}
-                            title="Add an OpenAI account"
-                          >
-                            + OpenAI
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => handleAddProvider("ollama")}
-                            title="Add a local Ollama API endpoint (runs small models locally)"
-                          >
-                            + Ollama
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => handleAddProvider("custom")}
-                            title="Add a Custom / Local vLLM or API endpoint"
-                          >
-                            + Custom
-                          </button>
-                        </div>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                        <label className="form-label" style={{ margin: 0 }}>Active LLM Provider</label>
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => {
+                            setEditingProviderId(llmSettings.active_provider_id);
+                            setSettingsNavTab("providers");
+                          }}
+                        >
+                          ⚙ Manage Providers
+                        </button>
                       </div>
-
-                      <div className="llm-provider-list">
-                        {llmSettings.providers.map((p) => {
-                          const isSelected = editingProviderId === p.id;
-                          const isActive = llmSettings.active_provider_id === p.id;
-                          return (
-                            <div
-                              key={p.id}
-                              className={`llm-provider-card ${isSelected ? "active" : ""}`}
-                              onClick={() => setEditingProviderId(p.id)}
-                            >
-                              <div className="llm-provider-info">
-                                <span className="llm-provider-icon">
-                                  {p.provider_type === "cloudflare"
-                                    ? "☁"
-                                    : p.provider_type === "groq"
-                                    ? "⚡"
-                                    : p.provider_type === "openai"
-                                    ? "🤖"
-                                    : p.provider_type === "ollama"
-                                    ? "🦙"
-                                    : "⚙"}
-                                </span>
-                                <div>
-                                  <div className="llm-provider-name">{p.name}</div>
-                                  <div className="llm-provider-type">{p.provider_type}</div>
-                                </div>
-                              </div>
-                              <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                                {isActive ? (
-                                  <span className="badge-pill installed">Active</span>
-                                ) : (
-                                  <button
-                                    type="button"
-                                    className="btn btn-secondary btn-sm"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      updateAndSaveLlmSettings({ active_provider_id: p.id });
-                                      setEditingProviderId(p.id);
-                                    }}
-                                  >
-                                    Use this
-                                  </button>
-                                )}
-                                {llmSettings.providers.length > 1 && (
-                                  <button
-                                    type="button"
-                                    className="btn-icon"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      handleDeleteProvider(p.id);
-                                    }}
-                                    title="Delete provider"
-                                  >
-                                    ✕
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
+                      <select
+                        className="form-input form-select"
+                        value={llmSettings.active_provider_id}
+                        onChange={(e) => {
+                          const newPid = e.target.value;
+                          updateAndSaveLlmSettings({ active_provider_id: newPid });
+                          setAvailableModels([]);
+                          handleFetchModels(newPid);
+                        }}
+                      >
+                        {llmSettings.providers.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name} ({p.provider_type})
+                          </option>
+                        ))}
+                      </select>
+                      {(() => {
+                        const cur = llmSettings.providers.find((p) => p.id === llmSettings.active_provider_id);
+                        if (!cur) return null;
+                        return (
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "4px", fontSize: "12px", color: "var(--text-secondary)" }}>
+                            <span>Endpoint: {cur.base_url || "Default endpoint"}</span>
+                            <span>{cur.api_key?.trim() ? "✓ Key Configured" : cur.provider_type === "ollama" ? "✓ Local Server" : "⚠ Key Missing in Providers tab"}</span>
+                          </div>
+                        );
+                      })()}
                     </div>
-
-                    {/* Active / Selected Provider Credentials */}
-                    {(() => {
-                      const cur = llmSettings.providers.find((p) => p.id === editingProviderId) || llmSettings.providers[0];
-                      if (!cur) return null;
-                      return (
-                        <div style={{ background: "var(--bg-primary)", padding: "14px", borderRadius: "8px", border: "1px solid var(--border)", display: "flex", flexDirection: "column", gap: "12px" }}>
-                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                            <span style={{ fontSize: "13px", fontWeight: 600 }}>
-                              Configure {cur.name} Credentials
-                            </span>
-                            {cur.id !== llmSettings.active_provider_id && (
-                              <button
-                                type="button"
-                                className="btn btn-secondary btn-sm"
-                                onClick={() => updateAndSaveLlmSettings({ active_provider_id: cur.id })}
-                              >
-                                Set as Active Provider
-                              </button>
-                            )}
-                          </div>
-
-                          <div className="form-group">
-                            <label className="form-label">Provider Label</label>
-                            <input
-                              type="text"
-                              className="form-input"
-                              value={cur.name}
-                              onChange={(e) => handleUpdateProvider(cur.id, { name: e.target.value })}
-                            />
-                          </div>
-
-                          {cur.provider_type === "cloudflare" && (
-                            <>
-                              <div className="form-group">
-                                <label className="form-label">Cloudflare Account ID</label>
-                                <input
-                                  type="text"
-                                  className="form-input"
-                                  placeholder="e.g. c3a0b12984ef... (found in Cloudflare Dashboard)"
-                                  value={cur.account_id || (() => {
-                                    const match = cur.base_url?.match(/accounts\/([a-zA-Z0-9_-]+)/);
-                                    return match && match[1] !== "<account_id>" && match[1] !== "{account_id}" ? match[1] : "";
-                                  })()}
-                                  onChange={(e) => {
-                                    const acc = e.target.value.trim();
-                                    const targetUrl = acc ? `https://api.cloudflare.com/client/v4/accounts/${acc}/ai/v1` : "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1";
-                                    handleUpdateProvider(cur.id, {
-                                      account_id: acc,
-                                      base_url: targetUrl,
-                                    });
-                                  }}
-                                />
-                                <span className="form-hint">
-                                  Found in Cloudflare Dashboard &rarr; Workers &amp; Pages overview (right sidebar). URL is added automatically.
-                                </span>
-                              </div>
-
-                              <div className="form-group">
-                                <label className="form-label">API Key / Token</label>
-                                <input
-                                  type="password"
-                                  className="form-input"
-                                  placeholder="Cloudflare API Token with Workers AI Read permissions"
-                                  value={cur.api_key}
-                                  onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
-                                />
-                                <span className="form-hint">
-                                  Needs <em>Workers AI: Read</em> permissions. Stored securely in local configuration.
-                                </span>
-                              </div>
-                              <div className="cf-usage-panel" style={{ marginTop: "12px" }}>
-                                <div className="cf-usage-panel-header">
-                                  <div className="cf-usage-panel-title">
-                                    <span>⚡</span>
-                                    <span>Cloudflare Consumed Workers AI Usage</span>
-                                  </div>
-                                  <div className="cf-usage-reset-badge">
-                                    Resets 00:00 UTC ({cfUsage?.today?.label || "Today"})
-                                  </div>
-                                </div>
-
-                                <div className="cf-usage-panel-stats">
-                                  <div className="cf-panel-stat-box">
-                                    <span className="cf-panel-stat-label">Today's Consumed</span>
-                                    <span className="cf-panel-stat-val">
-                                      {formatNeurons(cfUsage?.today?.total_neurons ?? 0)}
-                                      <span className="cf-panel-stat-sub"> Ⓝ</span>
-                                    </span>
-                                  </div>
-
-                                  <div className="cf-panel-stat-box">
-                                    <span className="cf-panel-stat-label">Consumed Cost</span>
-                                    <span className="cf-panel-stat-val">
-                                      {formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}
-                                      <span className="cf-panel-stat-sub"> @ $0.011/1k</span>
-                                    </span>
-                                  </div>
-
-                                  <div className="cf-panel-stat-box">
-                                    <span className="cf-panel-stat-label">Today's LLM Tokens</span>
-                                    <span className="cf-panel-stat-val">
-                                      {(cfUsage?.today?.llm_tokens ?? 0).toLocaleString()}
-                                      <span className="cf-panel-stat-sub"> ({cfUsage?.today?.llm_count ?? 0} {cfUsage?.today?.llm_count === 1 ? "tx" : "txs"})</span>
-                                    </span>
-                                  </div>
-
-                                  <div className="cf-panel-stat-box">
-                                    <span className="cf-panel-stat-label">This Month Consumed</span>
-                                    <span className="cf-panel-stat-val">
-                                      {formatNeurons(cfUsage?.current_month?.total_neurons ?? 0)} Ⓝ
-                                      <span className="cf-panel-stat-sub"> ({formatCostUsd(cfUsage?.current_month?.total_cost_usd ?? 0)})</span>
-                                    </span>
-                                  </div>
-                                </div>
-
-                                <div className="cf-usage-panel-footer">
-                                  <span className="cf-panel-hint">
-                                    Tracks Neurons consumed directly within Lipi (does not track external usage on your Cloudflare account). Cloudflare free tier resets at 00:00 UTC.
-                                  </span>
-                                  <div style={{ display: "flex", gap: "6px" }}>
-                                    <button
-                                      type="button"
-                                      className="btn btn-secondary"
-                                      style={{ fontSize: "11px", padding: "2px 8px" }}
-                                      onClick={() => loadCfUsage()}
-                                      disabled={loadingCfUsage}
-                                      title="Refresh Cloudflare usage statistics"
-                                    >
-                                      🔄 Refresh
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="btn btn-secondary"
-                                      style={{ fontSize: "11px", padding: "2px 8px", color: "var(--text-danger, #ef4444)" }}
-                                      onClick={handleClearCfUsage}
-                                      title="Reset local Cloudflare usage tracking data"
-                                    >
-                                      🗑 Reset
-                                    </button>
-                                  </div>
-                                </div>
-                              </div>
-                            </>
-                          )}
-
-                          {cur.provider_type === "groq" && (
-                            <div className="form-group">
-                              <label className="form-label">Groq API Key</label>
-                              <input
-                                type="password"
-                                className="form-input"
-                                placeholder="gsk_..."
-                                value={cur.api_key}
-                                onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
-                              />
-                              <span className="form-hint">From console.groq.com/keys.</span>
-                            </div>
-                          )}
-
-                          {cur.provider_type === "openai" && (
-                            <div className="form-group">
-                              <label className="form-label">OpenAI API Key</label>
-                              <input
-                                type="password"
-                                className="form-input"
-                                placeholder="sk-..."
-                                value={cur.api_key}
-                                onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
-                              />
-                            </div>
-                          )}
-
-                          {cur.provider_type === "ollama" && (
-                            <>
-                              <div className="form-group">
-                                <label className="form-label">Ollama API Base URL</label>
-                                <input
-                                  type="text"
-                                  className="form-input"
-                                  placeholder="http://localhost:11434/v1"
-                                  value={cur.base_url || "http://localhost:11434/v1"}
-                                  onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
-                                />
-                                <span className="form-hint">
-                                  Runs locally via Ollama API. Make sure Ollama is running (<code>ollama serve</code>). Best for small local LLMs. No API key needed.
-                                </span>
-                              </div>
-                              <div className="form-group">
-                                <label className="form-label">API Key / Token (Optional)</label>
-                                <input
-                                  type="password"
-                                  className="form-input"
-                                  placeholder="Optional (not required for local Ollama)"
-                                  value={cur.api_key}
-                                  onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
-                                />
-                              </div>
-                            </>
-                          )}
-
-                          {cur.provider_type === "custom" && (
-                            <>
-                              <div className="form-group">
-                                <label className="form-label">Base URL</label>
-                                <input
-                                  type="text"
-                                  className="form-input"
-                                  placeholder="http://localhost:11434/v1 or http://localhost:8000/v1"
-                                  value={cur.base_url}
-                                  onChange={(e) => handleUpdateProvider(cur.id, { base_url: e.target.value })}
-                                />
-                              </div>
-                              <div className="form-group">
-                                <label className="form-label">API Key / Token (Optional)</label>
-                                <input
-                                  type="password"
-                                  className="form-input"
-                                  placeholder="Bearer token if required by server"
-                                  value={cur.api_key}
-                                  onChange={(e) => handleUpdateProvider(cur.id, { api_key: e.target.value })}
-                                />
-                              </div>
-                            </>
-                          )}
-                        </div>
-                      );
-                    })()}
 
                     {/* Model Selection with Fetch Models */}
                     <div className="form-group">
@@ -2822,12 +2784,35 @@ export default function App() {
                         )}
                       </div>
 
+                      {availableModels.length > 0 && (
+                        <div style={{ marginTop: "6px" }}>
+                          <select
+                            className="form-input form-select"
+                            value={availableModels.includes(llmSettings.model) ? llmSettings.model : ""}
+                            onChange={(e) => {
+                              if (e.target.value) {
+                                updateAndSaveLlmSettings({ model: e.target.value });
+                              }
+                            }}
+                          >
+                            <option value="" disabled>
+                              -- Select from {availableModels.length} fetched models --
+                            </option>
+                            {availableModels.map((m) => (
+                              <option key={m} value={m}>
+                                {m}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+
                       <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
                         {(() => {
-                          const cur = llmSettings.providers.find((p) => p.id === editingProviderId) || llmSettings.providers[0];
-                          const isOllama = cur?.provider_type === "ollama" || editingProviderId.toLowerCase().includes("ollama");
-                          const isCf = cur?.provider_type === "cloudflare" || editingProviderId.toLowerCase().includes("cloudflare");
-                          const isGroq = cur?.provider_type === "groq" || editingProviderId.toLowerCase().includes("groq");
+                          const cur = llmSettings.providers.find((p) => p.id === llmSettings.active_provider_id) || llmSettings.providers[0];
+                          const isOllama = cur?.provider_type === "ollama";
+                          const isCf = cur?.provider_type === "cloudflare";
+                          const isGroq = cur?.provider_type === "groq";
 
                           if (isOllama) {
                             return [
@@ -2841,10 +2826,11 @@ export default function App() {
                           }
                           if (isCf) {
                             return [
-                              { id: "@cf/meta/llama-3.1-8b-instruct", label: "Llama 3.1 8B (Fast)" },
                               { id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", label: "Llama 3.3 70B (Quality)" },
-                              { id: "@cf/qwen/qwen2.5-7b-instruct", label: "Qwen 2.5 7B" },
+                              { id: "@cf/meta/llama-3.1-8b-instruct-fp8", label: "Llama 3.1 8B (Fast)" },
                               { id: "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", label: "DeepSeek R1 32B" },
+                              { id: "@cf/qwen/qwen2.5-coder-32b-instruct", label: "Qwen 2.5 Coder 32B" },
+                              { id: "@cf/openai/gpt-oss-120b", label: "GPT-OSS 120B" },
                             ];
                           }
                           if (isGroq) {
@@ -3912,8 +3898,8 @@ export default function App() {
                 {isCloudflareActive && !settings.model?.includes("tiny") && (
                   <span
                     className="stat-counter-cf"
-                    onClick={() => openSettings("asr")}
-                    title={`Cloudflare Workers AI: Today consumed ${formatNeurons(cfUsage?.today?.total_neurons ?? 0)} Ⓝ (${formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}) in Lipi. Click to view settings.`}
+                    onClick={() => openSettings("providers")}
+                    title={`Cloudflare Workers AI: Today consumed ${formatNeurons(cfUsage?.today?.total_neurons ?? 0)} Ⓝ (${formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}) in Lipi. Click to view providers.`}
                     style={{ cursor: "pointer" }}
                   >
                     {" "}· {formatCostUsd(cfUsage?.today?.total_cost_usd ?? 0)}

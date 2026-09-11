@@ -69,11 +69,21 @@ async fn stop_recording_and_transcribe(
         });
     }
 
-    if settings.api_base_url.trim().is_empty() {
+    let llm_cfg = env_config::load_llm_settings(&state.app_data_dir);
+    let (api_base_url, api_key) = if let Some(pid) = &settings.provider_id {
+        if let Some(prov) = llm_cfg.providers.iter().find(|p| &p.id == pid) {
+            (prov.resolved_base_url(), prov.api_key.clone())
+        } else {
+            (settings.api_base_url.clone(), settings.api_key.clone())
+        }
+    } else {
+        (settings.api_base_url.clone(), settings.api_key.clone())
+    };
+
+    if api_base_url.trim().is_empty() {
         return Err("API endpoint URL is missing. Set it in Settings.".into());
     }
 
-    let llm_cfg = env_config::load_llm_settings(&state.app_data_dir);
     let timeout_secs = llm_cfg.request_timeout_secs.max(settings.request_timeout_secs).max(180) as u64;
 
     let wav_len = wav_bytes.len();
@@ -85,8 +95,8 @@ async fn stop_recording_and_transcribe(
 
     let result = transcribe::transcribe_audio(
         wav_bytes,
-        &settings.api_base_url,
-        &settings.api_key,
+        &api_base_url,
+        &api_key,
         &settings.model,
         settings.language.as_deref(),
         timeout_secs,
@@ -96,7 +106,7 @@ async fn stop_recording_and_transcribe(
     let mut cf_neurons = None;
     let mut cf_cost = None;
 
-    if settings.api_base_url.contains("api.cloudflare.com") {
+    if api_base_url.contains("api.cloudflare.com") {
         if let Ok((neurons, cost)) = state.db.log_cf_asr_usage(&settings.model, duration_secs) {
             eprintln!(
                 "[Cloudflare ASR] Audio: {:.2}s | Model: {} | Consumed: {:.2} Neurons (~${:.5})",
