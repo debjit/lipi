@@ -129,6 +129,10 @@ mod which {
     }
 }
 
+pub fn which_command(name: &str) -> Option<PathBuf> {
+    which::which(name).ok()
+}
+
 pub fn find_faster_whisper_python(app_data_dir: &Path) -> Option<PathBuf> {
     let venv_py = if cfg!(windows) {
         app_data_dir.join("venv").join("Scripts").join("python.exe")
@@ -301,6 +305,65 @@ pub async fn ensure_whisper_cli_binary(app_data_dir: &Path) -> Result<PathBuf, S
                 let _ = fs::set_permissions(&binary_path, fs::Permissions::from_mode(0o755));
             }
             return Ok(binary_path);
+        }
+    }
+
+    // Download official whisper-bin-x64 release on Windows x86_64
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        let zip_url = "https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-x64.zip";
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(zip_url)
+            .header("User-Agent", "lipi")
+            .send()
+            .await
+            .map_err(|e| format!("Failed to download whisper binary archive: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("Download failed with status: {}", resp.status()));
+        }
+
+        let archive_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed to read archive bytes: {}", e))?;
+
+        let zip_path = bin_dir.join("whisper-bin.zip");
+        fs::write(&zip_path, &archive_bytes)
+            .map_err(|e| format!("Failed to write archive to disk: {}", e))?;
+
+        // Windows 10+ includes tar.exe which extracts .zip files natively
+        let mut extracted = false;
+        if let Ok(status) = std::process::Command::new("tar")
+            .arg("-xf")
+            .arg(&zip_path)
+            .arg("-C")
+            .arg(&bin_dir)
+            .status()
+        {
+            if status.success() {
+                extracted = true;
+            }
+        }
+
+        if !extracted {
+            let ps_script = format!(
+                "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                zip_path.to_string_lossy(),
+                bin_dir.to_string_lossy()
+            );
+            let _ = std::process::Command::new("powershell")
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg(&ps_script)
+                .status();
+        }
+
+        let _ = fs::remove_file(&zip_path);
+
+        if let Some(p) = find_whisper_binary(app_data_dir) {
+            return Ok(p);
         }
     }
 

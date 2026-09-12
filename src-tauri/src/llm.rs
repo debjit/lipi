@@ -141,7 +141,7 @@ pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, 
     }
 
     let client = reqwest::Client::builder()
-        .user_agent("Lipi/0.1.0")
+        .user_agent(concat!("Lipi/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format_reqwest_error(&e))?;
@@ -280,7 +280,7 @@ pub async fn transform_text_with_prompt(
     };
 
     let client = reqwest::Client::builder()
-        .user_agent("Lipi/0.1.0")
+        .user_agent(concat!("Lipi/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(timeout_secs.max(180)))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", format_reqwest_error(&e)))?;
