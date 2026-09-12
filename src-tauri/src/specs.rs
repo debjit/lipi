@@ -105,6 +105,57 @@ pub fn detect_system_specs() -> SystemSpecs {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PrerequisiteStatus {
+    pub os: String,
+    pub has_audio_device: bool,
+    pub audio_device_name: Option<String>,
+    pub whisper_binary_found: bool,
+    pub whisper_binary_path: Option<String>,
+    pub python_found: bool,
+    pub python_path: Option<String>,
+    pub venv_python_found: bool,
+    pub ollama_binary_found: bool,
+}
+
+pub fn check_system_prerequisites(app_data_dir: &std::path::Path) -> PrerequisiteStatus {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let os = std::env::consts::OS.to_string();
+
+    let host = cpal::default_host();
+    let (has_audio_device, audio_device_name) = match host.default_input_device() {
+        Some(dev) => (true, dev.name().ok()),
+        None => (false, None),
+    };
+
+    let whisper_bin = crate::models::find_whisper_binary(app_data_dir);
+    let whisper_binary_found = whisper_bin.is_some();
+    let whisper_binary_path = whisper_bin.map(|p| p.to_string_lossy().to_string());
+
+    let py = crate::models::which_command("python3")
+        .or_else(|| crate::models::which_command("python"));
+    let python_found = py.is_some();
+    let python_path = py.map(|p| p.to_string_lossy().to_string());
+
+    let venv_py = crate::models::find_faster_whisper_python(app_data_dir);
+    let venv_python_found = venv_py.is_some();
+
+    let ollama_bin = crate::models::which_command("ollama");
+    let ollama_binary_found = ollama_bin.is_some();
+
+    PrerequisiteStatus {
+        os,
+        has_audio_device,
+        audio_device_name,
+        whisper_binary_found,
+        whisper_binary_path,
+        python_found,
+        python_path,
+        venv_python_found,
+        ollama_binary_found,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,4 +169,12 @@ mod tests {
         assert!(!specs.recommended_mode.is_empty());
         assert!(!specs.summary_text.is_empty());
     }
+
+    #[test]
+    fn test_check_system_prerequisites() {
+        let temp_dir = std::env::temp_dir().join(format!("lipi_prereq_test_{}", std::process::id()));
+        let prereqs = check_system_prerequisites(&temp_dir);
+        assert!(!prereqs.os.is_empty());
+    }
 }
+

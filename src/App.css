@@ -2956,19 +2956,21 @@ optgroup {
 .wizard-stepper {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 12px 24px;
+  gap: 6px;
+  padding: 12px 20px;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border);
+  overflow-x: auto;
 }
 
 .wizard-step-pill {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 14px;
+  gap: 6px;
+  padding: 6px 12px;
   border-radius: 20px;
-  font-size: 12.5px;
+  font-size: 12px;
+  white-space: nowrap;
   font-weight: 600;
   color: var(--text-secondary);
   background: transparent;
@@ -3053,9 +3055,17 @@ optgroup {
 }
 
 .wizard-spec-card .spec-icon {
-  font-size: 24px;
-  display: block;
-  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 8px;
+  min-height: 28px;
+}
+
+.spec-svg-icon {
+  width: 26px;
+  height: 26px;
+  color: #60a5fa;
 }
 
 .wizard-spec-card .spec-label {
@@ -3542,6 +3552,169 @@ optgroup {
   padding-top: 18px;
   border-top: 1px solid var(--border);
   margin-top: 20px;
+}
+
+/* Wizard OS Toggle & Prerequisite Styles */
+.wizard-os-toggle-group {
+  display: inline-flex;
+  gap: 4px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px;
+}
+
+.wizard-os-pill {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.wizard-os-pill:hover {
+  color: var(--text-primary);
+}
+
+.wizard-os-pill.active {
+  background: #2563eb;
+  color: #fff;
+  font-weight: 600;
+}
+
+.wizard-prereq-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.wizard-prereq-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 16px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  transition: border-color 0.15s;
+}
+
+.wizard-prereq-card:hover {
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+.prereq-left {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex: 1;
+}
+
+.prereq-icon {
+  font-size: 18px;
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.prereq-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.prereq-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 3px;
+  line-height: 1.4;
+}
+
+.prereq-status-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.prereq-status-badge.status-ready {
+  background: rgba(16, 185, 129, 0.15);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.prereq-status-badge.status-warn {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.prereq-status-badge.status-action {
+  background: rgba(99, 102, 241, 0.15);
+  color: #818cf8;
+  border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.btn-sm {
+  padding: 5px 12px !important;
+  font-size: 12px !important;
+  white-space: nowrap;
+}
+
+.wizard-os-guide-box {
+  margin-top: 14px;
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.os-guide-header {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+
+.os-guide-body {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.os-guide-cmd {
+  display: block;
+  margin-top: 4px;
+  padding: 6px 10px;
+  background: #090b10;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 11.5px;
+  color: #38bdf8;
+  user-select: all;
+  overflow-x: auto;
+}
+
+.os-inline-code {
+  background: #090b10;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-family: monospace;
+  font-size: 11px;
+  color: #38bdf8;
+  user-select: all;
 }
 
 .confirm-modal-box {

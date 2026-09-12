@@ -666,6 +666,11 @@ fn get_system_specs() -> specs::SystemSpecs {
 }
 
 #[tauri::command]
+fn check_system_prerequisites(state: tauri::State<'_, AppState>) -> specs::PrerequisiteStatus {
+    specs::check_system_prerequisites(&state.app_data_dir)
+}
+
+#[tauri::command]
 async fn test_and_fetch_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
     llm::fetch_models(&base_url, &api_key).await
 }
@@ -869,6 +874,7 @@ pub fn run() {
             get_cf_usage_summary,
             clear_cf_usage_logs,
             get_system_specs,
+            check_system_prerequisites,
             test_and_fetch_models
         ])
         .run(tauri::generate_context!())
