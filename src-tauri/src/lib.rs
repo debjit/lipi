@@ -12,7 +12,32 @@ use audio::AudioRecorder;
 use db::{AppSettings, Database, Note};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Emitter, Manager,
+};
+
+const TRAY_IDLE_ICON: &[u8] = include_bytes!("../icons/tray_idle_32.png");
+const TRAY_RECORDING_ICON: &[u8] = include_bytes!("../icons/tray_recording_32.png");
+
+fn update_tray_icon(app: &tauri::AppHandle, is_recording: bool) {
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let bytes = if is_recording {
+            TRAY_RECORDING_ICON
+        } else {
+            TRAY_IDLE_ICON
+        };
+        if let Ok(img) = tauri::image::Image::from_bytes(bytes) {
+            let _ = tray.set_icon(Some(img));
+        }
+    }
+}
+
+#[tauri::command]
+fn set_tray_recording_state(app: tauri::AppHandle, is_recording: bool) {
+    update_tray_icon(&app, is_recording);
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OperationResult {
@@ -30,8 +55,10 @@ pub struct AppState {
 }
 
 #[tauri::command]
-fn start_recording(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.audio.start()
+fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.audio.start()?;
+    update_tray_icon(&app, true);
+    Ok(())
 }
 
 #[tauri::command]
@@ -41,8 +68,10 @@ fn is_recording(state: tauri::State<'_, AppState>) -> bool {
 
 #[tauri::command]
 async fn stop_recording_and_transcribe(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<OperationResult, String> {
+    update_tray_icon(&app, false);
     let wav_bytes = state.audio.stop()?;
     let settings = state.db.get_settings()?;
 
@@ -152,6 +181,11 @@ fn update_note(
 #[tauri::command]
 fn delete_note(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
     state.db.delete_note(id)
+}
+
+#[tauri::command]
+fn clear_all_notes(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.db.clear_all_notes()
 }
 
 #[tauri::command]
@@ -442,7 +476,7 @@ fn close_window(state: tauri::State<'_, AppState>, window: tauri::Window) -> Res
         &window,
         state.is_mini.load(std::sync::atomic::Ordering::SeqCst),
     );
-    window.close().map_err(|e| e.to_string())
+    window.hide().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -641,6 +675,10 @@ async fn test_and_fetch_models(base_url: String, api_key: String) -> Result<Vec<
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             let app_data_dir = app
                 .path()
@@ -700,6 +738,77 @@ pub fn run() {
                 }
             }
 
+            // Setup System Tray
+            let show_item = MenuItem::with_id(app, "show", "Show Lipi", true, None::<&str>)?;
+            let mini_item = MenuItem::with_id(app, "toggle_mini", "Toggle Mini Mode", true, None::<&str>)?;
+            let record_item = MenuItem::with_id(app, "toggle_record", "Start / Stop Recording", true, None::<&str>)?;
+            let pref_item = MenuItem::with_id(app, "preferences", "Preferences", true, None::<&str>)?;
+            let sep = PredefinedMenuItem::separator(app)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit Lipi", true, None::<&str>)?;
+
+            let tray_menu = Menu::with_items(
+                app,
+                &[&show_item, &mini_item, &record_item, &pref_item, &sep, &quit_item],
+            )?;
+
+            let tray_icon = tauri::image::Image::from_bytes(TRAY_IDLE_ICON)
+                .unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
+
+            let _tray = TrayIconBuilder::with_id("main-tray")
+                .icon(tray_icon)
+                .tooltip("Lipi - Voice to Notes")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        "show" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.unminimize();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        "toggle_mini" => {
+                            let _ = app.emit("tray_toggle_mini", ());
+                        }
+                        "toggle_record" => {
+                            let _ = app.emit("tray_toggle_recording", ());
+                        }
+                        "preferences" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.unminimize();
+                                let _ = w.set_focus();
+                            }
+                            let _ = app.emit("open_preferences", ());
+                        }
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(w) = app.get_webview_window("main") {
+                            if w.is_visible().unwrap_or(false) {
+                                let _ = w.hide();
+                            } else {
+                                let _ = w.show();
+                                let _ = w.unminimize();
+                                let _ = w.set_focus();
+                            }
+                        }
+                    }
+                })
+                .build(app)?;
+
             app.manage(AppState {
                 db: db_arc,
                 audio: Arc::new(AudioRecorder::new()),
@@ -711,7 +820,8 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
                 if let Some(state) = window.try_state::<AppState>() {
                     save_current_window_state(
                         &state.db,
@@ -719,9 +829,11 @@ pub fn run() {
                         state.is_mini.load(std::sync::atomic::Ordering::SeqCst),
                     );
                 }
+                let _ = window.hide();
             }
         })
         .invoke_handler(tauri::generate_handler![
+            set_tray_recording_state,
             start_recording,
             is_recording,
             stop_recording_and_transcribe,
@@ -729,6 +841,7 @@ pub fn run() {
             save_note,
             update_note,
             delete_note,
+            clear_all_notes,
             get_settings,
             save_settings,
             get_model_status,

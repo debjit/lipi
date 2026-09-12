@@ -14,6 +14,9 @@ pub fn resolve_system_prompt(preset: &str, custom_prompt: &str) -> String {
         "bullets" => {
             "Extract the core points, key details, and action items from the transcribed speech text into a structured Markdown bullet list. Do not add commentary. Output ONLY the bullet points.".to_string()
         }
+        "brainstorm" => {
+            "Analyze the transcribed speech to uncover what the speaker is truly thinking about and exploring. Identify the central premise, implicit questions, creative angles, key takeaways, and potential next steps or open threads. Organize the thoughts into a clear, structured insight summary with constructive ideas. Do not add conversational fluff.".to_string()
+        }
         "custom" => {
             if custom_prompt.trim().is_empty() {
                 "You are an editor. Improve the following text. Do not add commentary. Output ONLY the improved text.".to_string()
