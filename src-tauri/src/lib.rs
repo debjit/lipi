@@ -184,6 +184,11 @@ fn delete_note(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String>
 }
 
 #[tauri::command]
+fn clear_all_notes(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.db.clear_all_notes()
+}
+
+#[tauri::command]
 fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
     state.db.get_settings()
 }
@@ -836,6 +841,7 @@ pub fn run() {
             save_note,
             update_note,
             delete_note,
+            clear_all_notes,
             get_settings,
             save_settings,
             get_model_status,

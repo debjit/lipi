@@ -243,6 +243,13 @@ impl Database {
         Ok(())
     }
 
+    pub fn clear_all_notes(&self) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM notes", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn get_settings(&self) -> Result<AppSettings, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let get_val = |key: &str| -> Option<String> {

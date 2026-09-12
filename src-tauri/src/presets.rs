@@ -75,6 +75,11 @@ pub fn default_presets() -> Vec<PromptPreset> {
             label: "📌 Bullet Points".into(),
             prompt: "Extract the core points, key details, and action items from the transcribed speech text into a structured Markdown bullet list. Do not add commentary. Output ONLY the bullet points.".into(),
         },
+        PromptPreset {
+            id: "brainstorm".into(),
+            label: "💡 Brainstorm & Synthesize".into(),
+            prompt: "Analyze the transcribed speech to uncover what the speaker is truly thinking about and exploring. Identify the central premise, implicit questions, creative angles, key takeaways, and potential next steps or open threads. Organize the thoughts into a clear, structured insight summary with constructive ideas. Do not add conversational fluff.".into(),
+        },
     ]
 }
 
@@ -148,21 +153,10 @@ pub fn ensure_presets_dir(app_data_dir: &Path) -> Result<(), String> {
         let _ = fs::write(&guide_path, GUIDE_CONTENT);
     }
 
-    // Seed defaults if no .md preset files exist
-    let mut has_presets = false;
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with('.') && name.ends_with(".md") {
-                has_presets = true;
-                break;
-            }
-        }
-    }
-
-    if !has_presets {
-        for p in default_presets() {
-            let file_path = dir.join(format!("{}.md", p.id));
+    // Seed default presets if missing on disk
+    for p in default_presets() {
+        let file_path = dir.join(format!("{}.md", p.id));
+        if !file_path.exists() {
             let _ = fs::write(&file_path, serialize_preset(&p));
         }
     }
@@ -198,7 +192,7 @@ pub fn load_presets(app_data_dir: &Path) -> Vec<PromptPreset> {
     }
 
     // Sort: default IDs first in order, then custom alphabetically
-    let order = ["grammar_fix", "professional", "casual", "concise", "bullets"];
+    let order = ["grammar_fix", "professional", "casual", "concise", "bullets", "brainstorm"];
     presets.sort_by(|a, b| {
         let pos_a = order.iter().position(|&x| x == a.id);
         let pos_b = order.iter().position(|&x| x == b.id);

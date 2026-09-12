@@ -17,6 +17,29 @@ fn main() {
                 std::env::remove_var("XDG_DATA_HOME");
             }
         }
+
+        // Silence noisy upstream deprecation warning from libayatana-appindicator
+        extern "C" fn null_log_handler(
+            _log_domain: *const std::ffi::c_char,
+            _log_level: i32,
+            _message: *const std::ffi::c_char,
+            _user_data: *mut std::ffi::c_void,
+        ) {}
+
+        extern "C" {
+            fn g_log_set_handler(
+                log_domain: *const std::ffi::c_char,
+                log_levels: i32,
+                log_func: extern "C" fn(*const std::ffi::c_char, i32, *const std::ffi::c_char, *mut std::ffi::c_void),
+                user_data: *mut std::ffi::c_void,
+            ) -> u32;
+        }
+
+        unsafe {
+            let domain = b"libayatana-appindicator\0".as_ptr() as *const std::ffi::c_char;
+            // G_LOG_LEVEL_WARNING = 16 (1 << 4), G_LOG_LEVEL_MESSAGE = 32 (1 << 5), G_LOG_LEVEL_INFO = 64 (1 << 6)
+            g_log_set_handler(domain, 16 | 32 | 64, null_log_handler, std::ptr::null_mut());
+        }
     }
 
     lipi_lib::run()

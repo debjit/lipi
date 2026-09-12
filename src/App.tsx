@@ -231,6 +231,13 @@ export default function App() {
   const [isFreeingRam, setIsFreeingRam] = useState(false);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
+  const [confirmModal, setConfirmModal] = useState<{
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    danger?: boolean;
+    onConfirm: () => void;
+  } | null>(null);
 
   const [settings, setSettings] = useState<AppSettings>({
     api_base_url: "https://api.openai.com/v1",
@@ -278,6 +285,12 @@ export default function App() {
       label: "📌 Bullet Points",
       prompt:
         "Extract the core points, key details, and action items from the transcribed speech text into a structured Markdown bullet list. Do not add commentary. Output ONLY the bullet points.",
+    },
+    {
+      id: "brainstorm",
+      label: "💡 Brainstorm & Synthesize",
+      prompt:
+        "Analyze the transcribed speech to uncover what the speaker is truly thinking about and exploring. Identify the central premise, implicit questions, creative angles, key takeaways, and potential next steps or open threads. Organize the thoughts into a clear, structured insight summary with constructive ideas. Do not add conversational fluff.",
     },
   ];
 
@@ -421,17 +434,22 @@ export default function App() {
     }
   }
 
-  async function handleClearCfUsage() {
-    if (!window.confirm("Are you sure you want to clear your local Cloudflare usage records? This cannot be undone.")) {
-      return;
-    }
-    try {
-      await invoke("clear_cf_usage_logs");
-      await loadCfUsage();
-      showToast("✓ Cloudflare usage history cleared");
-    } catch (err) {
-      showToast(`Failed to clear usage: ${err}`);
-    }
+  function handleClearCfUsage() {
+    setConfirmModal({
+      title: "Clear Cloudflare Usage Records",
+      message: "Are you sure you want to clear your local Cloudflare usage records? This cannot be undone.",
+      confirmLabel: "Clear Records",
+      danger: true,
+      onConfirm: async () => {
+        try {
+          await invoke("clear_cf_usage_logs");
+          await loadCfUsage();
+          showToast("✓ Cloudflare usage history cleared");
+        } catch (err) {
+          showToast(`Failed to clear usage: ${err}`);
+        }
+      },
+    });
   }
 
   const activeViewRef = useRef(activeView);
@@ -1002,23 +1020,31 @@ export default function App() {
       return;
     }
     const target = llmSettingsRef.current.providers.find((p) => p.id === id);
-    if (target && hasCustomProviderInfo(target)) {
-      const ok = window.confirm(
-        `Delete provider "${target.name}"?\n\nThis provider has saved credentials or custom configuration.`
-      );
-      if (!ok) return;
-    }
-    const filtered = llmSettingsRef.current.providers.filter((p) => p.id !== id);
-    const nextActive =
-      llmSettingsRef.current.active_provider_id === id
-        ? filtered[0].id
-        : llmSettingsRef.current.active_provider_id;
+    const doDelete = () => {
+      const filtered = llmSettingsRef.current.providers.filter((p) => p.id !== id);
+      const nextActive =
+        llmSettingsRef.current.active_provider_id === id
+          ? filtered[0].id
+          : llmSettingsRef.current.active_provider_id;
 
-    updateAndSaveLlmSettings({
-      providers: filtered,
-      active_provider_id: nextActive,
-    });
-    setEditingProviderId(nextActive);
+      updateAndSaveLlmSettings({
+        providers: filtered,
+        active_provider_id: nextActive,
+      });
+      setEditingProviderId(nextActive);
+    };
+
+    if (target && hasCustomProviderInfo(target)) {
+      setConfirmModal({
+        title: `Delete ${target.name}?`,
+        message: "This provider has saved credentials or custom configuration.",
+        confirmLabel: "Delete Provider",
+        danger: true,
+        onConfirm: doDelete,
+      });
+      return;
+    }
+    doDelete();
   }
 
   async function handleTransform(textOverride?: string, _isAuto = false) {
@@ -1385,7 +1411,7 @@ export default function App() {
       }
     } catch (err: any) {
       console.error("Failed to update autostart setting:", err);
-      alert(`Could not update startup setting: ${err}`);
+      showToast(`Could not update startup setting: ${err}`);
     }
   }
 
@@ -1467,6 +1493,29 @@ export default function App() {
     } catch (err: any) {
       setErrorMsg(String(err));
     }
+  }
+
+  function handleClearHistory() {
+    if (notes.length === 0) return;
+    setConfirmModal({
+      title: "Clear All History?",
+      message: "Are you sure you want to clear all history? This will permanently delete all notes.",
+      confirmLabel: "Clear All",
+      danger: true,
+      onConfirm: async () => {
+        try {
+          await invoke("clear_all_notes");
+          setActiveNoteId(null);
+          setContent("");
+          setRawTranscript("");
+          setLlmResult("");
+          await loadNotes();
+          showToast("✓ History cleared");
+        } catch (err: any) {
+          setErrorMsg(String(err));
+        }
+      },
+    });
   }
 
   async function copyText(text: string, noteId?: number) {
@@ -1612,13 +1661,25 @@ export default function App() {
           <aside className={`sidebar ${sidebarOpen ? "" : "closed"}`}>
             <div className="sidebar-header">
               <span className="sidebar-title">History ({notes.length})</span>
-              <button
-                className="btn-icon"
-                onClick={handleNewNote}
-                title="New blank note"
-              >
-                +
-              </button>
+              <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                {notes.length > 0 && (
+                  <button
+                    className="btn-icon"
+                    onClick={handleClearHistory}
+                    title="Clear all history"
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    🗑️
+                  </button>
+                )}
+                <button
+                  className="btn-icon"
+                  onClick={handleNewNote}
+                  title="New blank note"
+                >
+                  +
+                </button>
+              </div>
             </div>
 
             <div className="history-list">
@@ -3961,6 +4022,8 @@ export default function App() {
                         ? "Concise Summary"
                         : llmSettings.voice_preset === "bullets"
                         ? "Action Bullets"
+                        : llmSettings.voice_preset === "brainstorm"
+                        ? "Brainstorming & Synthesis"
                         : "Custom Transformation"}
                     </span>
                   </div>
@@ -4109,6 +4172,43 @@ export default function App() {
         }}
         showToast={showToast}
       />
+
+      {/* Confirmation Modal */}
+      {confirmModal && (
+        <div
+          className="wizard-backdrop"
+          onClick={() => setConfirmModal(null)}
+          style={{ zIndex: 10000 }}
+        >
+          <div
+            className="confirm-modal-box"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="confirm-modal-title">{confirmModal.title}</div>
+            <div className="confirm-modal-message">{confirmModal.message}</div>
+            <div className="confirm-modal-actions">
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => setConfirmModal(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className={`btn ${confirmModal.danger ? "btn-danger" : "btn-primary"}`}
+                onClick={() => {
+                  const cb = confirmModal.onConfirm;
+                  setConfirmModal(null);
+                  cb();
+                }}
+              >
+                {confirmModal.confirmLabel || "Confirm"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
