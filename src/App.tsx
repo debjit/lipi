@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 import "./App.css";
 import { SetupWizard } from "./SetupWizard";
 
@@ -229,6 +230,7 @@ export default function App() {
   const [isPreloading, setIsPreloading] = useState(false);
   const [isFreeingRam, setIsFreeingRam] = useState(false);
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [autostartEnabled, setAutostartEnabled] = useState(false);
 
   const [settings, setSettings] = useState<AppSettings>({
     api_base_url: "https://api.openai.com/v1",
@@ -1364,6 +1366,58 @@ export default function App() {
       console.error("Failed to toggle mini mode:", e);
     }
   }
+
+  // Load autostart status on mount
+  useEffect(() => {
+    isAutostartEnabled()
+      .then(setAutostartEnabled)
+      .catch((e) => console.error("Failed to check autostart status:", e));
+  }, []);
+
+  async function handleToggleAutostart(enabled: boolean) {
+    try {
+      if (enabled) {
+        await enableAutostart();
+        setAutostartEnabled(true);
+      } else {
+        await disableAutostart();
+        setAutostartEnabled(false);
+      }
+    } catch (err: any) {
+      console.error("Failed to update autostart setting:", err);
+      alert(`Could not update startup setting: ${err}`);
+    }
+  }
+
+  // Sync tray icon with recording state
+  useEffect(() => {
+    invoke("set_tray_recording_state", { isRecording }).catch(() => {});
+  }, [isRecording]);
+
+  // Listen to system tray events
+  useEffect(() => {
+    let unlistenMini: (() => void) | undefined;
+    let unlistenRec: (() => void) | undefined;
+    let unlistenPref: (() => void) | undefined;
+
+    listen("tray_toggle_mini", () => {
+      toggleMiniMode(!miniModeRef.current);
+    }).then((fn) => { unlistenMini = fn; });
+
+    listen("tray_toggle_recording", () => {
+      toggleRecording();
+    }).then((fn) => { unlistenRec = fn; });
+
+    listen("open_preferences", () => {
+      openSettings("preferences");
+    }).then((fn) => { unlistenPref = fn; });
+
+    return () => {
+      if (unlistenMini) unlistenMini();
+      if (unlistenRec) unlistenRec();
+      if (unlistenPref) unlistenPref();
+    };
+  }, []);
 
   function handleContentChange(val: string) {
     setContent(val);
@@ -3385,6 +3439,21 @@ export default function App() {
                   </label>
                   <span className="form-hint" style={{ marginLeft: "26px" }}>
                     Prevents other windows from covering this app.
+                  </span>
+                </div>
+
+                <div className="form-group">
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      className="checkbox-input"
+                      checked={autostartEnabled}
+                      onChange={(e) => handleToggleAutostart(e.target.checked)}
+                    />
+                    <span>Start Lipi on system startup</span>
+                  </label>
+                  <span className="form-hint" style={{ marginLeft: "26px" }}>
+                    Automatically launch Lipi into a visible window when you log in.
                   </span>
                 </div>
 
