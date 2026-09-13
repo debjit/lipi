@@ -41,14 +41,23 @@ pub fn get_bin_dir(app_data_dir: &Path) -> PathBuf {
 }
 
 pub fn get_model_filename(engine: &str, model_size: &str) -> String {
-    let size = match model_size.to_lowercase().as_str() {
-        "tiny" => "tiny",
-        "small" => "small",
-        _ => "base",
-    };
     if engine == "faster_whisper" {
+        let size = match model_size.to_lowercase().as_str() {
+            "tiny" => "tiny",
+            "small" => "small",
+            "medium" => "medium",
+            "turbo" | "large-v3-turbo" | "turbo_q8" => "large-v3-turbo",
+            _ => "base",
+        };
         format!("faster-whisper-{}", size)
     } else {
+        let size = match model_size.to_lowercase().as_str() {
+            "tiny" => "tiny",
+            "small" => "small",
+            "medium" => "medium",
+            "turbo" | "large-v3-turbo" | "turbo_q8" => "large-v3-turbo-q8_0",
+            _ => "base",
+        };
         format!("ggml-{}.bin", size)
     }
 }
@@ -58,17 +67,43 @@ pub fn get_ggml_download_url(model_size: &str) -> Result<&'static str, String> {
         "tiny" => Ok("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"),
         "base" => Ok("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"),
         "small" => Ok("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"),
+        "medium" => Ok("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"),
+        "turbo" | "large-v3-turbo" | "turbo_q8" => Ok("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin"),
         _ => Err(format!("Unsupported model size: {}", model_size)),
+    }
+}
+
+fn flatten_release_dir_if_exists(bin_dir: &Path) {
+    let release_dir = bin_dir.join("Release");
+    if release_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&release_dir) {
+            for entry in entries.flatten() {
+                let dest = bin_dir.join(entry.file_name());
+                if dest.exists() {
+                    let _ = fs::remove_file(&dest);
+                }
+                if let Err(_) = fs::rename(entry.path(), &dest) {
+                    if let Ok(_) = fs::copy(entry.path(), &dest) {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&release_dir);
     }
 }
 
 pub fn find_whisper_binary(app_data_dir: &Path) -> Option<PathBuf> {
     let bin_dir = get_bin_dir(app_data_dir);
+    flatten_release_dir_if_exists(&bin_dir);
+
     let candidates = [
         bin_dir.join("whisper-cli"),
         bin_dir.join("whisper-cli.exe"),
         bin_dir.join("main"),
         bin_dir.join("main.exe"),
+        bin_dir.join("Release").join("whisper-cli.exe"),
+        bin_dir.join("Release").join("main.exe"),
     ];
 
     for candidate in &candidates {
@@ -78,7 +113,7 @@ pub fn find_whisper_binary(app_data_dir: &Path) -> Option<PathBuf> {
     }
 
     // Check system PATH
-    for name in &["whisper-cli", "whisper"] {
+    for name in &["whisper-cli", "whisper-cli.exe", "whisper", "main", "main.exe"] {
         if let Ok(path) = which::which(name) {
             return Some(path);
         }
@@ -89,9 +124,12 @@ pub fn find_whisper_binary(app_data_dir: &Path) -> Option<PathBuf> {
 
 pub fn find_whisper_server_binary(app_data_dir: &Path) -> Option<PathBuf> {
     let bin_dir = get_bin_dir(app_data_dir);
+    flatten_release_dir_if_exists(&bin_dir);
+
     let candidates = [
         bin_dir.join("whisper-server"),
         bin_dir.join("whisper-server.exe"),
+        bin_dir.join("Release").join("whisper-server.exe"),
     ];
 
     for candidate in &candidates {
@@ -100,8 +138,10 @@ pub fn find_whisper_server_binary(app_data_dir: &Path) -> Option<PathBuf> {
         }
     }
 
-    if let Ok(path) = which::which("whisper-server") {
-        return Some(path);
+    for name in &["whisper-server", "whisper-server.exe"] {
+        if let Ok(path) = which::which(name) {
+            return Some(path);
+        }
     }
 
     None
@@ -113,7 +153,7 @@ mod which {
     use std::process::Command;
 
     pub fn which(name: &str) -> Result<PathBuf, ()> {
-        let cmd = if cfg!(windows) { "where" } else { "which" };
+        let cmd = if cfg!(windows) { "where.exe" } else { "which" };
         let output = Command::new(cmd).arg(name).output().map_err(|_| ())?;
         if output.status.success() {
             let path_str = String::from_utf8_lossy(&output.stdout);
@@ -362,6 +402,9 @@ pub async fn ensure_whisper_cli_binary(app_data_dir: &Path) -> Result<PathBuf, S
 
         let _ = fs::remove_file(&zip_path);
 
+        // Flatten Release directory so executables and DLLs reside directly in bin_dir
+        flatten_release_dir_if_exists(&bin_dir);
+
         if let Some(p) = find_whisper_binary(app_data_dir) {
             return Ok(p);
         }
@@ -387,6 +430,8 @@ async fn download_faster_whisper_weights(
     let size = match model_size.to_lowercase().as_str() {
         "tiny" => "tiny",
         "small" => "small",
+        "medium" => "medium",
+        "turbo" | "large-v3-turbo" | "turbo_q8" => "large-v3-turbo",
         _ => "base",
     };
     let model_folder = models_dir.join(format!("faster-whisper-{}", size));
@@ -494,8 +539,13 @@ async fn download_faster_whisper_weights(
         .map_err(|e| format!("Failed to flush file: {}", e))?;
     drop(file);
 
-    fs::rename(&temp_bin, &target_bin)
-        .map_err(|e| format!("Failed to finalize model.bin: {}", e))?;
+    if target_bin.exists() {
+        let _ = fs::remove_file(&target_bin);
+    }
+    if let Err(_) = fs::rename(&temp_bin, &target_bin) {
+        fs::copy(&temp_bin, &target_bin).map_err(|e| format!("Failed to finalize model.bin: {}", e))?;
+        let _ = fs::remove_file(&temp_bin);
+    }
 
     let _ = app_handle.emit(
         "model-download-progress",
@@ -597,8 +647,13 @@ pub async fn download_model_weights(
         .map_err(|e| format!("Failed to flush file: {}", e))?;
     drop(file);
 
-    fs::rename(&temp_path, &target_path)
-        .map_err(|e| format!("Failed to finalize model file: {}", e))?;
+    if target_path.exists() {
+        let _ = fs::remove_file(&target_path);
+    }
+    if let Err(_) = fs::rename(&temp_path, &target_path) {
+        fs::copy(&temp_path, &target_path).map_err(|e| format!("Failed to finalize model file: {}", e))?;
+        let _ = fs::remove_file(&temp_path);
+    }
 
     // Also verify binary existence for whisper.cpp
     let _ = ensure_whisper_cli_binary(app_data_dir).await;
@@ -637,6 +692,15 @@ pub fn delete_model(
     Ok(())
 }
 
+pub fn delete_whisper_binary(app_data_dir: &Path) -> Result<(), String> {
+    let bin_dir = get_bin_dir(app_data_dir);
+    if bin_dir.exists() {
+        fs::remove_dir_all(&bin_dir)
+            .map_err(|e| format!("Failed to remove whisper binary directory: {}", e))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,12 +710,17 @@ mod tests {
         assert_eq!(get_model_filename("whisper_cpu", "tiny"), "ggml-tiny.bin");
         assert_eq!(get_model_filename("whisper_cpu", "base"), "ggml-base.bin");
         assert_eq!(get_model_filename("whisper_cpu", "small"), "ggml-small.bin");
+        assert_eq!(get_model_filename("whisper_cpu", "medium"), "ggml-medium.bin");
+        assert_eq!(get_model_filename("whisper_cpu", "turbo_q8"), "ggml-large-v3-turbo-q8_0.bin");
         assert_eq!(get_model_filename("whisper_vulkan", "base"), "ggml-base.bin");
         assert_eq!(get_model_filename("faster_whisper", "base"), "faster-whisper-base");
+        assert_eq!(get_model_filename("faster_whisper", "turbo_q8"), "faster-whisper-large-v3-turbo");
 
         assert!(get_ggml_download_url("tiny").unwrap().contains("ggml-tiny.bin"));
         assert!(get_ggml_download_url("base").unwrap().contains("ggml-base.bin"));
         assert!(get_ggml_download_url("small").unwrap().contains("ggml-small.bin"));
+        assert!(get_ggml_download_url("medium").unwrap().contains("ggml-medium.bin"));
+        assert!(get_ggml_download_url("turbo_q8").unwrap().contains("ggml-large-v3-turbo-q8_0.bin"));
         assert!(get_ggml_download_url("unknown").is_err());
     }
 

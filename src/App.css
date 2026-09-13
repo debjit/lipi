@@ -2895,8 +2895,9 @@ optgroup {
   background: var(--bg-primary);
   border: 1px solid var(--border);
   border-radius: 14px;
-  width: 100%;
-  max-width: 780px;
+  width: 800px;
+  max-width: 95vw;
+  height: 660px;
   max-height: 92vh;
   display: flex;
   flex-direction: column;
@@ -3013,6 +3014,15 @@ optgroup {
   padding: 24px;
   overflow-y: auto;
   flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.wizard-step-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 100%;
 }
 
 .wizard-step-heading {
@@ -3207,7 +3217,7 @@ optgroup {
 
 .wizard-model-sizes-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 10px;
   margin-bottom: 12px;
 }
@@ -3551,7 +3561,7 @@ optgroup {
   align-items: center;
   padding-top: 18px;
   border-top: 1px solid var(--border);
-  margin-top: 20px;
+  margin-top: auto;
 }
 
 /* Wizard OS Toggle & Prerequisite Styles */

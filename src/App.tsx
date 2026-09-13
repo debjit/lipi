@@ -23,7 +23,7 @@ interface AppSettings {
   always_on_top: boolean;
   engine_mode: "cloud" | "local";
   local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan";
-  local_model_size: "tiny" | "base" | "small";
+  local_model_size: "tiny" | "base" | "small" | "medium" | "turbo_q8";
   models_folder?: string;
   model_idle_timeout_mins?: number;
   request_timeout_secs?: number;
@@ -584,6 +584,17 @@ export default function App() {
       setErrorMsg(String(err));
     } finally {
       setIsInstallingDeps(false);
+    }
+  }
+
+  async function handleRemoveWhisperRunner() {
+    try {
+      await invoke("remove_whisper_binary");
+      showToast("Whisper runner removed from disk");
+      await refreshModelStatus();
+    } catch (err: any) {
+      setErrorMsg(String(err));
+      showToast(`Failed to remove runner: ${err}`);
     }
   }
 
@@ -2497,20 +2508,33 @@ export default function App() {
                           : "whisper-cli / whisper-server runner binary not downloaded yet"}
                       </div>
                     </div>
-                    {!modelStatus?.binary_available && (
-                      <button
-                        type="button"
-                        className="btn btn-secondary btn-sm"
-                        onClick={handlePrepareRunner}
-                        disabled={isInstallingDeps}
-                      >
-                        {isInstallingDeps
-                          ? "Setting up..."
-                          : settings.local_engine === "faster_whisper"
-                          ? "⚡ Setup Python Environment"
-                          : "⬇ Download Runner Binary"}
-                      </button>
-                    )}
+                    <div style={{ display: "flex", gap: "8px" }}>
+                      {!modelStatus?.binary_available ? (
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          onClick={handlePrepareRunner}
+                          disabled={isInstallingDeps}
+                        >
+                          {isInstallingDeps
+                            ? "Setting up..."
+                            : settings.local_engine === "faster_whisper"
+                            ? "⚡ Setup Python Environment"
+                            : "⬇ Download Runner Binary"}
+                        </button>
+                      ) : (
+                        settings.local_engine !== "faster_whisper" && (
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            onClick={handleRemoveWhisperRunner}
+                            title="Remove whisper.cpp runner files from disk"
+                          >
+                            🗑️ Remove Runner
+                          </button>
+                        )
+                      )}
+                    </div>
                   </div>
                 </div>
 
@@ -2577,6 +2601,8 @@ export default function App() {
                       <option value="tiny">Tiny (~75 MB) — Ultra fast, lowest memory usage</option>
                       <option value="base">Base (~142 MB) — Recommended standard balance</option>
                       <option value="small">Small (~466 MB) — High precision, multilingual</option>
+                      <option value="turbo_q8">Turbo Q8 (~850 MB) — Near Large-v3 quality, fast (~1.6 GB RAM)</option>
+                      <option value="medium">Medium (~1.5 GB) — Deep nuance & accuracy (~2.5 GB RAM)</option>
                     </select>
                   </div>
 
@@ -2584,7 +2610,9 @@ export default function App() {
                     <div className="model-status-header">
                       <div className="model-status-title">
                         <span className="model-name">
-                          {settings.local_engine === "faster_whisper"
+                          {modelStatus?.file_path
+                            ? modelStatus.file_path.replace(/\\/g, "/").split("/").pop()
+                            : settings.local_engine === "faster_whisper"
                             ? `faster-whisper-${settings.local_model_size}`
                             : `ggml-${settings.local_model_size}.bin`}
                         </span>
