@@ -246,7 +246,7 @@ export default function App() {
     language: "",
     auto_copy: true,
     always_on_top: true,
-    engine_mode: "cloud",
+    engine_mode: "local",
     local_engine: "whisper_cpu",
     local_model_size: "base",
     models_folder: "",
@@ -2241,13 +2241,6 @@ export default function App() {
                   <div className="settings-tabs" style={{ marginBottom: 0 }}>
                 <button
                   type="button"
-                  className={`settings-tab ${settings.engine_mode === "cloud" ? "active" : ""}`}
-                  onClick={() => updateAndSaveSettings({ engine_mode: "cloud" })}
-                >
-                  🌐 Custom / Remote API (OpenAI-Compatible)
-                </button>
-                <button
-                  type="button"
                   className={`settings-tab ${settings.engine_mode === "local" ? "active" : ""}`}
                   onClick={() => {
                     updateAndSaveSettings({ engine_mode: "local" });
@@ -2256,6 +2249,13 @@ export default function App() {
                   }}
                 >
                   ⚡ Local Offline Engine (Private & Zero-Cost)
+                </button>
+                <button
+                  type="button"
+                  className={`settings-tab ${settings.engine_mode === "cloud" ? "active" : ""}`}
+                  onClick={() => updateAndSaveSettings({ engine_mode: "cloud" })}
+                >
+                  🌐 Custom / Remote API (OpenAI-Compatible)
                 </button>
               </div>
 
@@ -3790,25 +3790,6 @@ export default function App() {
                       </button>
                     </div>
 
-                    {llmSettings.enabled && (
-                      <label className="nav-overflow-item">
-                        <span className="nav-overflow-item-left">
-                          <span>⚡</span>
-                          <span>Auto Transform</span>
-                        </span>
-                        <input
-                          type="checkbox"
-                          checked={llmSettings.auto_mode}
-                          onChange={(e) =>
-                            updateAndSaveLlmSettings({ auto_mode: e.target.checked })
-                          }
-                        />
-                        <span className={`mini-status-pill ${llmSettings.auto_mode ? "active" : ""}`}>
-                          {llmSettings.auto_mode ? "ON" : "OFF"}
-                        </span>
-                      </label>
-                    )}
-
                     <label className="nav-overflow-item">
                       <span className="nav-overflow-item-left">
                         <span>📋</span>
@@ -3972,6 +3953,22 @@ export default function App() {
                 </div>
 
                 <div className="transform-controls-right">
+                  <label
+                    className="auto-mode-toggle"
+                    title={llmSettings.auto_mode ? "Auto Transform: Active on dictation stop" : "Auto Transform: Off (Click to activate)"}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={llmSettings.auto_mode}
+                      onChange={(e) =>
+                        updateAndSaveLlmSettings({ auto_mode: e.target.checked })
+                      }
+                    />
+                    <span className={`auto-pill ${llmSettings.auto_mode ? "active" : ""}`}>
+                      ⚡ Auto
+                    </span>
+                  </label>
+
                   <button
                     type="button"
                     className={`btn btn-transform ${isTransforming ? "loading" : ""}`}

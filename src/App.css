@@ -2879,10 +2879,10 @@ optgroup {
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   display: flex;
-  align-items: center;
-  justify-content: center;
+  align-items: stretch;
+  justify-content: stretch;
   z-index: 9999;
-  padding: 20px;
+  padding: 0;
   animation: wizardFadeIn 0.2s ease-out;
 }
 
@@ -2893,15 +2893,15 @@ optgroup {
 
 .wizard-container {
   background: var(--bg-primary);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  width: 800px;
-  max-width: 95vw;
-  height: 660px;
-  max-height: 92vh;
+  border: none;
+  border-radius: 0;
+  width: 100vw;
+  max-width: 100vw;
+  height: 100vh;
+  max-height: 100vh;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  box-shadow: none;
   overflow: hidden;
 }
 

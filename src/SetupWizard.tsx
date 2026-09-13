@@ -361,7 +361,7 @@ export function SetupWizard({
 
   async function handleSkip() {
     await onFinish({
-      engine_mode: currentSettings.engine_mode || "cloud",
+      engine_mode: currentSettings.engine_mode || "local",
       local_engine: currentSettings.local_engine || "whisper_cpu",
       local_model_size: currentSettings.local_model_size || "base",
       api_base_url: currentSettings.api_base_url || "https://api.openai.com/v1",

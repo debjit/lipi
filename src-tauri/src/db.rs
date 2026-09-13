@@ -39,7 +39,7 @@ impl Default for AppSettings {
             language: None,
             auto_copy: true,
             always_on_top: true,
-            engine_mode: "cloud".into(),
+            engine_mode: "local".into(),
             local_engine: "whisper_cpu".into(),
             local_model_size: "base".into(),
             models_folder: String::new(),
