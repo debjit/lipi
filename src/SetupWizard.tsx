@@ -22,6 +22,8 @@ export interface PrerequisiteStatus {
   ollama_binary_found: boolean;
 }
 
+export type LocalModelSize = "tiny" | "base" | "small" | "medium" | "turbo_q8";
+
 export interface SetupWizardProps {
   isOpen: boolean;
   onClose: () => void;
@@ -29,7 +31,7 @@ export interface SetupWizardProps {
     settingsPatch: {
       engine_mode: "local" | "cloud";
       local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan";
-      local_model_size: "tiny" | "base" | "small";
+      local_model_size: LocalModelSize;
       api_base_url: string;
       api_key: string;
       model: string;
@@ -54,7 +56,7 @@ export interface SetupWizardProps {
   currentSettings: {
     engine_mode: "local" | "cloud";
     local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan";
-    local_model_size: "tiny" | "base" | "small";
+    local_model_size: LocalModelSize;
     api_base_url: string;
     api_key: string;
     model: string;
@@ -67,7 +69,7 @@ export interface SetupWizardProps {
   downloadSpeedBps: number;
   downloadEtaSecs: number;
   isDownloading: boolean;
-  onDownloadModel: (engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan", size: "tiny" | "base" | "small") => Promise<void>;
+  onDownloadModel: (engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan", size: LocalModelSize) => Promise<void>;
   showToast: (msg: string) => void;
 }
 
@@ -157,8 +159,10 @@ export function SetupWizard({
   const [setupPath, setSetupPath] = useState<"local" | "cloud">("local");
 
   // Local ASR model settings
-  const [localWhisperSize, setLocalWhisperSize] = useState<"tiny" | "base" | "small">("base");
-  const [localWhisperEngine, setLocalWhisperEngine] = useState<"whisper_cpu" | "faster_whisper">("whisper_cpu");
+  const [localWhisperSize, setLocalWhisperSize] = useState<LocalModelSize>("base");
+  const [localWhisperEngine, setLocalWhisperEngine] = useState<"whisper_cpu" | "faster_whisper">(
+    currentSettings.local_engine === "faster_whisper" ? "faster_whisper" : "whisper_cpu"
+  );
 
   // Local LLM (Ollama) settings
   const [localLlmMode, setLocalLlmMode] = useState<"ollama" | "none">("ollama");
@@ -185,6 +189,11 @@ export function SetupWizard({
     if (!isOpen) return;
     setStep(1);
     setIsLoadingSpecs(true);
+    if (currentSettings.local_engine) {
+      setLocalWhisperEngine(
+        currentSettings.local_engine === "faster_whisper" ? "faster_whisper" : "whisper_cpu"
+      );
+    }
 
     invoke<SystemSpecs>("get_system_specs")
       .then((res) => {
@@ -219,6 +228,9 @@ export function SetupWizard({
     try {
       const p = await invoke<PrerequisiteStatus>("check_system_prerequisites");
       setPrereqs(p);
+      if (p.venv_python_found && !currentSettings.local_engine) {
+        setLocalWhisperEngine("faster_whisper");
+      }
       if (p.os && p.os.toLowerCase().includes("win")) {
         setActiveOsTab("windows");
       }
@@ -263,6 +275,23 @@ export function SetupWizard({
       const errText = String(err);
       setEngineSetupMsg(`⚠️ ${errText}`);
       showToast(`Runner setup error: ${errText}`);
+    } finally {
+      setIsSettingUpEngine(false);
+    }
+  }
+
+  async function handleRemoveWhisperRunner() {
+    setIsSettingUpEngine(true);
+    setEngineSetupMsg(null);
+    try {
+      await invoke("remove_whisper_binary");
+      setEngineSetupMsg("✓ Whisper runner removed from disk");
+      showToast("Whisper runner removed from disk");
+      await fetchPrereqs();
+    } catch (err: any) {
+      const errText = String(err);
+      setEngineSetupMsg(`⚠️ ${errText}`);
+      showToast(`Failed to remove runner: ${errText}`);
     } finally {
       setIsSettingUpEngine(false);
     }
@@ -332,7 +361,7 @@ export function SetupWizard({
 
   async function handleSkip() {
     await onFinish({
-      engine_mode: currentSettings.engine_mode || "cloud",
+      engine_mode: currentSettings.engine_mode || "local",
       local_engine: currentSettings.local_engine || "whisper_cpu",
       local_model_size: currentSettings.local_model_size || "base",
       api_base_url: currentSettings.api_base_url || "https://api.openai.com/v1",
@@ -498,7 +527,7 @@ export function SetupWizard({
             className={`wizard-step-pill ${step === 1 ? "active" : ""} ${step > 1 ? "completed" : ""}`}
             onClick={() => setStep(1)}
           >
-            <span className="step-num">1</span> Specs & Mode
+            <span className="step-num">1</span> PC Specs
           </button>
           <div className="step-divider" />
           <button
@@ -506,26 +535,26 @@ export function SetupWizard({
             className={`wizard-step-pill ${step === 2 ? "active" : ""} ${step > 2 ? "completed" : ""}`}
             onClick={() => setStep(2)}
           >
-            <span className="step-num">2</span> ASR Model
+            <span className="step-num">2</span> Select Mode
           </button>
           <div className="step-divider" />
           <button
             type="button"
             className={`wizard-step-pill ${step === 3 ? "active" : ""} ${step > 3 ? "completed" : ""}`}
-            onClick={() => setStep(3)}
+            onClick={() => {
+              setStep(3);
+              fetchPrereqs();
+            }}
           >
-            <span className="step-num">3</span> AI Assistant
+            <span className="step-num">3</span> Prerequisites
           </button>
           <div className="step-divider" />
           <button
             type="button"
             className={`wizard-step-pill ${step === 4 ? "active" : ""} ${step > 4 ? "completed" : ""}`}
-            onClick={() => {
-              setStep(4);
-              fetchPrereqs();
-            }}
+            onClick={() => setStep(4)}
           >
-            <span className="step-num">4</span> Prerequisites
+            <span className="step-num">4</span> ASR &amp; Model
           </button>
           <div className="step-divider" />
           <button
@@ -533,19 +562,19 @@ export function SetupWizard({
             className={`wizard-step-pill ${step === 5 ? "active" : ""}`}
             onClick={() => setStep(5)}
           >
-            <span className="step-num">5</span> Ready
+            <span className="step-num">5</span> AI &amp; Ready
           </button>
         </div>
 
         {/* Wizard Step Body */}
         <div className="wizard-body">
-          {/* STEP 1: Specs & Mode Selection */}
+          {/* STEP 1: PC Specs */}
           {step === 1 && (
             <div className="wizard-step-content">
-              <h3 className="wizard-step-heading">Hardware Assessment & Setup Mode</h3>
+              <h3 className="wizard-step-heading">PC Hardware Specifications</h3>
               <p className="wizard-step-desc">
-                Lipi checks your machine specifications to suggest whether an offline local model or cloud API
-                is ideal for your workstation.
+                Lipi inspects your workstation hardware specs to suggest whether an offline local model or cloud API
+                is ideal for your computer.
               </p>
 
               {isLoadingSpecs ? (
@@ -619,79 +648,368 @@ export function SetupWizard({
                 <div className="wizard-loading-card">Standard system specs detected (~8.0 GB RAM)</div>
               )}
 
-              {/* Mode Selection Cards right underneath specs */}
-              <div style={{ marginTop: "20px" }}>
-                <h4 className="wizard-subheading" style={{ marginBottom: "10px" }}>
-                  Select Your Preferred Setup Mode
-                </h4>
-                <div className="wizard-path-selector">
-                  <label
-                    className={`wizard-path-card ${setupPath === "local" ? "selected" : ""}`}
-                    onClick={() => setSetupPath("local")}
-                  >
-                    <input
-                      type="radio"
-                      name="setup_path"
-                      checked={setupPath === "local"}
-                      onChange={() => setSetupPath("local")}
-                    />
-                    <div>
-                      <div className="path-title">
-                        <span>🏠 100% Local (Private & Offline)</span>
-                        {isMediumRam && <span className="path-pill-rec">Recommended</span>}
-                      </div>
-                      <div className="path-desc">
-                        Zero audio or notes leave your machine. Runs local ASR models and optional local Ollama LLMs completely offline.
-                      </div>
-                    </div>
-                  </label>
-
-                  <label
-                    className={`wizard-path-card ${setupPath === "cloud" ? "selected" : ""}`}
-                    onClick={() => setSetupPath("cloud")}
-                  >
-                    <input
-                      type="radio"
-                      name="setup_path"
-                      checked={setupPath === "cloud"}
-                      onChange={() => setSetupPath("cloud")}
-                    />
-                    <div>
-                      <div className="path-title">
-                        <span>☁️ Cloud / Hybrid (Fast & Free APIs)</span>
-                        {!isMediumRam && <span className="path-pill-rec">Recommended</span>}
-                      </div>
-                      <div className="path-desc">
-                        Uses generous free tiers from Groq, Cloudflare, or Google AI Studio. Lightning-fast response with zero local RAM impact.
-                      </div>
-                    </div>
-                  </label>
-                </div>
-              </div>
-
               <div className="wizard-footer-actions">
                 <button type="button" className="btn btn-secondary" onClick={handleSkip}>
                   Skip Setup
                 </button>
                 <button type="button" className="btn btn-primary" onClick={() => setStep(2)}>
-                  Next: Configure ASR Model →
+                  Next: Select Mode →
                 </button>
               </div>
             </div>
           )}
 
-          {/* STEP 2: Speech-to-Text / ASR Model Settings */}
+          {/* STEP 2: Select Mode */}
           {step === 2 && (
+            <div className="wizard-step-content">
+              <h3 className="wizard-step-heading">Select Setup Mode</h3>
+              <p className="wizard-step-desc">
+                Choose between running voice models completely offline on your device, or using cloud APIs.
+              </p>
+
+              <div className="wizard-path-selector">
+                <label
+                  className={`wizard-path-card ${setupPath === "local" ? "selected" : ""}`}
+                  onClick={() => setSetupPath("local")}
+                >
+                  <input
+                    type="radio"
+                    name="setup_path"
+                    checked={setupPath === "local"}
+                    onChange={() => setSetupPath("local")}
+                  />
+                  <div>
+                    <div className="path-title">
+                      <span>🏠 100% Local (Private &amp; Offline)</span>
+                      {isMediumRam && <span className="path-pill-rec">Recommended</span>}
+                    </div>
+                    <div className="path-desc">
+                      Zero audio or notes leave your machine. Runs local Whisper ASR and optional local Ollama LLMs completely offline.
+                    </div>
+                  </div>
+                </label>
+
+                <label
+                  className={`wizard-path-card ${setupPath === "cloud" ? "selected" : ""}`}
+                  onClick={() => setSetupPath("cloud")}
+                >
+                  <input
+                    type="radio"
+                    name="setup_path"
+                    checked={setupPath === "cloud"}
+                    onChange={() => setSetupPath("cloud")}
+                  />
+                  <div>
+                    <div className="path-title">
+                      <span>☁️ Cloud / Hybrid (Fast &amp; Free APIs)</span>
+                      {!isMediumRam && <span className="path-pill-rec">Recommended</span>}
+                    </div>
+                    <div className="path-desc">
+                      Uses generous free tiers from Groq, Cloudflare, or Google AI Studio. Lightning-fast response with zero local RAM impact.
+                    </div>
+                  </div>
+                </label>
+              </div>
+
+              <div className="wizard-footer-actions">
+                <button type="button" className="btn btn-secondary" onClick={() => setStep(1)}>
+                  ← Back to Specs
+                </button>
+                <div style={{ display: "flex", gap: "10px" }}>
+                  <button type="button" className="btn btn-secondary" onClick={handleSkip}>
+                    Skip Setup
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={() => {
+                      setStep(3);
+                      fetchPrereqs();
+                    }}
+                  >
+                    Next: Check Prerequisites →
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* STEP 3: Prerequisites (Models not shown here) */}
+          {step === 3 && (
+            <div className="wizard-step-content">
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "10px" }}>
+                <div>
+                  <h3 className="wizard-step-heading">System Prerequisites</h3>
+                  <p className="wizard-step-desc">
+                    Verifying microphone input, operating system environment, and local services before setting up models.
+                  </p>
+                </div>
+                {/* Windows vs Linux Switcher Tabs */}
+                <div className="wizard-os-toggle-group">
+                  <button
+                    type="button"
+                    className={`wizard-os-pill ${activeOsTab === "linux" ? "active" : ""}`}
+                    onClick={() => setActiveOsTab("linux")}
+                  >
+                    🐧 Linux
+                  </button>
+                  <button
+                    type="button"
+                    className={`wizard-os-pill ${activeOsTab === "windows" ? "active" : ""}`}
+                    onClick={() => setActiveOsTab("windows")}
+                  >
+                    🪟 Windows
+                  </button>
+                </div>
+              </div>
+
+              {/* Prerequisites Checklist Cards - Models omitted per design */}
+              <div className="wizard-prereq-list">
+                {/* 1. Microphone Input Device */}
+                <div className="wizard-prereq-card">
+                  <div className="prereq-left">
+                    <span className="prereq-icon">
+                      {prereqs?.has_audio_device ? "🎙️" : "⚠️"}
+                    </span>
+                    <div>
+                      <div className="prereq-title">
+                        Microphone Audio Input
+                        <span className={`prereq-status-badge ${prereqs?.has_audio_device ? "status-ready" : "status-warn"}`}>
+                          {prereqs?.has_audio_device ? "Ready" : "Not Found"}
+                        </span>
+                      </div>
+                      <div className="prereq-desc">
+                        {prereqs?.has_audio_device
+                          ? `Device: ${prereqs.audio_device_name || "Default System Input"}`
+                          : "No default audio recording device detected. Ensure microphone is connected and permissions granted."}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={fetchPrereqs}
+                    disabled={isLoadingPrereqs}
+                  >
+                    {isLoadingPrereqs ? "Checking..." : "↻ Re-check"}
+                  </button>
+                </div>
+
+                {/* 2. System OS & Audio Runtime */}
+                <div className="wizard-prereq-card">
+                  <div className="prereq-left">
+                    <span className="prereq-icon">💻</span>
+                    <div>
+                      <div className="prereq-title">
+                        Operating System &amp; Audio Runtime
+                        <span className="prereq-status-badge status-ready">
+                          {specs?.os.toUpperCase() || "Detected"}
+                        </span>
+                      </div>
+                      <div className="prereq-desc">
+                        {specs?.os.toLowerCase().includes("win")
+                          ? "Windows native environment detected. Whisper.cpp binaries and audio device drivers available."
+                          : "Linux environment detected with ALSA / PulseAudio / PipeWire audio backend."}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={fetchPrereqs}
+                    disabled={isLoadingPrereqs}
+                  >
+                    ↻ Check
+                  </button>
+                </div>
+
+                {/* 3. Local AI Assistant (Ollama) Service */}
+                <div className="wizard-prereq-card">
+                  <div className="prereq-left">
+                    <span className="prereq-icon">🦙</span>
+                    <div>
+                      <div className="prereq-title">
+                        Ollama LLM Service (localhost:11434)
+                        <span
+                          className={`prereq-status-badge ${
+                            ollamaAvailable ? "status-ready" : "status-warn"
+                          }`}
+                        >
+                          {ollamaAvailable ? "Online" : "Offline"}
+                        </span>
+                      </div>
+                      <div className="prereq-desc">
+                        {ollamaAvailable
+                          ? `Connected with ${ollamaModels.length} models installed. Ready for local AI text processing.`
+                          : "Ollama is not running locally (optional for offline AI correction; cloud models can also be used)."}
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={checkOllamaStatus}
+                    disabled={isCheckingOllama}
+                  >
+                    {isCheckingOllama ? "Testing..." : "↻ Re-test"}
+                  </button>
+                </div>
+              </div>
+
+              {/* OS Specific Setup Instructions Box */}
+              <div className="wizard-os-guide-box" style={{ marginTop: "14px" }}>
+                <div className="os-guide-header">
+                  <span>💡 {activeOsTab === "linux" ? "Linux Setup Guide (Debian / Ubuntu / Fedora / Arch)" : "Windows Setup Guide (Windows 10 / 11)"}</span>
+                </div>
+                {activeOsTab === "linux" ? (
+                  <div className="os-guide-body">
+                    <p style={{ margin: "0 0 6px 0", fontSize: "12px", color: "var(--text-secondary)" }}>
+                      If audio libraries are missing on Linux, install required packages:
+                    </p>
+                    <code className="os-guide-cmd">
+                      sudo apt update &amp;&amp; sudo apt install -y python3 libasound2-dev curl
+                    </code>
+                  </div>
+                ) : (
+                  <div className="os-guide-body">
+                    <p style={{ margin: "0 0 6px 0", fontSize: "12px", color: "var(--text-secondary)" }}>
+                      On Windows, ensure microphone permissions are enabled under <strong>Windows Settings → Privacy &amp; Security → Microphone</strong>.
+                    </p>
+                    <code className="os-guide-cmd">
+                      winget install Python.Python.3.11 &amp; winget install Ollama.Ollama
+                    </code>
+                  </div>
+                )}
+              </div>
+
+              <div className="wizard-footer-actions">
+                <button type="button" className="btn btn-secondary" onClick={() => setStep(2)}>
+                  ← Back to Mode
+                </button>
+                <div style={{ display: "flex", gap: "10px" }}>
+                  <button type="button" className="btn btn-secondary" onClick={handleSkip}>
+                    Skip Setup
+                  </button>
+                  <button type="button" className="btn btn-primary" onClick={() => setStep(4)}>
+                    Next: ASR Engine &amp; Model →
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* STEP 4: ASR Engine (Auto Install) + Model */}
+          {step === 4 && (
             <div className="wizard-step-content">
               {setupPath === "local" ? (
                 <>
-                  <h3 className="wizard-step-heading">Local ASR Model</h3>
+                  <h3 className="wizard-step-heading">ASR Engine (Auto Install) &amp; Speech Model</h3>
                   <p className="wizard-step-desc">
-                    Configure your on-device Automatic Speech Recognition (ASR) engine and model weights.
+                    Configure your Automatic Speech Recognition engine runner and download model weights for private offline dictation.
                   </p>
 
                   <div className="wizard-subpanel">
-                    <h4 className="wizard-subheading">Model Size & Precision</h4>
+                    {/* ASR Runner Selection & Auto-install */}
+                    <div className="wizard-engine-runner-row" style={{ marginBottom: "14px" }}>
+                      <span className="engine-runner-label">ASR Runner:</span>
+                      <label className="radio-label">
+                        <input
+                          type="radio"
+                          name="whisper_engine"
+                          checked={localWhisperEngine === "whisper_cpu"}
+                          onChange={() => setLocalWhisperEngine("whisper_cpu")}
+                        />
+                        <span>whisper.cpp (Native C++)</span>
+                      </label>
+                      <label className="radio-label">
+                        <input
+                          type="radio"
+                          name="whisper_engine"
+                          checked={localWhisperEngine === "faster_whisper"}
+                          onChange={() => setLocalWhisperEngine("faster_whisper")}
+                        />
+                        <span>faster-whisper (Python Virtualenv)</span>
+                      </label>
+                    </div>
+
+                    {/* Auto-install status banner */}
+                    <div className="wizard-prereq-card" style={{ marginBottom: "16px", background: "var(--bg-primary)" }}>
+                      <div className="prereq-left">
+                        <span className="prereq-icon">
+                          {isSettingUpEngine ? "⏳" : (localWhisperEngine === "whisper_cpu" && prereqs?.whisper_binary_found) || (localWhisperEngine === "faster_whisper" && prereqs?.venv_python_found) ? "✓" : "⚙️"}
+                        </span>
+                        <div>
+                          <div className="prereq-title">
+                            {localWhisperEngine === "whisper_cpu" ? "whisper.cpp Native Runner" : "faster-whisper Python Runner"}
+                            <span
+                              className={`prereq-status-badge ${
+                                (localWhisperEngine === "whisper_cpu" && prereqs?.whisper_binary_found) ||
+                                (localWhisperEngine === "faster_whisper" && prereqs?.venv_python_found)
+                                  ? "status-ready"
+                                  : isSettingUpEngine
+                                  ? "status-warn"
+                                  : "status-action"
+                              }`}
+                            >
+                              {(localWhisperEngine === "whisper_cpu" && prereqs?.whisper_binary_found) ||
+                              (localWhisperEngine === "faster_whisper" && prereqs?.venv_python_found)
+                                ? "Installed"
+                                : isSettingUpEngine
+                                ? "Installing..."
+                                : "Not Installed"}
+                            </span>
+                          </div>
+                          <div className="prereq-desc">
+                            {isSettingUpEngine
+                              ? "Setting up engine runner binary and libraries..."
+                              : localWhisperEngine === "whisper_cpu"
+                              ? prereqs?.whisper_binary_found
+                                ? `whisper-cli executable ready at ${prereqs.whisper_binary_path}`
+                                : "Click Setup below to download native whisper.cpp runner."
+                              : prereqs?.venv_python_found
+                              ? "faster-whisper virtual environment ready."
+                              : "Click setup to prepare faster-whisper Python virtual environment."}
+                          </div>
+                          {engineSetupMsg && (
+                            <div className="form-hint" style={{ marginTop: "4px", color: "var(--accent)" }}>
+                              {engineSetupMsg}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                        {localWhisperEngine === "whisper_cpu" && prereqs?.whisper_binary_found && (
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            style={{ color: "var(--text-danger, #ef4444)" }}
+                            onClick={handleRemoveWhisperRunner}
+                            disabled={isSettingUpEngine}
+                            title="Remove whisper.cpp binary from disk"
+                          >
+                            🗑️ Remove Runner
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          onClick={handleSetupRunner}
+                          disabled={isSettingUpEngine}
+                        >
+                          {isSettingUpEngine
+                            ? "Installing..."
+                            : ((localWhisperEngine === "whisper_cpu" && prereqs?.whisper_binary_found) ||
+                               (localWhisperEngine === "faster_whisper" && prereqs?.venv_python_found))
+                            ? "↻ Re-install"
+                            : "⚡ 1-Click Setup Runner"}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Model Size Selection */}
+                    <h4 className="wizard-subheading">Model Size &amp; Precision</h4>
                     <div className="wizard-model-sizes-grid">
                       <label className={`wizard-size-card ${localWhisperSize === "tiny" ? "active" : ""}`}>
                         <input
@@ -727,32 +1045,40 @@ export function SetupWizard({
                         <div className="size-title">Small (~466 MB)</div>
                         <div className="size-desc">High accuracy for accents and specialized technical terms (~1 GB RAM).</div>
                       </label>
+
+                      <label className={`wizard-size-card ${localWhisperSize === "turbo_q8" ? "active" : ""}`}>
+                        <input
+                          type="radio"
+                          name="whisper_size"
+                          checked={localWhisperSize === "turbo_q8"}
+                          onChange={() => setLocalWhisperSize("turbo_q8")}
+                        />
+                        <div className="size-title">
+                          Turbo Q8 (~850 MB) <span className="tag-recommended" style={{ background: "#7c3aed" }}>Near Large-v3</span>
+                        </div>
+                        <div className="size-desc">Whisper Large-v3-Turbo quantized. Near highest accuracy, 8x faster (~2.2 GB RAM).</div>
+                      </label>
+
+                      <label className={`wizard-size-card ${localWhisperSize === "medium" ? "active" : ""}`}>
+                        <input
+                          type="radio"
+                          name="whisper_size"
+                          checked={localWhisperSize === "medium"}
+                          onChange={() => setLocalWhisperSize("medium")}
+                        />
+                        <div className="size-title">Medium (~1.5 GB)</div>
+                        <div className="size-desc">Deep accuracy &amp; nuanced vocabulary for complex dictation (~2.5 GB RAM).</div>
+                      </label>
                     </div>
 
-                    <div className="wizard-engine-runner-row" style={{ marginTop: "14px" }}>
-                      <span className="engine-runner-label">ASR Runner:</span>
-                      <label className="radio-label">
-                        <input
-                          type="radio"
-                          name="whisper_engine"
-                          checked={localWhisperEngine === "whisper_cpu"}
-                          onChange={() => setLocalWhisperEngine("whisper_cpu")}
-                        />
-                        <span>whisper.cpp (Native C++)</span>
-                      </label>
-                      <label className="radio-label">
-                        <input
-                          type="radio"
-                          name="whisper_engine"
-                          checked={localWhisperEngine === "faster_whisper"}
-                          onChange={() => setLocalWhisperEngine("faster_whisper")}
-                        />
-                        <span>faster-whisper (Python Virtualenv)</span>
-                      </label>
-                    </div>
+                    {(localWhisperSize === "turbo_q8" || localWhisperSize === "medium") && (
+                      <div style={{ marginTop: "10px", padding: "8px 12px", background: "rgba(234, 179, 8, 0.1)", border: "1px solid rgba(234, 179, 8, 0.3)", borderRadius: "6px", fontSize: "12px", color: "var(--text-secondary)" }}>
+                        ⚡ <strong>RAM Notice:</strong> {localWhisperSize === "turbo_q8" ? "Turbo Q8 requires ~2.2 GB RAM (over 2 GB)" : "Medium requires ~2.5 GB RAM"}. Your PC has {specs?.total_ram_gb ?? 8} GB RAM.
+                      </div>
+                    )}
 
                     {/* Model weights status & download */}
-                    <div className="wizard-download-status-card" style={{ marginTop: "16px" }}>
+                    <div className="wizard-download-status-card" style={{ marginTop: "14px" }}>
                       <div className="status-left">
                         <span className="status-icon">
                           {modelStatus?.installed && modelStatus.model_size === localWhisperSize ? "✓" : "⬇️"}
@@ -868,7 +1194,7 @@ export function SetupWizard({
                             rel="noreferrer"
                             className="banner-link"
                           >
-                            Get Account ID & Token ↗
+                            Get Account ID &amp; Token ↗
                           </a>
                         </div>
 
@@ -978,518 +1304,177 @@ export function SetupWizard({
               )}
 
               <div className="wizard-footer-actions">
-                <button type="button" className="btn btn-secondary" onClick={() => setStep(1)}>
-                  ← Back to Specs
-                </button>
-                <div style={{ display: "flex", gap: "10px" }}>
-                  <button type="button" className="btn btn-secondary" onClick={handleSkip}>
-                    Skip Setup
-                  </button>
-                  <button type="button" className="btn btn-primary" onClick={() => setStep(3)}>
-                    Next: AI Assistant Settings →
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* STEP 3: AI Assistant / LLM Settings */}
-          {step === 3 && (
-            <div className="wizard-step-content">
-              {setupPath === "local" ? (
-                <>
-                  <h3 className="wizard-step-heading">Local AI Assistant (LLM)</h3>
-                  <p className="wizard-step-desc">
-                    Enhance your raw transcriptions with local grammar correction, formatting, or summarization via Ollama.
-                  </p>
-
-                  <div className="wizard-subpanel">
-                    <div className="wizard-llm-choice-row">
-                      <label className="radio-label">
-                        <input
-                          type="radio"
-                          name="local_llm_mode"
-                          checked={localLlmMode === "ollama"}
-                          onChange={() => setLocalLlmMode("ollama")}
-                        />
-                        <span>Enable Ollama (Local AI Models)</span>
-                      </label>
-                      <label className="radio-label">
-                        <input
-                          type="radio"
-                          name="local_llm_mode"
-                          checked={localLlmMode === "none"}
-                          onChange={() => setLocalLlmMode("none")}
-                        />
-                        <span>Pure Transcription Only (No AI Edits)</span>
-                      </label>
-                    </div>
-
-                    {localLlmMode === "ollama" && (
-                      <div className="wizard-ollama-box" style={{ marginTop: "14px" }}>
-                        <div className="ollama-status-row">
-                          <span className={`ollama-dot ${ollamaAvailable ? "dot-online" : "dot-offline"}`} />
-                          <span className="ollama-status-label">
-                            {isCheckingOllama
-                              ? "Checking Ollama on localhost:11434..."
-                              : ollamaAvailable
-                              ? "Ollama service connected (localhost:11434)"
-                              : "Ollama not running on localhost:11434 (start Ollama or pick model)"}
-                          </span>
-                          <button
-                            type="button"
-                            className="btn-text-action"
-                            onClick={checkOllamaStatus}
-                            title="Refresh Ollama status"
-                          >
-                            ↻ Check
-                          </button>
-                        </div>
-
-                        <div className="form-group" style={{ marginTop: "14px" }}>
-                          <label className="form-label">Select Ollama Model:</label>
-                          <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                            <input
-                              type="text"
-                              className="form-input"
-                              value={selectedOllamaModel}
-                              onChange={(e) => setSelectedOllamaModel(e.target.value)}
-                              placeholder="e.g. llama3.2, mistral, gemma2:2b"
-                              list="wizard-ollama-suggestions"
-                            />
-                            <datalist id="wizard-ollama-suggestions">
-                              {ollamaModels.map((m) => (
-                                <option key={m} value={m} />
-                              ))}
-                            </datalist>
-                          </div>
-
-                          {/* Dynamic RAM feedback based on chosen model and actual machine RAM */}
-                          {selectedOllamaModel.trim() && (
-                            <div className="wizard-model-ram-feedback">
-                              <span className="ram-badge-item">
-                                {getModelRamFeedback(selectedOllamaModel, totalRam).label}
-                              </span>
-                            </div>
-                          )}
-
-                          {ollamaModels.length > 0 ? (
-                            <div className="wizard-quick-model-pills">
-                              <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>Available in Ollama:</span>
-                              {ollamaModels.slice(0, 8).map((m) => (
-                                <button
-                                  key={m}
-                                  type="button"
-                                  className={`model-pill ${selectedOllamaModel === m ? "active" : ""}`}
-                                  onClick={() => setSelectedOllamaModel(m)}
-                                >
-                                  {m}
-                                </button>
-                              ))}
-                            </div>
-                          ) : (
-                            <div className="wizard-quick-model-pills">
-                              <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>Popular models:</span>
-                              {["llama3.2", "mistral", "gemma2:2b", "qwen2.5:3b"].map((m) => (
-                                <button
-                                  key={m}
-                                  type="button"
-                                  className={`model-pill ${selectedOllamaModel === m ? "active" : ""}`}
-                                  onClick={() => setSelectedOllamaModel(m)}
-                                >
-                                  {m}
-                                </button>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </>
-              ) : (
-                /* Cloud LLM Setup */
-                <>
-                  <h3 className="wizard-step-heading">Cloud AI Assistant (LLM)</h3>
-                  <p className="wizard-step-desc">
-                    Choose which cloud LLM will refine, proofread, and summarize your voice dictations.
-                  </p>
-
-                  <div className="wizard-subpanel">
-                    <div className="form-group">
-                      <label className="form-label">Cloud AI Model:</label>
-                      <input
-                        type="text"
-                        className="form-input"
-                        value={cloudLlmModel}
-                        onChange={(e) => setCloudLlmModel(e.target.value)}
-                        placeholder="e.g. llama-3.3-70b-versatile, gemini-2.5-flash"
-                        list="wizard-cloud-llm-models"
-                      />
-                      <datalist id="wizard-cloud-llm-models">
-                        {cloudAvailableModels.map((m) => (
-                          <option key={m} value={m} />
-                        ))}
-                      </datalist>
-                    </div>
-
-                    <div className="wizard-quick-model-pills" style={{ marginTop: "12px" }}>
-                      <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>Quick presets:</span>
-                      {(openapiTemplate === "groq"
-                        ? ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-                        : openapiTemplate === "google"
-                        ? ["gemini-2.5-flash", "gemini-2.0-flash"]
-                        : ["gpt-4o-mini", "llama-3.1-8b-instruct"]
-                      ).map((m) => (
-                        <button
-                          key={m}
-                          type="button"
-                          className={`model-pill ${cloudLlmModel === m ? "active" : ""}`}
-                          onClick={() => setCloudLlmModel(m)}
-                        >
-                          {m}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </>
-              )}
-
-              <div className="wizard-footer-actions">
-                <button type="button" className="btn btn-secondary" onClick={() => setStep(2)}>
-                  ← Back to ASR
-                </button>
-                <div style={{ display: "flex", gap: "10px" }}>
-                  <button type="button" className="btn btn-secondary" onClick={handleSkip}>
-                    Skip Setup
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    onClick={() => {
-                      setStep(4);
-                      fetchPrereqs();
-                    }}
-                  >
-                    Next: Check Prerequisites →
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* STEP 4: System Readiness & Prerequisites */}
-          {step === 4 && (
-            <div className="wizard-step-content">
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "10px" }}>
-                <div>
-                  <h3 className="wizard-step-heading">System Readiness & Prerequisites</h3>
-                  <p className="wizard-step-desc">
-                    Lipi verifies hardware, audio input, runner binaries, and offline weights before you begin.
-                  </p>
-                </div>
-                {/* Windows vs Linux Switcher Tabs */}
-                <div className="wizard-os-toggle-group">
-                  <button
-                    type="button"
-                    className={`wizard-os-pill ${activeOsTab === "linux" ? "active" : ""}`}
-                    onClick={() => setActiveOsTab("linux")}
-                  >
-                    🐧 Linux
-                  </button>
-                  <button
-                    type="button"
-                    className={`wizard-os-pill ${activeOsTab === "windows" ? "active" : ""}`}
-                    onClick={() => setActiveOsTab("windows")}
-                  >
-                    🪟 Windows
-                  </button>
-                </div>
-              </div>
-
-              {/* Prerequisites Checklist Cards */}
-              <div className="wizard-prereq-list">
-                {/* 1. Microphone Input Device */}
-                <div className="wizard-prereq-card">
-                  <div className="prereq-left">
-                    <span className="prereq-icon">
-                      {prereqs?.has_audio_device ? "🎙️" : "⚠️"}
-                    </span>
-                    <div>
-                      <div className="prereq-title">
-                        Microphone Audio Input
-                        <span className={`prereq-status-badge ${prereqs?.has_audio_device ? "status-ready" : "status-warn"}`}>
-                          {prereqs?.has_audio_device ? "Ready" : "Not Found"}
-                        </span>
-                      </div>
-                      <div className="prereq-desc">
-                        {prereqs?.has_audio_device
-                          ? `Device: ${prereqs.audio_device_name || "Default System Input"}`
-                          : "No default audio recording device detected. Ensure microphone is connected and permissions granted."}
-                      </div>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={fetchPrereqs}
-                    disabled={isLoadingPrereqs}
-                  >
-                    {isLoadingPrereqs ? "Checking..." : "↻ Re-check"}
-                  </button>
-                </div>
-
-                {/* 2. Local ASR Runner Engine (Local mode only) */}
-                {setupPath === "local" && (
-                  <div className="wizard-prereq-card">
-                    <div className="prereq-left">
-                      <span className="prereq-icon">
-                        {localWhisperEngine === "whisper_cpu"
-                          ? prereqs?.whisper_binary_found ? "⚙️" : "📦"
-                          : prereqs?.venv_python_found ? "🐍" : "📦"}
-                      </span>
-                      <div>
-                        <div className="prereq-title">
-                          ASR Engine Runner ({localWhisperEngine === "whisper_cpu" ? "whisper.cpp" : "faster-whisper"})
-                          <span
-                            className={`prereq-status-badge ${
-                              (localWhisperEngine === "whisper_cpu" && prereqs?.whisper_binary_found) ||
-                              (localWhisperEngine === "faster_whisper" && prereqs?.venv_python_found)
-                                ? "status-ready"
-                                : "status-action"
-                            }`}
-                          >
-                            {(localWhisperEngine === "whisper_cpu" && prereqs?.whisper_binary_found) ||
-                            (localWhisperEngine === "faster_whisper" && prereqs?.venv_python_found)
-                              ? "Ready"
-                              : "Setup Needed"}
-                          </span>
-                        </div>
-                        <div className="prereq-desc">
-                          {localWhisperEngine === "whisper_cpu"
-                            ? prereqs?.whisper_binary_found
-                              ? `whisper-cli executable ready at ${prereqs.whisper_binary_path}`
-                              : "Native whisper-cli runner binary not installed in Lipi bin directory."
-                            : prereqs?.venv_python_found
-                            ? "faster-whisper Python virtual environment is installed and active."
-                            : "faster-whisper module not installed in application virtualenv."}
-                        </div>
-                        {engineSetupMsg && (
-                          <div className="form-hint" style={{ marginTop: "4px", color: "var(--accent)" }}>
-                            {engineSetupMsg}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-
-                    <div>
-                      <button
-                        type="button"
-                        className="btn btn-secondary btn-sm"
-                        onClick={handleSetupRunner}
-                        disabled={isSettingUpEngine}
-                      >
-                        {isSettingUpEngine ? "Setting up..." : "⚡ 1-Click Setup Runner"}
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {/* 3. ASR Model Weights (Local mode only) */}
-                {setupPath === "local" && (
-                  <div className="wizard-prereq-card">
-                    <div className="prereq-left">
-                      <span className="prereq-icon">
-                        {modelStatus?.installed && modelStatus.model_size === localWhisperSize ? "💾" : "⬇️"}
-                      </span>
-                      <div>
-                        <div className="prereq-title">
-                          Model Weights ({localWhisperSize.toUpperCase()})
-                          <span
-                            className={`prereq-status-badge ${
-                              modelStatus?.installed && modelStatus.model_size === localWhisperSize
-                                ? "status-ready"
-                                : "status-action"
-                            }`}
-                          >
-                            {modelStatus?.installed && modelStatus.model_size === localWhisperSize
-                              ? "Installed"
-                              : "Download Needed"}
-                          </span>
-                        </div>
-                        <div className="prereq-desc">
-                          {modelStatus?.installed && modelStatus.model_size === localWhisperSize
-                            ? "Model weights are present on disk and ready for low-latency offline dictation."
-                            : `Weights for '${localWhisperSize}' have not been downloaded yet.`}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div>
-                      {isDownloading ? (
-                        <div className="wizard-downloading-box">
-                          <div className="downloading-info">
-                            <span>Downloading {localWhisperSize}... {downloadProgress ?? 0}%</span>
-                          </div>
-                          <div className="progress-bar-bg">
-                            <div
-                              className="progress-bar-fill"
-                              style={{ width: `${Math.min(downloadProgress ?? 0, 100)}%` }}
-                            />
-                          </div>
-                        </div>
-                      ) : (
-                        <button
-                          type="button"
-                          className="btn btn-secondary btn-sm"
-                          onClick={() => onDownloadModel(localWhisperEngine, localWhisperSize)}
-                        >
-                          {modelStatus?.installed && modelStatus.model_size === localWhisperSize
-                            ? "Re-download"
-                            : "⬇️ Download Weights"}
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {/* 4. Local AI Assistant (Ollama) */}
-                {setupPath === "local" && localLlmMode === "ollama" && (
-                  <div className="wizard-prereq-card">
-                    <div className="prereq-left">
-                      <span className="prereq-icon">🦙</span>
-                      <div>
-                        <div className="prereq-title">
-                          Ollama LLM Service (localhost:11434)
-                          <span
-                            className={`prereq-status-badge ${
-                              ollamaAvailable ? "status-ready" : "status-warn"
-                            }`}
-                          >
-                            {ollamaAvailable ? "Online" : "Offline"}
-                          </span>
-                        </div>
-                        <div className="prereq-desc">
-                          {ollamaAvailable
-                            ? `Connected with ${ollamaModels.length} models installed. Selected: ${selectedOllamaModel}`
-                            : "Ollama is not running. Launch Ollama app or start daemon via terminal."}
-                        </div>
-                      </div>
-                    </div>
-
-                    <button
-                      type="button"
-                      className="btn btn-secondary btn-sm"
-                      onClick={checkOllamaStatus}
-                      disabled={isCheckingOllama}
-                    >
-                      {isCheckingOllama ? "Testing..." : "↻ Re-test"}
-                    </button>
-                  </div>
-                )}
-
-                {/* Cloud Mode API Verification */}
-                {setupPath === "cloud" && (
-                  <div className="wizard-prereq-card">
-                    <div className="prereq-left">
-                      <span className="prereq-icon">☁️</span>
-                      <div>
-                        <div className="prereq-title">
-                          Cloud API Connection
-                          <span
-                            className={`prereq-status-badge ${
-                              cloudApiKey.trim() ? "status-ready" : "status-warn"
-                            }`}
-                          >
-                            {cloudApiKey.trim() ? "Key Provided" : "Key Missing"}
-                          </span>
-                        </div>
-                        <div className="prereq-desc">
-                          {cloudApiKey.trim()
-                            ? `Configured for ${cloudBaseUrl}`
-                            : "Return to Step 2 to enter your API key or token."}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* OS Specific Setup Instructions Box */}
-              <div className="wizard-os-guide-box">
-                <div className="os-guide-header">
-                  <span>💡 {activeOsTab === "linux" ? "Linux Setup Guide (Debian / Ubuntu / Fedora / Arch)" : "Windows Setup Guide (Windows 10 / 11)"}</span>
-                </div>
-                {activeOsTab === "linux" ? (
-                  <div className="os-guide-body">
-                    <p style={{ margin: "0 0 6px 0", fontSize: "12px", color: "var(--text-secondary)" }}>
-                      If runners or audio libraries are missing on Linux, install required packages via terminal:
-                    </p>
-                    <code className="os-guide-cmd">
-                      sudo apt update &amp;&amp; sudo apt install -y python3 python3-venv libasound2-dev curl
-                    </code>
-                    {localLlmMode === "ollama" && !ollamaAvailable && (
-                      <p style={{ margin: "8px 0 0 0", fontSize: "12px", color: "var(--text-secondary)" }}>
-                        Install and start Ollama: <code className="os-inline-code">curl -fsSL https://ollama.com/install.sh | sh &amp;&amp; ollama run {selectedOllamaModel || "llama3.2"}</code>
-                      </p>
-                    )}
-                  </div>
-                ) : (
-                  <div className="os-guide-body">
-                    <p style={{ margin: "0 0 6px 0", fontSize: "12px", color: "var(--text-secondary)" }}>
-                      On Windows, Lipi can automatically download official whisper-cli.exe binaries or use winget:
-                    </p>
-                    <code className="os-guide-cmd">
-                      winget install Python.Python.3.11 &amp; winget install Ollama.Ollama
-                    </code>
-                    <p style={{ margin: "8px 0 0 0", fontSize: "12px", color: "var(--text-secondary)" }}>
-                      Ensure microphone permissions are enabled under <strong>Windows Settings → Privacy &amp; Security → Microphone</strong>.
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              <div className="wizard-footer-actions">
                 <button type="button" className="btn btn-secondary" onClick={() => setStep(3)}>
-                  ← Back to AI Assistant
+                  ← Back to Prerequisites
                 </button>
                 <div style={{ display: "flex", gap: "10px" }}>
                   <button type="button" className="btn btn-secondary" onClick={handleSkip}>
                     Skip Setup
                   </button>
                   <button type="button" className="btn btn-primary" onClick={() => setStep(5)}>
-                    Next: Review &amp; Start →
+                    Next: AI Assistant &amp; Ready →
                   </button>
                 </div>
               </div>
             </div>
           )}
 
-          {/* STEP 5: Ready to Dictate / Final Review */}
+          {/* STEP 5: AI Assistant Ready (Info Selected) */}
           {step === 5 && (
             <div className="wizard-step-content">
-              <h3 className="wizard-step-heading">Everything is configured!</h3>
+              <h3 className="wizard-step-heading">AI Assistant &amp; Summary</h3>
               <p className="wizard-step-desc">
-                Review your configuration below. You can always change any of these settings later in Settings.
+                Configure optional AI post-processing, review your chosen setup, and start dictating.
               </p>
 
-              <div className="wizard-summary-card">
+              {/* AI Assistant Configuration */}
+              {setupPath === "local" ? (
+                <div className="wizard-subpanel" style={{ marginBottom: "14px" }}>
+                  <h4 className="wizard-subheading" style={{ marginBottom: "8px" }}>Local AI Assistant (LLM)</h4>
+                  <div className="wizard-llm-choice-row">
+                    <label className="radio-label">
+                      <input
+                        type="radio"
+                        name="local_llm_mode"
+                        checked={localLlmMode === "ollama"}
+                        onChange={() => setLocalLlmMode("ollama")}
+                      />
+                      <span>Enable Ollama (Local AI Models)</span>
+                    </label>
+                    <label className="radio-label">
+                      <input
+                        type="radio"
+                        name="local_llm_mode"
+                        checked={localLlmMode === "none"}
+                        onChange={() => setLocalLlmMode("none")}
+                      />
+                      <span>Pure Transcription Only (No AI Edits)</span>
+                    </label>
+                  </div>
+
+                  {localLlmMode === "ollama" && (
+                    <div className="wizard-ollama-box" style={{ marginTop: "12px" }}>
+                      <div className="ollama-status-row">
+                        <span className={`ollama-dot ${ollamaAvailable ? "dot-online" : "dot-offline"}`} />
+                        <span className="ollama-status-label">
+                          {isCheckingOllama
+                            ? "Checking Ollama on localhost:11434..."
+                            : ollamaAvailable
+                            ? `Ollama service connected (${ollamaModels.length} models available)`
+                            : "Ollama not running on localhost:11434 (start Ollama or pick model)"}
+                        </span>
+                        <button
+                          type="button"
+                          className="btn-text-action"
+                          onClick={checkOllamaStatus}
+                          title="Refresh Ollama status"
+                        >
+                          ↻ Check
+                        </button>
+                      </div>
+
+                      <div className="form-group" style={{ marginTop: "10px" }}>
+                        <label className="form-label">Select Ollama Model:</label>
+                        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                          <input
+                            type="text"
+                            className="form-input"
+                            value={selectedOllamaModel}
+                            onChange={(e) => setSelectedOllamaModel(e.target.value)}
+                            placeholder="e.g. llama3.2, mistral, gemma2:2b"
+                            list="wizard-ollama-suggestions"
+                          />
+                          <datalist id="wizard-ollama-suggestions">
+                            {ollamaModels.map((m) => (
+                              <option key={m} value={m} />
+                            ))}
+                          </datalist>
+                        </div>
+
+                        {selectedOllamaModel.trim() && (
+                          <div className="wizard-model-ram-feedback" style={{ marginTop: "6px" }}>
+                            <span className="ram-badge-item">
+                              {getModelRamFeedback(selectedOllamaModel, totalRam).label}
+                            </span>
+                          </div>
+                        )}
+
+                        <div className="wizard-quick-model-pills" style={{ marginTop: "8px" }}>
+                          <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>Models:</span>
+                          {(ollamaModels.length > 0 ? ollamaModels.slice(0, 6) : ["llama3.2", "mistral", "gemma2:2b", "qwen2.5:3b"]).map((m) => (
+                            <button
+                              key={m}
+                              type="button"
+                              className={`model-pill ${selectedOllamaModel === m ? "active" : ""}`}
+                              onClick={() => setSelectedOllamaModel(m)}
+                            >
+                              {m}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                /* Cloud LLM selection */
+                <div className="wizard-subpanel" style={{ marginBottom: "14px" }}>
+                  <h4 className="wizard-subheading" style={{ marginBottom: "8px" }}>Cloud AI Assistant (LLM)</h4>
+                  <div className="form-group">
+                    <label className="form-label">Cloud AI Model:</label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      value={cloudLlmModel}
+                      onChange={(e) => setCloudLlmModel(e.target.value)}
+                      placeholder="e.g. llama-3.3-70b-versatile, gemini-2.5-flash"
+                      list="wizard-cloud-llm-models"
+                    />
+                    <datalist id="wizard-cloud-llm-models">
+                      {cloudAvailableModels.map((m) => (
+                        <option key={m} value={m} />
+                      ))}
+                    </datalist>
+                  </div>
+                  <div className="wizard-quick-model-pills" style={{ marginTop: "8px" }}>
+                    <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>Presets:</span>
+                    {(openapiTemplate === "groq"
+                      ? ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+                      : openapiTemplate === "google"
+                      ? ["gemini-2.5-flash", "gemini-2.0-flash"]
+                      : ["gpt-4o-mini", "llama-3.1-8b-instruct"]
+                    ).map((m) => (
+                      <button
+                        key={m}
+                        type="button"
+                        className={`model-pill ${cloudLlmModel === m ? "active" : ""}`}
+                        onClick={() => setCloudLlmModel(m)}
+                      >
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Info Selected Summary Card */}
+              <div className="wizard-summary-card" style={{ marginBottom: "14px" }}>
                 <div className="summary-row">
-                  <span className="summary-label">Setup Mode:</span>
+                  <span className="summary-label">Selected Mode:</span>
                   <span className="summary-value">{setupPath === "local" ? "🏠 100% Local (Offline)" : "☁️ Cloud / Hybrid"}</span>
                 </div>
                 <div className="summary-row">
-                  <span className="summary-label">Speech-to-Text (ASR):</span>
+                  <span className="summary-label">ASR Speech-to-Text:</span>
                   <span className="summary-value">
                     {setupPath === "local"
-                      ? `Whisper ${localWhisperSize.toUpperCase()} (${localWhisperEngine === "whisper_cpu" ? "whisper.cpp" : "faster-whisper"})`
+                      ? `Whisper ${localWhisperSize === "turbo_q8" ? "Turbo Q8" : localWhisperSize.toUpperCase()} (${localWhisperEngine === "whisper_cpu" ? "whisper.cpp" : "faster-whisper"})`
                       : cloudCategory === "cloudflare"
                       ? "Cloudflare Workers AI"
                       : `${cloudModel || "Configured model"} via ${cloudBaseUrl}`}
                   </span>
                 </div>
                 <div className="summary-row">
-                  <span className="summary-label">AI Transformation:</span>
+                  <span className="summary-label">AI Assistant:</span>
                   <span className="summary-value">
                     {setupPath === "local"
                       ? localLlmMode === "ollama"
@@ -1501,34 +1486,28 @@ export function SetupWizard({
                   </span>
                 </div>
                 <div className="summary-row">
-                  <span className="summary-label">Platform & Audio:</span>
+                  <span className="summary-label">Microphone &amp; Platform:</span>
                   <span className="summary-value">
-                    {specs?.os.toUpperCase() || "DESKTOP"} · {prereqs?.audio_device_name ? "Microphone Detected" : "Default Audio"}
+                    {specs?.os.toUpperCase() || "DESKTOP"} · {prereqs?.audio_device_name ? prereqs.audio_device_name : (prereqs?.has_audio_device ? "Default Mic Ready" : "No Mic Found")}
                   </span>
                 </div>
               </div>
 
-              {/* Cheatsheet for hotkeys */}
-              <div className="wizard-cheatsheet-box">
-                <h4 style={{ margin: "0 0 8px 0", fontSize: "13px", fontWeight: 600, color: "var(--text-primary)" }}>
+              {/* Shortcuts cheatsheet */}
+              <div className="wizard-cheatsheet-box" style={{ marginBottom: "14px" }}>
+                <h4 style={{ margin: "0 0 6px 0", fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>
                   💡 Helpful Shortcuts:
                 </h4>
-                <ul style={{ margin: 0, paddingLeft: "18px", fontSize: "13px", color: "var(--text-secondary)", lineHeight: 1.6 }}>
-                  <li>
-                    <kbd className="key-hint">Alt+R</kbd>: Toggle dictation recording on / off from anywhere.
-                  </li>
-                  <li>
-                    <kbd className="key-hint">Alt+M</kbd>: Switch to compact transparent floating mini widget.
-                  </li>
-                  <li>
-                    <kbd className="key-hint">Esc</kbd>: Exit Settings back to your notes scratchpad.
-                  </li>
-                </ul>
+                <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", fontSize: "12px", color: "var(--text-secondary)" }}>
+                  <span><kbd className="key-hint">Alt+R</kbd> Toggle dictation</span>
+                  <span><kbd className="key-hint">Alt+M</kbd> Mini widget</span>
+                  <span><kbd className="key-hint">Esc</kbd> Exit to scratchpad</span>
+                </div>
               </div>
 
               <div className="wizard-footer-actions">
                 <button type="button" className="btn btn-secondary" onClick={() => setStep(4)}>
-                  ← Back to Prerequisites
+                  ← Back to ASR Engine
                 </button>
                 <button type="button" className="btn btn-primary" onClick={handleCompleteSetup}>
                   ✓ Complete Setup &amp; Start Dictating

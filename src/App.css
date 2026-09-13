@@ -2879,10 +2879,10 @@ optgroup {
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   display: flex;
-  align-items: center;
-  justify-content: center;
+  align-items: stretch;
+  justify-content: stretch;
   z-index: 9999;
-  padding: 20px;
+  padding: 0;
   animation: wizardFadeIn 0.2s ease-out;
 }
 
@@ -2893,14 +2893,15 @@ optgroup {
 
 .wizard-container {
   background: var(--bg-primary);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  width: 100%;
-  max-width: 780px;
-  max-height: 92vh;
+  border: none;
+  border-radius: 0;
+  width: 100vw;
+  max-width: 100vw;
+  height: 100vh;
+  max-height: 100vh;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  box-shadow: none;
   overflow: hidden;
 }
 
@@ -3013,6 +3014,15 @@ optgroup {
   padding: 24px;
   overflow-y: auto;
   flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.wizard-step-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 100%;
 }
 
 .wizard-step-heading {
@@ -3207,7 +3217,7 @@ optgroup {
 
 .wizard-model-sizes-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 10px;
   margin-bottom: 12px;
 }
@@ -3551,7 +3561,7 @@ optgroup {
   align-items: center;
   padding-top: 18px;
   border-top: 1px solid var(--border);
-  margin-top: 20px;
+  margin-top: auto;
 }
 
 /* Wizard OS Toggle & Prerequisite Styles */

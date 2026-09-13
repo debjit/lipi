@@ -34,9 +34,42 @@ fn estimate_ram_mb(model_size: &str) -> u64 {
         "tiny" => 150,
         "base" => 250,
         "small" => 500,
+        "turbo" | "large-v3-turbo" | "turbo_q8" => 2200,
         "medium" => 1500,
         "large" => 3000,
         _ => 250,
+    }
+}
+
+fn configure_binary_env_and_flags(cmd: &mut Command, binary_path: &Path) {
+    if let Some(parent) = binary_path.parent() {
+        let parent_str = parent.to_string_lossy().to_string();
+        #[cfg(windows)]
+        {
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            let new_path = if current_path.is_empty() {
+                parent_str
+            } else {
+                format!("{};{}", parent_str, current_path)
+            };
+            cmd.env("PATH", new_path);
+        }
+        #[cfg(not(windows))]
+        {
+            let current_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            let new_ld = if current_ld.is_empty() {
+                parent_str
+            } else {
+                format!("{}:{}", parent_str, current_ld)
+            };
+            cmd.env("LD_LIBRARY_PATH", new_ld);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
 }
 
@@ -191,6 +224,8 @@ impl ModelSupervisor {
             let size = match model_size.to_lowercase().as_str() {
                 "tiny" => "tiny",
                 "small" => "small",
+                "medium" => "medium",
+                "turbo" | "large-v3-turbo" | "turbo_q8" => "large-v3-turbo",
                 _ => "base",
             };
             let model_folder = models_dir.join(format!("faster-whisper-{}", size));
@@ -269,16 +304,7 @@ server.serve_forever()
 
             let server_binary = ensure_whisper_server_binary(app_data_dir).await?;
             let mut cmd = Command::new(&server_binary);
-
-            if let Some(parent) = server_binary.parent() {
-                let current_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-                let new_ld = if current_ld.is_empty() {
-                    parent.to_string_lossy().to_string()
-                } else {
-                    format!("{}:{}", parent.to_string_lossy(), current_ld)
-                };
-                cmd.env("LD_LIBRARY_PATH", new_ld);
-            }
+            configure_binary_env_and_flags(&mut cmd, &server_binary);
 
             let num_threads = std::thread::available_parallelism()
                 .map(|n| n.get().min(8).to_string())
@@ -513,15 +539,7 @@ async fn transcribe_whisper_cpp(
     let binary_path = ensure_whisper_cli_binary(app_data_dir).await?;
 
     let mut cmd = Command::new(&binary_path);
-    if let Some(parent) = binary_path.parent() {
-        let current_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-        let new_ld = if current_ld.is_empty() {
-            parent.to_string_lossy().to_string()
-        } else {
-            format!("{}:{}", parent.to_string_lossy(), current_ld)
-        };
-        cmd.env("LD_LIBRARY_PATH", new_ld);
-    }
+    configure_binary_env_and_flags(&mut cmd, &binary_path);
 
     cmd.arg("-m")
         .arg(&model_file)
@@ -577,6 +595,8 @@ fn transcribe_faster_whisper(
     let size = match model_size.to_lowercase().as_str() {
         "tiny" => "tiny",
         "small" => "small",
+        "medium" => "medium",
+        "turbo" | "large-v3-turbo" | "turbo_q8" => "large-v3-turbo",
         _ => "base",
     };
     let model_folder = models_dir.join(format!("faster-whisper-{}", size));
@@ -651,6 +671,7 @@ mod tests {
         assert_eq!(estimate_ram_mb("base"), 250);
         assert_eq!(estimate_ram_mb("small"), 500);
         assert_eq!(estimate_ram_mb("medium"), 1500);
+        assert_eq!(estimate_ram_mb("turbo_q8"), 2200);
         assert_eq!(estimate_ram_mb("large"), 3000);
     }
 

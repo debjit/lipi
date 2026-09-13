@@ -431,6 +431,13 @@ async fn prepare_engine(
 }
 
 #[tauri::command]
+fn remove_whisper_binary(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    state.supervisor.unload();
+    models::delete_whisper_binary(&state.app_data_dir)?;
+    Ok("Whisper runner binary removed".into())
+}
+
+#[tauri::command]
 async fn pick_directory() -> Result<Option<String>, String> {
     #[cfg(target_os = "linux")]
     {
@@ -857,6 +864,7 @@ pub fn run() {
             delete_model,
             install_faster_whisper,
             prepare_engine,
+            remove_whisper_binary,
             pick_directory,
             write_to_clipboard,
             set_mini_mode,
