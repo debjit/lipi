@@ -132,8 +132,7 @@ pub fn check_system_prerequisites(app_data_dir: &std::path::Path) -> Prerequisit
     let whisper_binary_found = whisper_bin.is_some();
     let whisper_binary_path = whisper_bin.map(|p| p.to_string_lossy().to_string());
 
-    let py = crate::models::which_command("python3")
-        .or_else(|| crate::models::which_command("python"));
+    let py = crate::models::find_working_python_cmd();
     let python_found = py.is_some();
     let python_path = py.map(|p| p.to_string_lossy().to_string());
 

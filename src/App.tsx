@@ -1385,7 +1385,7 @@ export default function App() {
           model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
           endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
           message: errStr,
-          details: `Timestamp: ${new Date().toISOString()}\nEngine Mode: ${settingsRef.current.engine_mode}\nModel: ${settingsRef.current.model || "(default)"}\nEndpoint: ${settingsRef.current.api_base_url || "(local)"}\nError:\n${errStr}`,
+          details: `Timestamp: ${new Date().toISOString()}\nEngine Mode: ${settingsRef.current.engine_mode}${settingsRef.current.engine_mode === "local" ? ` (${settingsRef.current.local_engine})` : ""}\nModel: ${settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : (settingsRef.current.local_model_size || "(default)")}\nEndpoint: ${settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.api_base_url || "(default)") : "(local)"}\nError:\n${errStr}`,
         });
       } finally {
         setIsTranscribing(false);
@@ -1408,7 +1408,7 @@ export default function App() {
   useEffect(() => {
     isAutostartEnabled()
       .then(setAutostartEnabled)
-      .catch((e) => console.error("Failed to check autostart status:", e));
+      .catch((e: any) => console.error("Failed to check autostart status:", e));
   }, []);
 
   async function handleToggleAutostart(enabled: boolean) {
@@ -1850,7 +1850,8 @@ export default function App() {
                     type="button"
                     className="btn-toast-action"
                     onClick={async () => {
-                      await copyText(`Transcription Error Log:\n${errorMsg}\nTime: ${new Date().toISOString()}\nEngine Mode: ${settings.engine_mode}\nModel: ${settings.model || "default"}\nEndpoint: ${settings.api_base_url || "(local)"}`);
+                      const isCloud = settings.engine_mode === "cloud";
+                      await copyText(`Transcription Error Log:\n${errorMsg}\nTime: ${new Date().toISOString()}\nEngine Mode: ${settings.engine_mode}${!isCloud ? ` (${settings.local_engine})` : ""}\nModel: ${(isCloud ? settings.model : settings.local_model_size) || "default"}\nEndpoint: ${isCloud ? (settings.api_base_url || "(default)") : "(local)"}`);
                       showToast("✓ Error log copied!");
                     }}
                   >
@@ -2503,9 +2504,9 @@ export default function App() {
                       <div className="runner-path" title={modelStatus?.binary_path || ""}>
                         {modelStatus?.binary_available
                           ? modelStatus.binary_path
-                          : settings.local_engine === "faster_whisper"
+                          : modelStatus?.binary_path || (settings.local_engine === "faster_whisper"
                           ? "Python faster-whisper virtualenv not configured"
-                          : "whisper-cli / whisper-server runner binary not downloaded yet"}
+                          : "whisper-cli / whisper-server runner binary not downloaded yet")}
                       </div>
                     </div>
                     <div style={{ display: "flex", gap: "8px" }}>
@@ -2519,7 +2520,7 @@ export default function App() {
                           {isInstallingDeps
                             ? "Setting up..."
                             : settings.local_engine === "faster_whisper"
-                            ? "⚡ Setup Python Environment"
+                            ? "⚡ Install faster-whisper"
                             : "⬇ Download Runner Binary"}
                         </button>
                       ) : (
@@ -3863,7 +3864,8 @@ export default function App() {
                   type="button"
                   className="btn-toast-action"
                   onClick={async () => {
-                    await copyText(`Transcription Error Log:\n${errorMsg}\nTime: ${new Date().toISOString()}\nEngine: ${settings.engine_mode}\nModel: ${settings.model || "default"}\nEndpoint: ${settings.api_base_url || "(local)"}`);
+                    const isCloud = settings.engine_mode === "cloud";
+                    await copyText(`Transcription Error Log:\n${errorMsg}\nTime: ${new Date().toISOString()}\nEngine: ${settings.engine_mode}${!isCloud ? ` (${settings.local_engine})` : ""}\nModel: ${(isCloud ? settings.model : settings.local_model_size) || "default"}\nEndpoint: ${isCloud ? (settings.api_base_url || "(default)") : "(local)"}`);
                     showToast("✓ Error log copied!");
                   }}
                   title="Copy error details to clipboard"

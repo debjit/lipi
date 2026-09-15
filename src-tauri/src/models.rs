@@ -174,6 +174,31 @@ pub fn which_command(name: &str) -> Option<PathBuf> {
 }
 
 pub fn find_faster_whisper_python(app_data_dir: &Path) -> Option<PathBuf> {
+    // 1. Prioritize reusing system Python if faster_whisper is installed there
+    let candidates = if cfg!(windows) {
+        vec!["python", "py", "python3"]
+    } else {
+        vec!["python3", "python"]
+    };
+
+    for candidate in candidates {
+        if let Some(path) = which_command(candidate) {
+            let mut sys_check = std::process::Command::new(&path);
+            sys_check.arg("-c").arg("import faster_whisper");
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                sys_check.creation_flags(0x08000000);
+            }
+            if let Ok(out) = sys_check.output() {
+                if out.status.success() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to app's isolated venv if present
     let venv_py = if cfg!(windows) {
         app_data_dir.join("venv").join("Scripts").join("python.exe")
     } else {
@@ -181,42 +206,93 @@ pub fn find_faster_whisper_python(app_data_dir: &Path) -> Option<PathBuf> {
     };
 
     if venv_py.exists() {
-        let check = std::process::Command::new(&venv_py)
-            .arg("-c")
-            .arg("import faster_whisper")
-            .output();
-        if let Ok(out) = check {
+        let mut check = std::process::Command::new(&venv_py);
+        check.arg("-c").arg("import faster_whisper");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            check.creation_flags(0x08000000);
+        }
+        if let Ok(out) = check.output() {
             if out.status.success() {
                 return Some(venv_py);
             }
         }
     }
 
-    // Check system python3
-    let sys_check = std::process::Command::new("python3")
-        .arg("-c")
-        .arg("import faster_whisper")
-        .output();
-    if let Ok(out) = sys_check {
-        if out.status.success() {
-            return Some(PathBuf::from("python3"));
+    None
+}
+
+pub fn is_python_functional(cmd: &Path) -> bool {
+    let mut proc = std::process::Command::new(cmd);
+    proc.arg("-c").arg("import sys; sys.exit(0)");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        proc.creation_flags(0x08000000);
+    }
+    proc.output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+pub fn find_working_python_cmd() -> Option<PathBuf> {
+    let candidates: &[&'static str] = if cfg!(windows) {
+        &["python", "py", "python3"]
+    } else {
+        &["python3", "python"]
+    };
+
+    for &cmd in candidates {
+        if let Some(path) = which_command(cmd) {
+            if is_python_functional(&path) {
+                return Some(path);
+            }
         }
     }
-
     None
 }
 
 pub fn install_faster_whisper_deps(app_data_dir: &Path) -> Result<String, String> {
+    let py_path = find_working_python_cmd().ok_or_else(|| {
+        if cfg!(windows) {
+            "Python 3 is not found on your system PATH. Please install Python from https://python.org or run 'winget install Python.Python.3.11' (check 'Add Python to PATH').".to_string()
+        } else {
+            "Python 3 is not found on your system. Please install python3 (e.g. 'sudo apt install python3-pip').".to_string()
+        }
+    })?;
+
+    // 1. First attempt: Install faster-whisper directly into the existing Python environment
+    let mut direct_pip = std::process::Command::new(&py_path);
+    direct_pip.arg("-m").arg("pip").arg("install").arg("faster-whisper");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        direct_pip.creation_flags(0x08000000);
+    }
+    if let Ok(output) = direct_pip.output() {
+        if output.status.success() {
+            return Ok(format!(
+                "faster-whisper installed directly into existing Python ({})",
+                py_path.to_string_lossy()
+            ));
+        }
+    }
+
+    // 2. Fallback: If direct install fails (e.g. permission limits or PEP 668), use an isolated venv
     let venv_dir = app_data_dir.join("venv");
     if !venv_dir.exists() {
-        let venv_status = std::process::Command::new("python3")
-            .arg("-m")
-            .arg("venv")
-            .arg(&venv_dir)
+        let mut venv_cmd = std::process::Command::new(&py_path);
+        venv_cmd.arg("-m").arg("venv").arg(&venv_dir);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            venv_cmd.creation_flags(0x08000000);
+        }
+
+        let venv_status = venv_cmd
             .status()
             .map_err(|e| format!("Failed to create virtual environment: {}", e))?;
         if !venv_status.success() {
-            return Err("Failed to create virtual environment with 'python3 -m venv'".into());
+            return Err(format!("Failed to create virtual environment with '{} -m venv'", py_path.to_string_lossy()));
         }
     }
 
@@ -225,10 +301,15 @@ pub fn install_faster_whisper_deps(app_data_dir: &Path) -> Result<String, String
     } else {
         venv_dir.join("bin").join("pip")
     };
+    let mut pip_cmd = std::process::Command::new(pip_exe);
+    pip_cmd.arg("install").arg("faster-whisper");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        pip_cmd.creation_flags(0x08000000);
+    }
 
-    let pip_output = std::process::Command::new(pip_exe)
-        .arg("install")
-        .arg("faster-whisper")
+    let pip_output = pip_cmd
         .output()
         .map_err(|e| format!("Failed to run pip install: {}", e))?;
 
@@ -268,7 +349,16 @@ pub fn check_model_status(
     let (binary_available, binary_path) = if engine == "faster_whisper" {
         match find_faster_whisper_python(app_data_dir) {
             Some(p) => (true, p.to_string_lossy().to_string()),
-            None => (false, "faster-whisper python module not found".into()),
+            None => {
+                if let Some(sys_py) = find_working_python_cmd() {
+                    (
+                        false,
+                        format!("Python detected at {}", sys_py.to_string_lossy()),
+                    )
+                } else {
+                    (false, "Python 3 not found in PATH".into())
+                }
+            }
         }
     } else {
         let b = find_whisper_binary(app_data_dir);

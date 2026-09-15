@@ -282,8 +282,9 @@ server = HTTPServer(('127.0.0.1', port), H)
 server.serve_forever()
 "#;
 
-            Command::new(python_exe)
-                .arg("-c")
+            let mut cmd = Command::new(&python_exe);
+            configure_binary_env_and_flags(&mut cmd, &python_exe);
+            cmd.arg("-c")
                 .arg(py_server_code)
                 .arg(port.to_string())
                 .arg(target_arg)
@@ -322,10 +323,9 @@ server.serve_forever()
                 .arg("-t")
                 .arg(num_threads);
 
-            if engine == "whisper_vulkan" {
-                cmd.arg("-ng").arg("99");
-            } else {
-                cmd.arg("-ng").arg("0");
+            if engine != "whisper_vulkan" {
+                // -ng disables GPU in whisper-server for CPU engine
+                cmd.arg("-ng");
             }
 
             cmd.stdin(std::process::Stdio::null())
@@ -553,11 +553,9 @@ async fn transcribe_whisper_cpp(
         .unwrap_or_else(|_| "4".to_string());
     cmd.arg("-t").arg(num_threads);
 
-    if vulkan {
-        // -ng 99 enables GPU layer offloading for ggml Vulkan backend
-        cmd.arg("-ng").arg("99");
-    } else {
-        cmd.arg("-ng").arg("0");
+    if !vulkan {
+        // -ng disables GPU compute for CPU engine
+        cmd.arg("-ng");
     }
 
     if let Some(lang) = language {
@@ -635,7 +633,8 @@ except Exception as e:
         size.to_string()
     };
 
-    let mut cmd = Command::new(python_exe);
+    let mut cmd = Command::new(&python_exe);
+    configure_binary_env_and_flags(&mut cmd, &python_exe);
     cmd.arg("-c")
         .arg(py_script)
         .arg(wav_path)
