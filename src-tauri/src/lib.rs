@@ -423,6 +423,10 @@ async fn prepare_engine(
         })
         .await
         .map_err(|e| e.to_string())?
+    } else if engine == "whisper_vulkan" {
+        models::ensure_whisper_vulkan_backend(&app_data_dir)
+            .await
+            .map(|p| format!("Vulkan GPU backend ready at {}", p.to_string_lossy()))
     } else {
         models::ensure_whisper_cli_binary(&app_data_dir)
             .await

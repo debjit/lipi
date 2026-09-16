@@ -570,9 +570,12 @@ export default function App() {
     setErrorMsg(null);
     try {
       const isFW = settingsRef.current.local_engine === "faster_whisper";
+      const isVulkan = settingsRef.current.local_engine === "whisper_vulkan";
       showToast(
         isFW
           ? "Setting up isolated environment & installing faster-whisper (this may take ~1m)..."
+          : isVulkan
+          ? "Downloading Vulkan GPU backend for whisper.cpp..."
           : "Preparing official whisper.cpp runner binary..."
       );
       const res: string = await invoke("prepare_engine", {
@@ -2506,6 +2509,8 @@ export default function App() {
                           ? modelStatus.binary_path
                           : modelStatus?.binary_path || (settings.local_engine === "faster_whisper"
                           ? "Python faster-whisper virtualenv not configured"
+                          : settings.local_engine === "whisper_vulkan"
+                          ? "Vulkan GPU backend not installed yet"
                           : "whisper-cli / whisper-server runner binary not downloaded yet")}
                       </div>
                     </div>
@@ -2521,6 +2526,8 @@ export default function App() {
                             ? "Setting up..."
                             : settings.local_engine === "faster_whisper"
                             ? "⚡ Install faster-whisper"
+                            : settings.local_engine === "whisper_vulkan"
+                            ? "⬇ Download Vulkan GPU backend"
                             : "⬇ Download Runner Binary"}
                         </button>
                       ) : (

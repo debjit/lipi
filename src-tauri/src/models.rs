@@ -89,6 +89,38 @@ pub fn get_bin_dir(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("bin")
 }
 
+fn vulkan_backend_candidates(bin_dir: &Path) -> [PathBuf; 3] {
+    [
+        bin_dir.join("ggml-vulkan.dll"),
+        bin_dir.join("libggml-vulkan.so"),
+        bin_dir.join("ggml-vulkan.so"),
+    ]
+}
+
+pub fn vulkan_backend_path(app_data_dir: &Path) -> Option<PathBuf> {
+    let bin_dir = get_bin_dir(app_data_dir);
+    vulkan_backend_candidates(&bin_dir)
+        .into_iter()
+        .find(|p| p.exists())
+}
+
+fn find_file_named(root: &Path, names: &[&str]) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_file_named(&path, names) {
+                return Some(found);
+            }
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if names.iter().any(|want| name.eq_ignore_ascii_case(want)) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 pub fn get_model_filename(engine: &str, model_size: &str) -> String {
     if engine == "faster_whisper" {
         let size = match model_size.to_lowercase().as_str() {
@@ -366,9 +398,23 @@ pub fn check_model_status(
         }
     } else {
         let b = find_whisper_binary(app_data_dir);
-        let avail = b.is_some();
-        let path = b.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-        (avail, path)
+        if engine == "whisper_vulkan" {
+            match (b, vulkan_backend_path(app_data_dir)) {
+                (Some(cli), Some(vk)) => (
+                    true,
+                    format!("{} + {}", cli.to_string_lossy(), vk.file_name().unwrap_or_default().to_string_lossy()),
+                ),
+                (Some(_), None) => (
+                    false,
+                    "CPU whisper.cpp runner found. Download the Vulkan GPU backend to use this engine.".into(),
+                ),
+                (None, _) => (false, "whisper-cli / whisper-server runner binary not downloaded yet".into()),
+            }
+        } else {
+            let avail = b.is_some();
+            let path = b.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            (avail, path)
+        }
     };
 
     Ok(ModelStatus {
@@ -508,6 +554,107 @@ pub async fn ensure_whisper_cli_binary(app_data_dir: &Path) -> Result<PathBuf, S
     }
 
     Err("whisper-cli binary not found. Please install whisper-cli or ensure it is in PATH.".into())
+}
+
+pub async fn ensure_whisper_vulkan_backend(app_data_dir: &Path) -> Result<PathBuf, String> {
+    let _ = ensure_whisper_cli_binary(app_data_dir).await?;
+    if let Some(existing) = vulkan_backend_path(app_data_dir) {
+        return Ok(existing);
+    }
+
+    let bin_dir = get_bin_dir(app_data_dir);
+    fs::create_dir_all(&bin_dir).map_err(|e| format!("Failed to create bin dir: {}", e))?;
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let archive_url = "https://github.com/ggml-org/llama.cpp/releases/download/b10992/llama-b10992-bin-win-vulkan-x64.zip";
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let archive_url = "https://github.com/ggml-org/llama.cpp/releases/download/b10992/llama-b10992-bin-ubuntu-vulkan-x64.tar.gz";
+    #[cfg(not(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )))]
+    {
+        return Err(
+            "Vulkan GPU backend is not bundled for this OS/arch. Install a whisper.cpp build that includes ggml-vulkan."
+                .into(),
+        );
+    }
+
+    #[cfg(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    ))]
+    {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(archive_url)
+            .header("User-Agent", "lipi")
+            .send()
+            .await
+            .map_err(|e| format!("Failed to download Vulkan GPU backend: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "Vulkan GPU backend download failed with status: {}",
+                resp.status()
+            ));
+        }
+
+        let archive_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed to read Vulkan archive bytes: {}", e))?;
+
+        let extract_dir = std::env::temp_dir().join("lipi_vulkan_extract");
+        let _ = fs::remove_dir_all(&extract_dir);
+        fs::create_dir_all(&extract_dir)
+            .map_err(|e| format!("Failed to create Vulkan extract dir: {}", e))?;
+
+        #[cfg(windows)]
+        let archive_path = extract_dir.join("llama-vulkan.zip");
+        #[cfg(not(windows))]
+        let archive_path = extract_dir.join("llama-vulkan.tar.gz");
+
+        fs::write(&archive_path, &archive_bytes)
+            .map_err(|e| format!("Failed to write Vulkan archive: {}", e))?;
+
+        let mut tar_cmd = std::process::Command::new("tar");
+        apply_no_window(&mut tar_cmd);
+        #[cfg(windows)]
+        {
+            tar_cmd.arg("-xf").arg(&archive_path).arg("-C").arg(&extract_dir);
+        }
+        #[cfg(not(windows))]
+        {
+            tar_cmd
+                .arg("-xzf")
+                .arg(&archive_path)
+                .arg("-C")
+                .arg(&extract_dir);
+        }
+        let status = tar_cmd
+            .status()
+            .map_err(|e| format!("Failed to extract Vulkan archive: {}", e))?;
+        if !status.success() {
+            return Err("Failed to unpack Vulkan GPU backend archive".into());
+        }
+
+        let found = find_file_named(
+            &extract_dir,
+            &["ggml-vulkan.dll", "libggml-vulkan.so", "ggml-vulkan.so"],
+        )
+        .ok_or_else(|| "Vulkan backend library was not found inside the downloaded archive".to_string())?;
+
+        let dest = bin_dir.join(found.file_name().unwrap());
+        fs::copy(&found, &dest).map_err(|e| format!("Failed to install Vulkan backend: {}", e))?;
+        let _ = fs::remove_dir_all(&extract_dir);
+
+        if dest.exists() {
+            return Ok(dest);
+        }
+    }
+
+    Err("Vulkan GPU backend could not be installed. The official whisper.cpp Windows zip is CPU-only.".into())
 }
 
 pub async fn ensure_whisper_server_binary(app_data_dir: &Path) -> Result<PathBuf, String> {
