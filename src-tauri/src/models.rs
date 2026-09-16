@@ -16,13 +16,62 @@ pub struct ModelStatus {
     pub models_dir: String,
 }
 
+pub(crate) fn apply_no_window(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
+fn is_windows_store_stub(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.contains(r"\WindowsApps\") || s.contains("/WindowsApps/")
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn venv_python_path(app_data_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        app_data_dir.join("venv").join("Scripts").join("python.exe")
+    } else {
+        let py3 = app_data_dir.join("venv").join("bin").join("python3");
+        if py3.exists() {
+            py3
+        } else {
+            app_data_dir.join("venv").join("bin").join("python")
+        }
+    }
+}
+
+fn python_can_import(python: &Path, module: &str) -> bool {
+    if is_windows_store_stub(python) {
+        return false;
+    }
+    let mut cmd = std::process::Command::new(python);
+    apply_no_window(&mut cmd);
+    cmd.arg("-c").arg(format!("import {}", module));
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+}
+
 pub fn resolve_models_dir(app_data_dir: &Path, custom_dir: Option<&str>) -> PathBuf {
     if let Some(custom) = custom_dir {
         let trimmed = custom.trim();
         if !trimmed.is_empty() {
-            if let Some(stripped) = trimmed.strip_prefix("~/") {
-                if let Ok(home) = std::env::var("HOME") {
-                    return PathBuf::from(home).join(stripped);
+            let home_relative = trimmed
+                .strip_prefix("~/")
+                .or_else(|| trimmed.strip_prefix("~\\"));
+            if let Some(stripped) = home_relative {
+                if let Some(home) = home_dir() {
+                    return home.join(stripped);
                 }
             }
             return PathBuf::from(trimmed);
@@ -153,14 +202,18 @@ mod which {
     use std::process::Command;
 
     pub fn which(name: &str) -> Result<PathBuf, ()> {
-        let cmd = if cfg!(windows) { "where.exe" } else { "which" };
-        let output = Command::new(cmd).arg(name).output().map_err(|_| ())?;
+        let finder = if cfg!(windows) { "where.exe" } else { "which" };
+        let mut cmd = Command::new(finder);
+        super::apply_no_window(&mut cmd);
+        let output = cmd.arg(name).output().map_err(|_| ())?;
         if output.status.success() {
-            let path_str = String::from_utf8_lossy(&output.stdout);
-            let first_line = path_str.lines().next().unwrap_or("").trim();
-            if !first_line.is_empty() {
-                let p = PathBuf::from(first_line);
-                if p.exists() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let p = PathBuf::from(trimmed);
+                if p.exists() && !super::is_windows_store_stub(&p) {
                     return Ok(p);
                 }
             }
@@ -174,69 +227,36 @@ pub fn which_command(name: &str) -> Option<PathBuf> {
 }
 
 pub fn find_faster_whisper_python(app_data_dir: &Path) -> Option<PathBuf> {
-    // 1. Prioritize reusing system Python if faster_whisper is installed there
-    let candidates = if cfg!(windows) {
-        vec!["python", "py", "python3"]
+    // Prefer an existing system install of faster-whisper, then the app venv.
+    let candidates: &[&str] = if cfg!(windows) {
+        &["py", "python", "python3"]
     } else {
-        vec!["python3", "python"]
+        &["python3", "python"]
     };
 
     for candidate in candidates {
         if let Some(path) = which_command(candidate) {
-            let mut sys_check = std::process::Command::new(&path);
-            sys_check.arg("-c").arg("import faster_whisper");
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                sys_check.creation_flags(0x08000000);
-            }
-            if let Ok(out) = sys_check.output() {
-                if out.status.success() {
-                    return Some(path);
-                }
+            if python_can_import(&path, "faster_whisper") {
+                return Some(path);
             }
         }
     }
 
-    // 2. Fallback to app's isolated venv if present
-    let venv_py = if cfg!(windows) {
-        app_data_dir.join("venv").join("Scripts").join("python.exe")
-    } else {
-        app_data_dir.join("venv").join("bin").join("python3")
-    };
-
-    if venv_py.exists() {
-        let mut check = std::process::Command::new(&venv_py);
-        check.arg("-c").arg("import faster_whisper");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            check.creation_flags(0x08000000);
-        }
-        if let Ok(out) = check.output() {
-            if out.status.success() {
-                return Some(venv_py);
-            }
-        }
+    let venv_py = venv_python_path(app_data_dir);
+    if venv_py.exists() && python_can_import(&venv_py, "faster_whisper") {
+        return Some(venv_py);
     }
 
     None
 }
 
 pub fn is_python_functional(cmd: &Path) -> bool {
-    let mut proc = std::process::Command::new(cmd);
-    proc.arg("-c").arg("import sys; sys.exit(0)");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        proc.creation_flags(0x08000000);
-    }
-    proc.output().map(|o| o.status.success()).unwrap_or(false)
+    python_can_import(cmd, "sys")
 }
 
 pub fn find_working_python_cmd() -> Option<PathBuf> {
     let candidates: &[&'static str] = if cfg!(windows) {
-        &["python", "py", "python3"]
+        &["py", "python", "python3"]
     } else {
         &["python3", "python"]
     };
@@ -260,54 +280,38 @@ pub fn install_faster_whisper_deps(app_data_dir: &Path) -> Result<String, String
         }
     })?;
 
-    // 1. First attempt: Install faster-whisper directly into the existing Python environment
-    let mut direct_pip = std::process::Command::new(&py_path);
-    direct_pip.arg("-m").arg("pip").arg("install").arg("faster-whisper");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        direct_pip.creation_flags(0x08000000);
-    }
-    if let Ok(output) = direct_pip.output() {
-        if output.status.success() {
-            return Ok(format!(
-                "faster-whisper installed directly into existing Python ({})",
-                py_path.to_string_lossy()
-            ));
-        }
-    }
-
-    // 2. Fallback: If direct install fails (e.g. permission limits or PEP 668), use an isolated venv
     let venv_dir = app_data_dir.join("venv");
-    if !venv_dir.exists() {
-        let mut venv_cmd = std::process::Command::new(&py_path);
-        venv_cmd.arg("-m").arg("venv").arg(&venv_dir);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            venv_cmd.creation_flags(0x08000000);
+    let mut venv_py = venv_python_path(app_data_dir);
+    if !venv_py.exists() {
+        if venv_dir.exists() {
+            let _ = fs::remove_dir_all(&venv_dir);
         }
-
+        let mut venv_cmd = std::process::Command::new(&py_path);
+        apply_no_window(&mut venv_cmd);
+        venv_cmd.arg("-m").arg("venv").arg(&venv_dir);
         let venv_status = venv_cmd
             .status()
             .map_err(|e| format!("Failed to create virtual environment: {}", e))?;
         if !venv_status.success() {
-            return Err(format!("Failed to create virtual environment with '{} -m venv'", py_path.to_string_lossy()));
+            return Err(format!(
+                "Failed to create virtual environment with '{} -m venv'",
+                py_path.to_string_lossy()
+            ));
         }
+        venv_py = venv_python_path(app_data_dir);
     }
 
-    let pip_exe = if cfg!(windows) {
-        venv_dir.join("Scripts").join("pip.exe")
-    } else {
-        venv_dir.join("bin").join("pip")
-    };
-    let mut pip_cmd = std::process::Command::new(pip_exe);
-    pip_cmd.arg("install").arg("faster-whisper");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        pip_cmd.creation_flags(0x08000000);
+    if !venv_py.exists() {
+        return Err("Virtual environment was created but Python was not found inside it.".into());
     }
+
+    let mut pip_cmd = std::process::Command::new(&venv_py);
+    apply_no_window(&mut pip_cmd);
+    pip_cmd
+        .arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg("faster-whisper");
 
     let pip_output = pip_cmd
         .output()
@@ -463,9 +467,10 @@ pub async fn ensure_whisper_cli_binary(app_data_dir: &Path) -> Result<PathBuf, S
         fs::write(&zip_path, &archive_bytes)
             .map_err(|e| format!("Failed to write archive to disk: {}", e))?;
 
-        // Windows 10+ includes tar.exe which extracts .zip files natively
+        let mut tar_cmd = std::process::Command::new("tar");
+        apply_no_window(&mut tar_cmd);
         let mut extracted = false;
-        if let Ok(status) = std::process::Command::new("tar")
+        if let Ok(status) = tar_cmd
             .arg("-xf")
             .arg(&zip_path)
             .arg("-C")
@@ -483,7 +488,9 @@ pub async fn ensure_whisper_cli_binary(app_data_dir: &Path) -> Result<PathBuf, S
                 zip_path.to_string_lossy(),
                 bin_dir.to_string_lossy()
             );
-            let _ = std::process::Command::new("powershell")
+            let mut ps_cmd = std::process::Command::new("powershell");
+            apply_no_window(&mut ps_cmd);
+            let _ = ps_cmd
                 .arg("-NoProfile")
                 .arg("-Command")
                 .arg(&ps_script)
@@ -825,6 +832,13 @@ mod tests {
             resolve_models_dir(&app_data, Some("/media/external/models")),
             PathBuf::from("/media/external/models")
         );
+
+        if let Some(home) = home_dir() {
+            assert_eq!(
+                resolve_models_dir(&app_data, Some("~/custom-models")),
+                home.join("custom-models")
+            );
+        }
     }
 
     #[test]

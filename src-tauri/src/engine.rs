@@ -41,6 +41,16 @@ fn estimate_ram_mb(model_size: &str) -> u64 {
     }
 }
 
+fn apply_whisper_gpu_flags(cmd: &mut Command, use_gpu: bool) {
+    if use_gpu {
+        // -ngl offloads layers to GPU (Vulkan / CUDA / Metal)
+        cmd.arg("-ngl").arg("99");
+    } else {
+        // -ng disables GPU for the CPU engine
+        cmd.arg("-ng");
+    }
+}
+
 fn configure_binary_env_and_flags(cmd: &mut Command, binary_path: &Path) {
     if let Some(parent) = binary_path.parent() {
         let parent_str = parent.to_string_lossy().to_string();
@@ -323,10 +333,7 @@ server.serve_forever()
                 .arg("-t")
                 .arg(num_threads);
 
-            if engine != "whisper_vulkan" {
-                // -ng disables GPU in whisper-server for CPU engine
-                cmd.arg("-ng");
-            }
+            apply_whisper_gpu_flags(&mut cmd, engine == "whisper_vulkan");
 
             cmd.stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -553,10 +560,7 @@ async fn transcribe_whisper_cpp(
         .unwrap_or_else(|_| "4".to_string());
     cmd.arg("-t").arg(num_threads);
 
-    if !vulkan {
-        // -ng disables GPU compute for CPU engine
-        cmd.arg("-ng");
-    }
+    apply_whisper_gpu_flags(&mut cmd, vulkan);
 
     if let Some(lang) = language {
         let trimmed = lang.trim();

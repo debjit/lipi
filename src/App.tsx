@@ -2551,7 +2551,7 @@ export default function App() {
                       <input
                         type="text"
                         className="form-input"
-                        placeholder={modelStatus?.models_dir || "Default: ~/.local/share/com.lipi.app/models"}
+                        placeholder={modelStatus?.models_dir || "Default app models folder"}
                         value={settings.models_folder || ""}
                         onChange={(e) =>
                           setSettings({ ...settings, models_folder: e.target.value })

@@ -454,7 +454,35 @@ async fn pick_directory() -> Result<Option<String>, String> {
                 }
             }
         }
+
+        if let Ok(output) = std::process::Command::new("kdialog")
+            .arg("--title")
+            .arg("Select Models Storage Directory")
+            .arg("--getexistingdirectory")
+            .output()
+        {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Ok(Some(path));
+                }
+            }
+        }
     }
+
+    #[cfg(target_os = "windows")]
+    {
+        let folder = tauri::async_runtime::spawn_blocking(|| {
+            rfd::FileDialog::new()
+                .set_title("Select Models Storage Directory")
+                .pick_folder()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        return Ok(folder.map(|p| p.to_string_lossy().into_owned()));
+    }
+
+    #[cfg(not(target_os = "windows"))]
     Ok(None)
 }
 
