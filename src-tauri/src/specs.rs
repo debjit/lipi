@@ -40,17 +40,36 @@ pub fn get_total_ram_bytes() -> u64 {
 
     #[cfg(target_os = "windows")]
     {
-        if let Ok(output) = std::process::Command::new("powershell")
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg("(Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize")
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(kb) = String::from_utf8_lossy(&output.stdout).trim().parse::<u64>() {
-                    return kb * 1024;
-                }
-            }
+        #[repr(C)]
+        struct MemoryStatusEx {
+            dw_length: u32,
+            dw_memory_load: u32,
+            ull_total_phys: u64,
+            ull_avail_phys: u64,
+            ull_total_page_file: u64,
+            ull_avail_page_file: u64,
+            ull_total_virtual: u64,
+            ull_avail_virtual: u64,
+            ull_avail_extended_virtual: u64,
+        }
+
+        extern "system" {
+            fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+        }
+
+        let mut status = MemoryStatusEx {
+            dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            dw_memory_load: 0,
+            ull_total_phys: 0,
+            ull_avail_phys: 0,
+            ull_total_page_file: 0,
+            ull_avail_page_file: 0,
+            ull_total_virtual: 0,
+            ull_avail_virtual: 0,
+            ull_avail_extended_virtual: 0,
+        };
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ull_total_phys > 0 {
+            return status.ull_total_phys;
         }
     }
 
@@ -132,8 +151,7 @@ pub fn check_system_prerequisites(app_data_dir: &std::path::Path) -> Prerequisit
     let whisper_binary_found = whisper_bin.is_some();
     let whisper_binary_path = whisper_bin.map(|p| p.to_string_lossy().to_string());
 
-    let py = crate::models::which_command("python3")
-        .or_else(|| crate::models::which_command("python"));
+    let py = crate::models::find_working_python_cmd();
     let python_found = py.is_some();
     let python_path = py.map(|p| p.to_string_lossy().to_string());
 

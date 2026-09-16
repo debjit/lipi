@@ -929,7 +929,7 @@ export function SetupWizard({
                           checked={localWhisperEngine === "faster_whisper"}
                           onChange={() => setLocalWhisperEngine("faster_whisper")}
                         />
-                        <span>faster-whisper (Python Virtualenv)</span>
+                        <span>faster-whisper (Python)</span>
                       </label>
                     </div>
 
@@ -968,8 +968,10 @@ export function SetupWizard({
                                 ? `whisper-cli executable ready at ${prereqs.whisper_binary_path}`
                                 : "Click Setup below to download native whisper.cpp runner."
                               : prereqs?.venv_python_found
-                              ? "faster-whisper virtual environment ready."
-                              : "Click setup to prepare faster-whisper Python virtual environment."}
+                              ? "faster-whisper Python runner ready."
+                              : prereqs?.python_found
+                              ? `Detected existing Python at ${prereqs.python_path}. Click setup to install faster-whisper.`
+                              : "Click setup to prepare faster-whisper Python environment."}
                           </div>
                           {engineSetupMsg && (
                             <div className="form-hint" style={{ marginTop: "4px", color: "var(--accent)" }}>

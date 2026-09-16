@@ -41,6 +41,13 @@ fn estimate_ram_mb(model_size: &str) -> u64 {
     }
 }
 
+fn apply_whisper_gpu_flags(cmd: &mut Command, use_gpu: bool) {
+    if !use_gpu {
+        // Current whisper.cpp builds have no -ngl; -ng disables GPU.
+        cmd.arg("-ng");
+    }
+}
+
 fn configure_binary_env_and_flags(cmd: &mut Command, binary_path: &Path) {
     if let Some(parent) = binary_path.parent() {
         let parent_str = parent.to_string_lossy().to_string();
@@ -282,8 +289,9 @@ server = HTTPServer(('127.0.0.1', port), H)
 server.serve_forever()
 "#;
 
-            Command::new(python_exe)
-                .arg("-c")
+            let mut cmd = Command::new(&python_exe);
+            configure_binary_env_and_flags(&mut cmd, &python_exe);
+            cmd.arg("-c")
                 .arg(py_server_code)
                 .arg(port.to_string())
                 .arg(target_arg)
@@ -303,6 +311,9 @@ server.serve_forever()
             }
 
             let server_binary = ensure_whisper_server_binary(app_data_dir).await?;
+            if engine == "whisper_vulkan" {
+                models::ensure_whisper_vulkan_backend(app_data_dir).await?;
+            }
             let mut cmd = Command::new(&server_binary);
             configure_binary_env_and_flags(&mut cmd, &server_binary);
 
@@ -322,15 +333,18 @@ server.serve_forever()
                 .arg("-t")
                 .arg(num_threads);
 
-            if engine == "whisper_vulkan" {
-                cmd.arg("-ng").arg("99");
+            apply_whisper_gpu_flags(&mut cmd, engine == "whisper_vulkan");
+
+            let stderr_path = std::env::temp_dir().join("lipi_whisper_daemon.err");
+            let stderr_file = fs::File::create(&stderr_path).ok();
+            if let Some(file) = stderr_file {
+                cmd.stderr(std::process::Stdio::from(file));
             } else {
-                cmd.arg("-ng").arg("0");
+                cmd.stderr(std::process::Stdio::null());
             }
 
             cmd.stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
                 .spawn()
                 .map_err(|e| format!("Failed to spawn whisper-server: {}", e))?
         };
@@ -338,12 +352,19 @@ server.serve_forever()
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         let mut ready = false;
         let mut child = child;
+        let daemon_log = std::env::temp_dir().join("lipi_whisper_daemon.err");
 
         for _ in 0..75 {
             std::thread::sleep(std::time::Duration::from_millis(200));
 
             if let Ok(Some(exit)) = child.try_wait() {
-                return Err(format!("Daemon exited prematurely with status: {}", exit));
+                let details = fs::read_to_string(&daemon_log).unwrap_or_default();
+                let details = details.trim();
+                return Err(if details.is_empty() {
+                    format!("Daemon exited prematurely with status: {}", exit)
+                } else {
+                    format!("Daemon exited prematurely with status: {}. {}", exit, details)
+                });
             }
 
             if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(150)).is_ok() {
@@ -355,7 +376,13 @@ server.serve_forever()
         if !ready {
             let _ = child.kill();
             let _ = child.wait();
-            return Err("Daemon failed to respond within 15 seconds".into());
+            let details = fs::read_to_string(&daemon_log).unwrap_or_default();
+            let details = details.trim();
+            return Err(if details.is_empty() {
+                "Daemon failed to respond within 15 seconds".into()
+            } else {
+                format!("Daemon failed to respond within 15 seconds. {}", details)
+            });
         }
 
         let now_instant = std::time::Instant::now();
@@ -537,6 +564,9 @@ async fn transcribe_whisper_cpp(
     }
 
     let binary_path = ensure_whisper_cli_binary(app_data_dir).await?;
+    if vulkan {
+        models::ensure_whisper_vulkan_backend(app_data_dir).await?;
+    }
 
     let mut cmd = Command::new(&binary_path);
     configure_binary_env_and_flags(&mut cmd, &binary_path);
@@ -553,12 +583,7 @@ async fn transcribe_whisper_cpp(
         .unwrap_or_else(|_| "4".to_string());
     cmd.arg("-t").arg(num_threads);
 
-    if vulkan {
-        // -ng 99 enables GPU layer offloading for ggml Vulkan backend
-        cmd.arg("-ng").arg("99");
-    } else {
-        cmd.arg("-ng").arg("0");
-    }
+    apply_whisper_gpu_flags(&mut cmd, vulkan);
 
     if let Some(lang) = language {
         let trimmed = lang.trim();
@@ -635,7 +660,8 @@ except Exception as e:
         size.to_string()
     };
 
-    let mut cmd = Command::new(python_exe);
+    let mut cmd = Command::new(&python_exe);
+    configure_binary_env_and_flags(&mut cmd, &python_exe);
     cmd.arg("-c")
         .arg(py_script)
         .arg(wav_path)
