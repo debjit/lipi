@@ -1501,7 +1501,7 @@ export function SetupWizard({
                   💡 Helpful Shortcuts:
                 </h4>
                 <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", fontSize: "12px", color: "var(--text-secondary)" }}>
-                  <span><kbd className="key-hint">Alt+R</kbd> Toggle dictation</span>
+                  <span><kbd className="key-hint">Alt+R</kbd> System-wide dictation (enable Auto-Paste in Settings)</span>
                   <span><kbd className="key-hint">Alt+M</kbd> Mini widget</span>
                   <span><kbd className="key-hint">Esc</kbd> Exit to scratchpad</span>
                 </div>

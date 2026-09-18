@@ -4,6 +4,7 @@ mod engine;
 mod env_config;
 mod llm;
 mod models;
+mod paste;
 mod presets;
 mod specs;
 mod transcribe;
@@ -52,13 +53,51 @@ pub struct AppState {
     supervisor: Arc<engine::ModelSupervisor>,
     app_data_dir: std::path::PathBuf,
     is_mini: std::sync::atomic::AtomicBool,
+    paste_target: Arc<std::sync::Mutex<Option<paste::PasteTarget>>>,
+    global_shortcut_registered: std::sync::atomic::AtomicBool,
 }
 
 #[tauri::command]
 fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let settings = state.db.get_settings().unwrap_or_default();
+    if settings.auto_paste {
+        let target = paste::capture_paste_target();
+        if let Ok(mut guard) = state.paste_target.lock() {
+            *guard = Some(target);
+        }
+    } else if let Ok(mut guard) = state.paste_target.lock() {
+        *guard = None;
+    }
+
     state.audio.start()?;
     update_tray_icon(&app, true);
     Ok(())
+}
+
+#[tauri::command]
+async fn paste_into_previous_app(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    text: String,
+) -> Result<(), String> {
+    if !state.is_mini.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.minimize();
+        }
+    }
+    let target = if let Ok(guard) = state.paste_target.lock() {
+        guard.clone()
+    } else {
+        None
+    };
+    paste::paste_into_previous_app(target, &text)
+}
+
+#[tauri::command]
+fn is_global_shortcut_registered(state: tauri::State<'_, AppState>) -> bool {
+    state
+        .global_shortcut_registered
+        .load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[tauri::command]
@@ -723,6 +762,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             let app_data_dir = app
                 .path()
@@ -853,12 +893,31 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            let app_handle_for_shortcut = app.handle().clone();
+            let mut global_shortcut_registered = false;
+            use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+            let shortcut = Shortcut::new(Some(Modifiers::ALT), Code::KeyR);
+            match app.global_shortcut().on_shortcut(shortcut, move |_app, _sc, event| {
+                if event.state() == ShortcutState::Pressed {
+                    let _ = app_handle_for_shortcut.emit("tray_toggle_recording", ());
+                }
+            }) {
+                Ok(_) => {
+                    global_shortcut_registered = true;
+                }
+                Err(e) => {
+                    eprintln!("[GlobalShortcut] Warning: Could not register global Alt+R: {}", e);
+                }
+            }
+
             app.manage(AppState {
                 db: db_arc,
                 audio: Arc::new(AudioRecorder::new()),
                 supervisor: supervisor_arc,
                 app_data_dir,
                 is_mini: std::sync::atomic::AtomicBool::new(false),
+                paste_target: Arc::new(std::sync::Mutex::new(None)),
+                global_shortcut_registered: std::sync::atomic::AtomicBool::new(global_shortcut_registered),
             });
 
             Ok(())
@@ -881,6 +940,8 @@ pub fn run() {
             start_recording,
             is_recording,
             stop_recording_and_transcribe,
+            paste_into_previous_app,
+            is_global_shortcut_registered,
             get_notes,
             save_note,
             update_note,

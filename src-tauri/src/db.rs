@@ -18,6 +18,7 @@ pub struct AppSettings {
     pub model: String,
     pub language: Option<String>,
     pub auto_copy: bool,
+    pub auto_paste: bool,
     pub always_on_top: bool,
     pub engine_mode: String,
     pub local_engine: String,
@@ -26,6 +27,7 @@ pub struct AppSettings {
     pub model_idle_timeout_mins: u32,
     pub request_timeout_secs: u32,
     pub mini_record_mode: String,
+    pub shortcut_record_mode: String,
     pub provider_id: Option<String>,
     pub wizard_completed: bool,
 }
@@ -38,6 +40,7 @@ impl Default for AppSettings {
             model: "whisper-1".into(),
             language: None,
             auto_copy: true,
+            auto_paste: false,
             always_on_top: true,
             engine_mode: "local".into(),
             local_engine: "whisper_cpu".into(),
@@ -46,6 +49,7 @@ impl Default for AppSettings {
             model_idle_timeout_mins: 10,
             request_timeout_secs: 180,
             mini_record_mode: "new_note".into(),
+            shortcut_record_mode: "new_note".into(),
             provider_id: None,
             wizard_completed: false,
         }
@@ -263,6 +267,7 @@ impl Database {
             model: get_val("model").unwrap_or_else(|| "whisper-1".into()),
             language: get_val("language").filter(|s| !s.is_empty()),
             auto_copy: get_val("auto_copy").map(|v| v != "false" && v != "0").unwrap_or(true),
+            auto_paste: get_val("auto_paste").map(|v| v == "true" || v == "1").unwrap_or(false),
             always_on_top: get_val("always_on_top").map(|v| v != "false" && v != "0").unwrap_or(true),
             engine_mode: get_val("engine_mode").unwrap_or_else(|| "cloud".into()),
             local_engine: get_val("local_engine").unwrap_or_else(|| "whisper_cpu".into()),
@@ -271,6 +276,7 @@ impl Database {
             model_idle_timeout_mins: get_val("model_idle_timeout_mins").and_then(|v| v.parse().ok()).unwrap_or(10),
             request_timeout_secs: get_val("request_timeout_secs").and_then(|v| v.parse().ok()).unwrap_or(180).max(180),
             mini_record_mode: get_val("mini_record_mode").unwrap_or_else(|| "new_note".into()),
+            shortcut_record_mode: get_val("shortcut_record_mode").unwrap_or_else(|| "new_note".into()),
             provider_id: get_val("provider_id").filter(|s| !s.is_empty()),
             wizard_completed: get_val("wizard_completed").map(|v| v == "true" || v == "1").unwrap_or(false),
         })
@@ -291,6 +297,7 @@ impl Database {
         set_val("model", &settings.model).map_err(|e| e.to_string())?;
         set_val("language", settings.language.as_deref().unwrap_or("")).map_err(|e| e.to_string())?;
         set_val("auto_copy", if settings.auto_copy { "true" } else { "false" }).map_err(|e| e.to_string())?;
+        set_val("auto_paste", if settings.auto_paste { "true" } else { "false" }).map_err(|e| e.to_string())?;
         set_val("always_on_top", if settings.always_on_top { "true" } else { "false" }).map_err(|e| e.to_string())?;
         set_val("engine_mode", &settings.engine_mode).map_err(|e| e.to_string())?;
         set_val("local_engine", &settings.local_engine).map_err(|e| e.to_string())?;
@@ -299,6 +306,7 @@ impl Database {
         set_val("model_idle_timeout_mins", &settings.model_idle_timeout_mins.to_string()).map_err(|e| e.to_string())?;
         set_val("request_timeout_secs", &settings.request_timeout_secs.max(180).to_string()).map_err(|e| e.to_string())?;
         set_val("mini_record_mode", &settings.mini_record_mode).map_err(|e| e.to_string())?;
+        set_val("shortcut_record_mode", &settings.shortcut_record_mode).map_err(|e| e.to_string())?;
         set_val("provider_id", settings.provider_id.as_deref().unwrap_or("")).map_err(|e| e.to_string())?;
         set_val("wizard_completed", if settings.wizard_completed { "true" } else { "false" }).map_err(|e| e.to_string())?;
         Ok(())
@@ -494,6 +502,7 @@ mod tests {
         let default_settings = db.get_settings().unwrap();
         assert_eq!(default_settings.api_base_url, "https://api.openai.com/v1");
         assert_eq!(default_settings.auto_copy, true);
+        assert_eq!(default_settings.auto_paste, false);
         assert_eq!(default_settings.always_on_top, true);
         assert_eq!(default_settings.engine_mode, "cloud");
         assert_eq!(default_settings.local_engine, "whisper_cpu");
@@ -501,6 +510,7 @@ mod tests {
         assert_eq!(default_settings.models_folder, "");
         assert_eq!(default_settings.model_idle_timeout_mins, 10);
         assert_eq!(default_settings.mini_record_mode, "new_note");
+        assert_eq!(default_settings.shortcut_record_mode, "new_note");
 
         let new_settings = AppSettings {
             api_base_url: "https://api.groq.com/openai/v1".into(),
@@ -508,6 +518,7 @@ mod tests {
             model: "whisper-large-v3".into(),
             language: Some("en".into()),
             auto_copy: false,
+            auto_paste: true,
             always_on_top: false,
             engine_mode: "local".into(),
             local_engine: "whisper_vulkan".into(),
@@ -516,6 +527,7 @@ mod tests {
             model_idle_timeout_mins: 5,
             request_timeout_secs: 240,
             mini_record_mode: "append".into(),
+            shortcut_record_mode: "append".into(),
             provider_id: Some("GROQ_DEFAULT".into()),
             wizard_completed: true,
         };
@@ -526,6 +538,7 @@ mod tests {
         assert_eq!(loaded.model, "whisper-large-v3");
         assert_eq!(loaded.language, Some("en".into()));
         assert_eq!(loaded.auto_copy, false);
+        assert_eq!(loaded.auto_paste, true);
         assert_eq!(loaded.always_on_top, false);
         assert_eq!(loaded.engine_mode, "local");
         assert_eq!(loaded.local_engine, "whisper_vulkan");
@@ -534,6 +547,7 @@ mod tests {
         assert_eq!(loaded.model_idle_timeout_mins, 5);
         assert_eq!(loaded.request_timeout_secs, 240);
         assert_eq!(loaded.mini_record_mode, "append");
+        assert_eq!(loaded.shortcut_record_mode, "append");
         assert_eq!(loaded.provider_id, Some("GROQ_DEFAULT".into()));
         assert_eq!(loaded.wizard_completed, true);
     }
