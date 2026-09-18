@@ -1,3 +1,4 @@
+mod agents;
 mod audio;
 mod db;
 mod engine;
@@ -50,6 +51,7 @@ pub struct AppState {
     db: Arc<Database>,
     audio: Arc<AudioRecorder>,
     supervisor: Arc<engine::ModelSupervisor>,
+    agent_runner: Arc<agents::AgentRunner>,
     app_data_dir: std::path::PathBuf,
     is_mini: std::sync::atomic::AtomicBool,
 }
@@ -714,6 +716,72 @@ async fn test_and_fetch_models(base_url: String, api_key: String) -> Result<Vec<
     llm::fetch_models(&base_url, &api_key).await
 }
 
+#[tauri::command]
+fn get_agent_config(state: tauri::State<'_, AppState>) -> agents::AgentConfig {
+    let raw = state.db.get_kv("agent_config").ok().flatten();
+    agents::parse_config(raw.as_deref())
+}
+
+#[tauri::command]
+fn save_agent_config(
+    state: tauri::State<'_, AppState>,
+    config: agents::AgentConfig,
+) -> Result<(), String> {
+    let json = agents::serialize_config(&config)?;
+    state.db.set_kv("agent_config", &json)
+}
+
+#[tauri::command]
+fn scan_agents(state: tauri::State<'_, AppState>) -> Vec<agents::AgentScanItem> {
+    let raw = state.db.get_kv("agent_config").ok().flatten();
+    let config = agents::parse_config(raw.as_deref());
+    agents::scan_agents(&config)
+}
+
+#[tauri::command]
+async fn dispatch_agent(
+    state: tauri::State<'_, AppState>,
+    agent_id: String,
+    prompt: String,
+    workspace: Option<String>,
+    continue_session: Option<bool>,
+    model: Option<String>,
+) -> Result<agents::AgentRunResult, String> {
+    let runner = state.agent_runner.clone();
+    let raw = state.db.get_kv("agent_config").ok().flatten();
+    let config = agents::parse_config(raw.as_deref());
+    tauri::async_runtime::spawn_blocking(move || {
+        agents::dispatch_blocking(
+            &runner,
+            &config,
+            &agent_id,
+            &prompt,
+            workspace.as_deref(),
+            continue_session,
+            model.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn list_agent_models(
+    state: tauri::State<'_, AppState>,
+    agent_id: String,
+) -> Result<Vec<String>, String> {
+    let raw = state.db.get_kv("agent_config").ok().flatten();
+    let config = agents::parse_config(raw.as_deref());
+    tauri::async_runtime::spawn_blocking(move || agents::list_models_blocking(&config, &agent_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn cancel_agent_run(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    agents::cancel_run(&state.agent_runner)
+}
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -857,6 +925,7 @@ pub fn run() {
                 db: db_arc,
                 audio: Arc::new(AudioRecorder::new()),
                 supervisor: supervisor_arc,
+                agent_runner: Arc::new(agents::AgentRunner::new()),
                 app_data_dir,
                 is_mini: std::sync::atomic::AtomicBool::new(false),
             });
@@ -915,7 +984,13 @@ pub fn run() {
             clear_cf_usage_logs,
             get_system_specs,
             check_system_prerequisites,
-            test_and_fetch_models
+            test_and_fetch_models,
+            get_agent_config,
+            save_agent_config,
+            scan_agents,
+            dispatch_agent,
+            list_agent_models,
+            cancel_agent_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

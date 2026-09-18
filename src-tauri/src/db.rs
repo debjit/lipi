@@ -304,6 +304,28 @@ impl Database {
         Ok(())
     }
 
+    pub fn get_kv(&self, key: &str) -> Result<Option<String>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT value FROM settings WHERE key = ?1")
+            .map_err(|e| e.to_string())?;
+        match stmt.query_row(params![key], |r| r.get(0)) {
+            Ok(val) => Ok(Some(val)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    pub fn set_kv(&self, key: &str, value: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn get_window_state(&self) -> Option<WindowState> {
         let conn = self.conn.lock().ok()?;
         let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = 'window_state'").ok()?;
@@ -490,6 +512,10 @@ mod tests {
         db.delete_note(note.id).unwrap();
         let empty_notes = db.get_notes().unwrap();
         assert_eq!(empty_notes.len(), 0);
+
+        assert!(db.get_kv("agent_config").unwrap().is_none());
+        db.set_kv("agent_config", r#"{"enabled":true}"#).unwrap();
+        assert_eq!(db.get_kv("agent_config").unwrap().as_deref(), Some(r#"{"enabled":true}"#));
 
         let default_settings = db.get_settings().unwrap();
         assert_eq!(default_settings.api_base_url, "https://api.openai.com/v1");

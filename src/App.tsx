@@ -5,6 +5,18 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 import "./App.css";
 import { SetupWizard } from "./SetupWizard";
+import { AgentsSettings } from "./AgentsSettings";
+import {
+  AGENT_LABELS,
+  AgentConfig,
+  AgentId,
+  AgentOverride,
+  AgentRunResult,
+  AgentScanItem,
+  AgentUiState,
+  defaultAgentUi,
+  mergeAgentConfig,
+} from "./agentTypes";
 
 interface Note {
   id: number;
@@ -198,6 +210,8 @@ interface LogEntry {
   details?: string;
 }
 
+type SettingsTab = "providers" | "asr" | "llm" | "agents" | "preferences" | "logs";
+
 function isFullScreenMode(): boolean {
   if (typeof window === "undefined" || !window.screen) return false;
   if (window.screen.availWidth < 1200) return false;
@@ -230,6 +244,7 @@ export default function App() {
   const [isPreloading, setIsPreloading] = useState(false);
   const [isFreeingRam, setIsFreeingRam] = useState(false);
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [agentUi, setAgentUi] = useState<AgentUiState>(() => defaultAgentUi());
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [confirmModal, setConfirmModal] = useState<{
     title: string;
@@ -333,6 +348,9 @@ export default function App() {
   const llmSettingsRef = useRef(llmSettings);
   llmSettingsRef.current = llmSettings;
 
+  const agentUiRef = useRef(agentUi);
+  agentUiRef.current = agentUi;
+
   const [editingPresetId, setEditingPresetId] = useState<string | null>(null);
   const [isAddingPreset, setIsAddingPreset] = useState<boolean>(false);
   const [presetForm, setPresetForm] = useState<{ id: string; label: string; prompt: string }>({
@@ -404,7 +422,7 @@ export default function App() {
     showToast("✓ Diagnostic logs copied!");
   };
 
-  const [settingsNavTab, setSettingsNavTab] = useState<"providers" | "asr" | "llm" | "preferences" | "logs">("providers");
+  const [settingsNavTab, setSettingsNavTab] = useState<SettingsTab>("providers");
 
   const [cfUsage, setCfUsage] = useState<CloudflareUsageSummary | null>(null);
   const [loadingCfUsage, setLoadingCfUsage] = useState<boolean>(false);
@@ -814,6 +832,206 @@ export default function App() {
     }
   }
 
+  async function loadAgentConfig() {
+    try {
+      const cfg: AgentConfig = await invoke("get_agent_config");
+      const merged = mergeAgentConfig(cfg);
+      const next: AgentUiState = {
+        ...agentUiRef.current,
+        config: merged,
+        selected: merged.default_agent || agentUiRef.current.selected,
+      };
+      agentUiRef.current = next;
+      setAgentUi(next);
+    } catch (e) {
+      console.error("Failed loading agent config:", e);
+    }
+  }
+
+  async function updateAndSaveAgentConfig(patch: Partial<AgentConfig>) {
+    const config = mergeAgentConfig({ ...agentUiRef.current.config, ...patch });
+    const next: AgentUiState = {
+      ...agentUiRef.current,
+      config,
+      selected: patch.default_agent || agentUiRef.current.selected,
+    };
+    agentUiRef.current = next;
+    setAgentUi(next);
+    try {
+      await invoke("save_agent_config", { config });
+    } catch (e) {
+      console.error("Failed saving agent config:", e);
+      setErrorMsg(String(e));
+    }
+  }
+
+  async function refreshAgentScan() {
+    const nextScan: AgentUiState = { ...agentUiRef.current, scanning: true };
+    agentUiRef.current = nextScan;
+    setAgentUi(nextScan);
+    try {
+      const items: AgentScanItem[] = await invoke("scan_agents");
+      const current = agentUiRef.current;
+      let selected = current.selected;
+      if (!items.find((i) => i.id === selected && i.found)) {
+        const first = items.find((i) => i.found);
+        if (first) selected = first.id;
+      }
+      const next: AgentUiState = { ...current, scan: items, scanning: false, selected };
+      agentUiRef.current = next;
+      setAgentUi(next);
+    } catch (e) {
+      console.error("Failed scanning agents:", e);
+      const next: AgentUiState = { ...agentUiRef.current, scanning: false };
+      agentUiRef.current = next;
+      setAgentUi(next);
+    }
+  }
+
+  function patchAgentOverride(id: AgentId, patch: Partial<AgentOverride>) {
+    const current = agentUiRef.current.config[id];
+    updateAndSaveAgentConfig({ [id]: { ...current, ...patch } } as Partial<AgentConfig>);
+  }
+
+  async function handleFetchAgentModels(id: AgentId) {
+    const fetching: AgentUiState = { ...agentUiRef.current, fetchingModels: id };
+    agentUiRef.current = fetching;
+    setAgentUi(fetching);
+    try {
+      const models: string[] = await invoke("list_agent_models", { agentId: id });
+      const next: AgentUiState = {
+        ...agentUiRef.current,
+        fetchingModels: null,
+        models: { ...agentUiRef.current.models, [id]: models },
+      };
+      agentUiRef.current = next;
+      setAgentUi(next);
+      showToast(`✓ Loaded ${models.length} ${AGENT_LABELS[id]} models`);
+    } catch (err: any) {
+      const next: AgentUiState = { ...agentUiRef.current, fetchingModels: null };
+      agentUiRef.current = next;
+      setAgentUi(next);
+      showToast(String(err));
+    }
+  }
+
+  async function handlePickAgentWorkspace(): Promise<string | null> {
+    try {
+      const path = await invoke<string | null>("pick_directory");
+      return path || null;
+    } catch (e) {
+      setErrorMsg(String(e));
+      return null;
+    }
+  }
+
+  async function handleDispatchAgent(textOverride?: string, polishFirst = false) {
+    const cfg = agentUiRef.current.config;
+
+    let prompt = (textOverride !== undefined ? textOverride : rawTranscriptRef.current).trim();
+    if (!prompt) prompt = content.trim();
+    if (!prompt) {
+      showToast("No transcript to send. Speak or type first.");
+      return;
+    }
+
+    if (polishFirst) {
+      if (!llmSettingsRef.current.enabled) {
+        showToast("Enable LLM Transform in settings to polish before send.");
+        return;
+      }
+      try {
+        const res: OperationResult = await invoke("transform_with_llm", {
+          text: prompt,
+          providerId: llmSettingsRef.current.active_provider_id,
+          model: llmSettingsRef.current.model,
+          preset: llmSettingsRef.current.voice_preset,
+          customPrompt: llmSettingsRef.current.custom_prompt || undefined,
+        });
+        const transformed = (res && typeof res === "object" ? res.text : String(res || "")).trim();
+        if (transformed) {
+          prompt = transformed;
+          setLlmResult(transformed);
+        }
+      } catch (err: any) {
+        setErrorMsg(String(err));
+        return;
+      }
+    }
+
+    const agentId = agentUiRef.current.selected || cfg.default_agent;
+    const running: AgentUiState = {
+      ...agentUiRef.current,
+      status: "running",
+      output: "",
+    };
+    agentUiRef.current = running;
+    setAgentUi(running);
+    try {
+      const res: AgentRunResult = await invoke("dispatch_agent", {
+        agentId,
+        prompt,
+        workspace: cfg.workspace_dir.trim() || null,
+        continueSession: cfg.continue_last_session,
+        model: cfg[agentId].model || null,
+      });
+      const done: AgentUiState = {
+        ...agentUiRef.current,
+        status: (res.status as AgentUiState["status"]) || "done",
+        output: res.output || res.status,
+      };
+      agentUiRef.current = done;
+      setAgentUi(done);
+      addLog({
+        level: res.status === "done" ? "success" : res.status === "cancelled" ? "info" : "error",
+        title: `Agent ${res.status}`,
+        engine: AGENT_LABELS[agentId],
+        model: agentId,
+        message: res.status,
+        details: res.output?.slice(0, 2000) || prompt.slice(0, 500),
+      });
+      if (res.status === "done") {
+        showToast(`✓ ${AGENT_LABELS[agentId]} finished`);
+      } else if (res.status !== "cancelled") {
+        setErrorMsg(res.output || res.status);
+      }
+    } catch (err: any) {
+      const errStr = String(err);
+      const failed: AgentUiState = { ...agentUiRef.current, status: "failed", output: errStr };
+      agentUiRef.current = failed;
+      setAgentUi(failed);
+      setErrorMsg(errStr);
+      addLog({
+        level: "error",
+        title: "Agent dispatch failed",
+        engine: AGENT_LABELS[agentId],
+        model: agentId,
+        message: errStr,
+      });
+    }
+  }
+
+  async function handleCancelAgent() {
+    try {
+      await invoke("cancel_agent_run");
+      const next: AgentUiState = { ...agentUiRef.current, status: "cancelled" };
+      agentUiRef.current = next;
+      setAgentUi(next);
+    } catch (e) {
+      showToast(String(e));
+    }
+  }
+
+  async function maybeDispatchAfterTranscript(transcript: string) {
+    const cfg = agentUiRef.current.config;
+    if (!cfg.enabled || cfg.destination !== "agent") return;
+    if (cfg.review_before_send) {
+      showToast("Review the transcript, then send to your agent");
+      return;
+    }
+    await handleDispatchAgent(transcript);
+  }
+
   function handleSelectOrUpdateModel(newModel: string) {
     const activeId = llmSettingsRef.current.active_provider_id;
     const trimmed = newModel.trim();
@@ -1153,6 +1371,8 @@ export default function App() {
       await refreshModelStatus(s.local_engine, s.local_model_size);
       await refreshMemoryStatus();
       await loadLlmSettings();
+      await loadAgentConfig();
+      await refreshAgentScan();
 
       // Check first-run wizard
       if (!s.wizard_completed && !s.api_key && s.engine_mode !== "local") {
@@ -1207,10 +1427,12 @@ export default function App() {
     }
   }
 
-  function openSettings(tab: "providers" | "asr" | "llm" | "preferences" | "logs" = "asr") {
+  function openSettings(tab: SettingsTab = "asr") {
     setSettingsNavTab(tab);
     loadSettings();
     loadLlmSettings();
+    loadAgentConfig();
+    refreshAgentScan();
     loadCfUsage();
     refreshModelStatus();
     refreshMemoryStatus();
@@ -1341,6 +1563,7 @@ export default function App() {
                 showToast("✓ Transcribed to raw buffer!");
               }
             }
+            await maybeDispatchAfterTranscript(nextRaw);
           } else {
             // Standard scratchpad behavior or fresh item
             let nextContent: string;
@@ -1376,6 +1599,7 @@ export default function App() {
             } else {
               showToast("✓ Transcribed!");
             }
+            await maybeDispatchAfterTranscript(nextContent);
           }
         }
       } catch (err: any) {
@@ -1570,6 +1794,7 @@ export default function App() {
       await invoke("save_settings", { settings });
       settingsRef.current = settings;
       await invoke("save_llm_config", { config: llmSettingsRef.current });
+      await invoke("save_agent_config", { config: agentUiRef.current.config });
       showToast("✓ Settings saved!");
       setActiveView("notes");
     } catch (err: any) {
@@ -1586,6 +1811,15 @@ export default function App() {
   };
 
   const wordCount = content.trim() ? content.trim().split(/\s+/).length : 0;
+  const agentDestination = agentUi.config.enabled && agentUi.config.destination === "agent";
+
+  function switchDestination(dest: "notes" | "agent") {
+    if (dest === "agent") {
+      updateAndSaveAgentConfig({ enabled: true, destination: "agent" });
+      return;
+    }
+    updateAndSaveAgentConfig({ destination: "notes" });
+  }
 
   function handleDrag(e: React.MouseEvent) {
     if (e.buttons === 1) {
@@ -1632,6 +1866,18 @@ export default function App() {
           }
         >
           {isRecording ? "■" : isTranscribing ? "…" : copiedNotification ? "✓" : "●"}
+        </button>
+
+        <button
+          className={`btn-mini-float ${agentDestination ? "pinned" : ""}`}
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            switchDestination(agentDestination ? "notes" : "agent");
+          }}
+          title={agentDestination ? "Destination: Agent (click for Notes)" : "Destination: Notes (click for Agent)"}
+        >
+          {agentDestination ? "A" : "N"}
         </button>
 
         {isRecording && (
@@ -1784,18 +2030,31 @@ export default function App() {
                 <span className="settings-nav-icon">🎙</span>
                 <span className="settings-nav-label">Audio / ASR</span>
               </button>
-              <button
-                type="button"
-                className={`settings-nav-tab ${settingsNavTab === "llm" ? "active" : ""}`}
-                onClick={() => {
-                  setSettingsNavTab("llm");
-                  loadLlmSettings();
-                }}
-              >
-                <span className="settings-nav-icon">🤖</span>
-                <span className="settings-nav-label">LLM Transform</span>
-                {llmSettings.enabled && <span className="settings-badge-on">ON</span>}
-              </button>
+                <button
+                  type="button"
+                  className={`settings-nav-tab ${settingsNavTab === "llm" ? "active" : ""}`}
+                  onClick={() => {
+                    setSettingsNavTab("llm");
+                    loadLlmSettings();
+                  }}
+                >
+                  <span className="settings-nav-icon">🤖</span>
+                  <span className="settings-nav-label">LLM Transform</span>
+                  {llmSettings.enabled && <span className="settings-badge-on">ON</span>}
+                </button>
+                <button
+                  type="button"
+                  className={`settings-nav-tab ${settingsNavTab === "agents" ? "active" : ""}`}
+                  onClick={() => {
+                    setSettingsNavTab("agents");
+                    loadAgentConfig();
+                    refreshAgentScan();
+                  }}
+                >
+                  <span className="settings-nav-icon">🛰️</span>
+                  <span className="settings-nav-label">Agents</span>
+                  {agentUi.config.enabled && <span className="settings-badge-on">ON</span>}
+                </button>
               <button
                 type="button"
                 className={`settings-nav-tab ${settingsNavTab === "preferences" ? "active" : ""}`}
@@ -3486,6 +3745,20 @@ export default function App() {
             </>
           )}
 
+            {settingsNavTab === "agents" && (
+              <AgentsSettings
+                config={agentUi.config}
+                scan={agentUi.scan}
+                isScanning={agentUi.scanning}
+                models={agentUi.models}
+                fetchingModels={agentUi.fetchingModels}
+                onSave={updateAndSaveAgentConfig}
+                onRefreshScan={refreshAgentScan}
+                onPickWorkspace={handlePickAgentWorkspace}
+                onFetchModels={handleFetchAgentModels}
+              />
+            )}
+
             {/* Section 3: General Audio & Transcription Preferences */}
             {settingsNavTab === "preferences" && (
               <div className="settings-section-card">
@@ -4124,9 +4397,136 @@ export default function App() {
             </div>
           )}
 
+          {agentDestination && (
+            <div className="agent-dispatch-block">
+              <div className="agent-dispatch-controls">
+                <select
+                  className="form-select strip-select"
+                  value={agentUi.selected}
+                  onChange={(e) => {
+                    const selected = e.target.value as AgentId;
+                    const next = { ...agentUiRef.current, selected };
+                    agentUiRef.current = next;
+                    setAgentUi(next);
+                  }}
+                >
+                  {(agentUi.scan.length
+                    ? agentUi.scan
+                    : (Object.keys(AGENT_LABELS) as AgentId[]).map((id) => ({
+                        id,
+                        name: AGENT_LABELS[id],
+                        found: false,
+                        path: null,
+                        docs_url: "",
+                        enabled: true,
+                      }))
+                  ).map((item) => (
+                    <option key={item.id} value={item.id} disabled={!item.found || !agentUi.config[item.id].enabled}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+                {(() => {
+                  const selectedId = agentUi.selected;
+                  const selectedModel = agentUi.config[selectedId]?.model || "";
+                  const fetched = agentUi.models[selectedId] || [];
+                  const options = fetched.includes(selectedModel) || !selectedModel
+                    ? fetched
+                    : [selectedModel, ...fetched];
+                  return (
+                    <>
+                      {options.length > 0 ? (
+                        <select
+                          className="form-select strip-select"
+                          value={selectedModel}
+                          title="Model for this agent. Empty uses the CLI default."
+                          onChange={(e) => patchAgentOverride(selectedId, { model: e.target.value })}
+                        >
+                          <option value="">CLI default</option>
+                          {options.map((m) => (
+                            <option key={m} value={m}>
+                              {m}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          className="form-input strip-select"
+                          style={{ minWidth: 140, fontSize: 12 }}
+                          placeholder="Model (optional)"
+                          value={selectedModel}
+                          onChange={(e) => patchAgentOverride(selectedId, { model: e.target.value })}
+                          title="Type a model id, or fetch the list from the CLI"
+                        />
+                      )}
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        disabled={agentUi.fetchingModels === selectedId}
+                        onClick={() => handleFetchAgentModels(selectedId)}
+                        title="Ask the installed CLI for models it can run"
+                      >
+                        {agentUi.fetchingModels === selectedId ? "Fetching…" : "Fetch models"}
+                      </button>
+                    </>
+                  );
+                })()}
+                {agentUi.status === "running" ? (
+                  <button type="button" className="btn btn-secondary" onClick={handleCancelAgent}>
+                    Stop
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      disabled={!rawTranscript.trim() && !content.trim()}
+                      onClick={() => handleDispatchAgent()}
+                    >
+                      Send to {AGENT_LABELS[agentUi.selected]}
+                    </button>
+                    {llmSettings.enabled && (
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        disabled={isTransforming || !rawTranscript.trim()}
+                        onClick={() => handleDispatchAgent(undefined, true)}
+                      >
+                        Polish & send
+                      </button>
+                    )}
+                  </>
+                )}
+                <span className="form-hint">{agentUi.status === "idle" ? "" : agentUi.status}</span>
+              </div>
+              <textarea
+                className="agent-output-textarea"
+                readOnly
+                placeholder="Agent CLI output appears here after send."
+                value={agentUi.output}
+              />
+            </div>
+          )}
+
           {/* Bottom Floating Control Dock */}
           <footer className="bottom-bar">
             <div className="bottom-left">
+              <div className="destination-toggle" title="Notes keep dictation. Agent sends reviewed text to an installed CLI.">
+                <button
+                  type="button"
+                  className={`dest-pill ${!agentDestination ? "active" : ""}`}
+                  onClick={() => switchDestination("notes")}
+                >
+                  Notes
+                </button>
+                <button
+                  type="button"
+                  className={`dest-pill ${agentDestination ? "active" : ""}`}
+                  onClick={() => switchDestination("agent")}
+                >
+                  Agent
+                </button>
+              </div>
               <button
                 className="btn btn-secondary"
                 onClick={handleNewNote}

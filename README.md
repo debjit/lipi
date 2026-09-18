@@ -94,9 +94,22 @@ Lipi is a lightweight, local-first desktop speech-to-text and voice note applica
 
 ---
 
+## Agent dispatch (optional)
+
+Lipi transcribes on this machine, then runs an installed coding CLI with that text. Put the binary on PATH (or set a custom path). Lipi does not install agents.
+
+- **Hermes** (`hermes chat -q`, optional `--model`)
+- **OpenCode** (`opencode run`, optional `--model`)
+- **Agy / Antigravity** (`agy -p`, optional `--model`)
+- **Cursor CLI** (`cursor-agent -p`, optional `--model` / `--force`)
+
+Settings → Agents, or the Notes / Agent toggle on the record bar. Fetch models from the CLI when it can list them; otherwise type a model id. Empty keeps the CLI default. Config is stored in SQLite with the rest of Lipi settings.
+
+---
+
 ## ⚙️ Settings & Configuration
 
-Lipi provides a modular full-page Settings dashboard organized into four tabs:
+Lipi provides a modular full-page Settings dashboard:
 
 ### 1. 🎙 ASR (Automatic Speech Recognition)
 - **Engine Mode**:
@@ -125,12 +138,18 @@ Lipi provides a modular full-page Settings dashboard organized into four tabs:
 - **Request Timeout**:
   - Shared timeout limit ensuring LLMs have adequate time for large generation tasks.
 
-### 3. ⚙ Preferences
+### 3. Agents
+- Detect Hermes, OpenCode, Agy, and Cursor CLI on PATH (or a custom binary path).
+- Fetch that CLI's model list when available, then select one (or leave empty for the CLI default).
+- Workspace folder, review-before-send, optional Cursor `--force` / OpenCode `--auto`.
+- Config is stored in SQLite (`settings.agent_config`). Install docs open in the browser.
+
+### 4. ⚙ Preferences
 - **Language Code**: Optional ISO-639-1 code (e.g., `en`, `bn`, `es`, `hi`) or empty for auto-detection.
 - **Auto-Copy to Clipboard**: Copy transcript immediately upon recording completion.
 - **Always on Top**: Keep the window floating above all desktop applications.
 
-### 4. 📋 Diagnostic Logs
+### 5. 📋 Diagnostic Logs
 - Real-time log history of transcription attempts, backend errors, endpoints, and models.
 - One-click `📋 Copy All Logs` to generate a formatted diagnostic report for troubleshooting.
 
@@ -142,10 +161,13 @@ Lipi provides a modular full-page Settings dashboard organized into four tabs:
 lipi/
 ├── src/                      # React frontend (Vite + TypeScript)
 │   ├── App.tsx               # Main UI, dual editor, settings tabs, shortcuts
+│   ├── AgentsSettings.tsx    # Settings → Agents panel
+│   ├── agentTypes.ts         # Agent config types
 │   ├── App.css               # Responsive styling, mini wizard, settings themes
 │   └── main.tsx              # React root entry
 ├── src-tauri/                # Tauri Rust application
 │   ├── src/
+│   │   ├── agents.rs         # Detect and dispatch coding agent CLIs
 │   │   ├── audio.rs          # CPAL audio recording & linear resampling
 │   │   ├── db.rs             # SQLite storage (notes, app settings, window state)
 │   │   ├── engine.rs         # Local Whisper runner & RAM supervisor
