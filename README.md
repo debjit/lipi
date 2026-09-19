@@ -2,6 +2,17 @@
 
 > **Lipi** (*"script"* or *"writing"* in Bengali) is a fast, lightweight, local-first desktop voice dictation and AI assistant.
 
+### 📥 Download Pre-Release
+
+Get pre-compiled binaries for your OS from **[Latest GitHub Releases](https://github.com/debjit/lipi/releases)**:
+
+| Platform | Package Formats | Download |
+| :--- | :--- | :--- |
+| 🪟 **Windows** | `.msi`, `setup.exe` (NSIS) | **[Windows Binaries ➔](https://github.com/debjit/lipi/releases)** |
+| 🐧 **Linux** | `.deb`, `.AppImage` (x86_64) | **[Linux Binaries ➔](https://github.com/debjit/lipi/releases)** |
+
+---
+
 Press **`Alt + R`** anywhere to speak. Lipi transcribes your voice—either 100% offline with local Whisper or via high-speed cloud AI—optionally cleans up grammar or reformats with LLMs, and automatically pastes the result directly into your active window (VSCode, Cursor, browser, terminal).
 
 ---
@@ -45,7 +56,7 @@ Press **`Alt + R`** anywhere to speak. Lipi transcribes your voice—either 100%
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/<your-username>/lipi.git
+   git clone https://github.com/debjit/lipi.git
    cd lipi
    ```
 
