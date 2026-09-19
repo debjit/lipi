@@ -60,10 +60,11 @@ pub struct AppState {
 #[tauri::command]
 fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let settings = state.db.get_settings().unwrap_or_default();
+    let is_mini = state.is_mini.load(std::sync::atomic::Ordering::SeqCst);
     if settings.auto_paste {
-        let target = paste::capture_paste_target();
+        let target = paste::capture_paste_target(is_mini);
         if let Ok(mut guard) = state.paste_target.lock() {
-            *guard = Some(target);
+            *guard = if target.has_target() { Some(target) } else { None };
         }
     } else if let Ok(mut guard) = state.paste_target.lock() {
         *guard = None;
@@ -79,18 +80,27 @@ async fn paste_into_previous_app(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     text: String,
-) -> Result<(), String> {
-    if !state.is_mini.load(std::sync::atomic::Ordering::SeqCst) {
-        if let Some(w) = app.get_webview_window("main") {
-            let _ = w.minimize();
-        }
-    }
+) -> Result<bool, String> {
     let target = if let Ok(guard) = state.paste_target.lock() {
         guard.clone()
     } else {
         None
     };
-    paste::paste_into_previous_app(target, &text)
+
+    let has_target = target.as_ref().map(|t| t.has_target()).unwrap_or(false);
+    if !has_target {
+        // No external target: user was inside Lipi window, keep in Lipi editor!
+        return Ok(false);
+    }
+
+    if !state.is_mini.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.minimize();
+        }
+    }
+
+    paste::paste_into_previous_app(target, &text)?;
+    Ok(true)
 }
 
 #[tauri::command]

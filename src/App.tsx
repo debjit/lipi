@@ -480,6 +480,7 @@ export default function App() {
 
   const isGlobalShortcutActiveRef = useRef(false);
   const isShortcutRecordingRef = useRef(false);
+  const wasLipiFocusedOnRecordRef = useRef(false);
   const lastToggleTimeRef = useRef(0);
 
   useEffect(() => {
@@ -1280,6 +1281,7 @@ export default function App() {
     setErrorMsg(null);
 
     if (!isRecordingRef.current) {
+      wasLipiFocusedOnRecordRef.current = document.hasFocus() && !miniModeRef.current;
       if (source === "shortcut") {
         isShortcutRecordingRef.current = true;
         if (settingsRef.current.shortcut_record_mode !== "append") {
@@ -1421,6 +1423,7 @@ export default function App() {
       } finally {
         setIsTranscribing(false);
         isShortcutRecordingRef.current = false;
+        wasLipiFocusedOnRecordRef.current = false;
         refreshMemoryStatus();
       }
     }
@@ -1595,10 +1598,28 @@ export default function App() {
 
   async function deliverTranscript(text: string, defaultToast?: string) {
     if (!text) return;
+    if (wasLipiFocusedOnRecordRef.current) {
+      // User was working inside Lipi's editor: keep text in Lipi editor, do not paste externally
+      if (settingsRef.current.auto_copy) {
+        await copyText(text);
+      } else if (defaultToast) {
+        showToast(defaultToast);
+      }
+      return;
+    }
+
     if (settingsRef.current.auto_paste) {
       try {
-        await invoke("paste_into_previous_app", { text });
-        showToast("✓ Pasted into previous app!");
+        const pasted = await invoke<boolean>("paste_into_previous_app", { text });
+        if (pasted) {
+          showToast("✓ Pasted into previous app!");
+        } else {
+          if (settingsRef.current.auto_copy) {
+            await copyText(text);
+          } else if (defaultToast) {
+            showToast(defaultToast);
+          }
+        }
       } catch (err: any) {
         console.warn("Auto-paste failed, falling back to copy:", err);
         await copyText(text);

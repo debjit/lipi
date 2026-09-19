@@ -9,20 +9,36 @@ pub struct PasteTarget {
     pub hwnd: Option<isize>,
 }
 
-/// Snapshot the currently focused window, skipping Lipi's own window if focused.
-pub fn capture_paste_target() -> PasteTarget {
+impl PasteTarget {
+    pub fn has_target(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.x11_window.is_some() {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        if self.hwnd.is_some() {
+            return true;
+        }
+        false
+    }
+}
+
+/// Snapshot the currently focused window.
+/// If Lipi's main window is active (allow_fallback = false), returns no target so dictation stays in Lipi editor.
+/// If Lipi is in mini floating widget mode (allow_fallback = true), falls back to the window right underneath.
+pub fn capture_paste_target(allow_fallback: bool) -> PasteTarget {
     let mut target = PasteTarget::default();
 
     #[cfg(target_os = "linux")]
     {
-        if let Ok(win) = capture_x11_target() {
+        if let Ok(win) = capture_x11_target(allow_fallback) {
             target.x11_window = Some(win);
         }
     }
 
     #[cfg(target_os = "windows")]
     {
-        if let Some(hwnd) = capture_windows_target() {
+        if let Some(hwnd) = capture_windows_target(allow_fallback) {
             target.hwnd = Some(hwnd);
         }
     }
@@ -31,7 +47,7 @@ pub fn capture_paste_target() -> PasteTarget {
 }
 
 #[cfg(target_os = "linux")]
-fn capture_x11_target() -> Result<u32, String> {
+fn capture_x11_target(allow_fallback: bool) -> Result<u32, String> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
 
@@ -61,7 +77,15 @@ fn capture_x11_target() -> Result<u32, String> {
             if let Some(win) = reply.value32().and_then(|mut v| v.next()) {
                 if win != 0 {
                     let win_pid = get_window_pid(&conn, win, net_wm_pid);
-                    if win_pid.map(|pid| pid != current_pid).unwrap_or(true) {
+                    if let Some(pid) = win_pid {
+                        if pid == current_pid {
+                            if !allow_fallback {
+                                return Err("Lipi is active window".into());
+                            }
+                        } else {
+                            return Ok(win);
+                        }
+                    } else {
                         return Ok(win);
                     }
                 }
@@ -69,7 +93,11 @@ fn capture_x11_target() -> Result<u32, String> {
         }
     }
 
-    // 2. Active window is Lipi itself or 0. Inspect stacking list and client list from top backwards.
+    if !allow_fallback {
+        return Err("No external active window found".into());
+    }
+
+    // 2. Active window is Lipi itself in mini widget mode. Inspect stacking list and client list from top backwards.
     for atom_name in [b"_NET_CLIENT_LIST_STACKING" as &[u8], b"_NET_CLIENT_LIST"] {
         if let Ok(atom_reply) = conn.intern_atom(false, atom_name).map(|c| c.reply()) {
             if let Ok(atom) = atom_reply {
@@ -118,7 +146,7 @@ fn get_window_pid<C: x11rb::connection::Connection>(
 }
 
 #[cfg(target_os = "windows")]
-fn capture_windows_target() -> Option<isize> {
+fn capture_windows_target(allow_fallback: bool) -> Option<isize> {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -128,11 +156,26 @@ fn capture_windows_target() -> Option<isize> {
     unsafe {
         let current_pid = GetCurrentProcessId();
         let mut foreground: HWND = GetForegroundWindow();
+        if foreground.is_null() {
+            return None;
+        }
 
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(foreground, &mut pid);
+        if pid != current_pid {
+            return Some(foreground as isize);
+        }
+
+        if !allow_fallback {
+            return None;
+        }
+
+        // Mini mode: search window underneath
+        foreground = GetWindow(foreground, GW_HWNDNEXT);
         while !foreground.is_null() {
-            let mut pid = 0u32;
-            GetWindowThreadProcessId(foreground, &mut pid);
-            if pid != current_pid {
+            let mut next_pid = 0u32;
+            GetWindowThreadProcessId(foreground, &mut next_pid);
+            if next_pid != current_pid {
                 return Some(foreground as isize);
             }
             foreground = GetWindow(foreground, GW_HWNDNEXT);
@@ -315,7 +358,8 @@ mod tests {
 
     #[test]
     fn test_capture_paste_target() {
-        let _ = capture_paste_target();
+        let _ = capture_paste_target(false);
+        let _ = capture_paste_target(true);
     }
 }
 
