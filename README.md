@@ -32,6 +32,13 @@ Lipi is a lightweight, local-first desktop speech-to-text and voice note applica
   - Automatic speech transformation, grammar rectification, summarization, and translation via OpenAI-compatible endpoints (Cloudflare Workers AI, Groq, OpenAI, Ollama, vLLM).
   - Open Markdown-based presets (`presets/*.md`) with frontmatter metadata and live editing.
   - Optional auto-mode: transcribes, transforms with LLM, and copies to clipboard in a single stroke.
+- 📋 **Auto-Paste to Previous Application (`Alt+R`)**:
+  - Restores your target application (VSCode, Cursor, browser, terminal) and automatically pastes the transcribed or AI-transformed text (`Ctrl+V`).
+  - System-wide **`Alt+R`** global shortcut allows starting and stopping dictation anywhere without leaving your working window.
+  - **Linux Note (GNOME Wayland)**: Modern Wayland compositors (e.g. GNOME Mutter) isolate synthetic key input between windows. When auto-paste triggers, GNOME prompts for **Remote Desktop / Screen Control** authorization; clicking **Allow** grants Lipi permission to send `Ctrl+V` into your target app. (Alternatively, setting up `ydotool` allows seamless background key injection without prompts).
+- 📝 **Independent Note on Alt+R (Configurable)**:
+  - Pressing `Alt+R` automatically creates a fresh note and clean transcription/conversion by default (matching the Mini Wizard behavior).
+  - Can be toggled to "Append to current active note" in Preferences.
 
 ---
 
@@ -128,7 +135,11 @@ Lipi provides a modular full-page Settings dashboard organized into four tabs:
 ### 3. ⚙ Preferences
 - **Language Code**: Optional ISO-639-1 code (e.g., `en`, `bn`, `es`, `hi`) or empty for auto-detection.
 - **Auto-Copy to Clipboard**: Copy transcript immediately upon recording completion.
+- **Auto-Paste to Previous Application**: Restore previous app window and send `Ctrl+V` after dictation/auto-transform.
 - **Always on Top**: Keep the window floating above all desktop applications.
+- **Start Lipi on System Startup**: Automatically launches Lipi upon desktop login.
+- **Alt+R Shortcut Recording Behavior**: Configure whether `Alt+R` creates an independent new note (default) or appends onto the active note.
+- **Mini Wizard Recording Behavior**: Configure whether finishing a recording in the Mini Wizard saves as a new note (default) or appends to the current note.
 
 ### 4. 📋 Diagnostic Logs
 - Real-time log history of transcription attempts, backend errors, endpoints, and models.
