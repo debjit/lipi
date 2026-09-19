@@ -1,37 +1,29 @@
 # Lipi (লিপি)
 
-> **Lipi** (লিপি) means *"script"* or *"writing"* in Bengali.
+> **Lipi** (*"script"* or *"writing"* in Bengali) is a fast, lightweight, local-first desktop voice dictation and AI assistant.
 
-Lipi is a lightweight, local-first desktop speech-to-text and voice note application. Built with **Tauri v2**, **Rust**, and **React 19**, it lets you record microphone audio, transcribe speech with either cloud AI providers or 100% offline local Whisper engines, and manage your notes seamlessly.
+### 📥 Download Pre-Release
+
+Get pre-compiled binaries for your OS from **[Latest GitHub Releases](https://github.com/debjit/lipi/releases)**:
+
+| Platform | Package Formats | Download |
+| :--- | :--- | :--- |
+| 🪟 **Windows** | `.msi`, `setup.exe` (NSIS) | **[Windows Binaries ➔](https://github.com/debjit/lipi/releases)** |
+| 🐧 **Linux** | `.deb`, `.AppImage` (x86_64) | **[Linux Binaries ➔](https://github.com/debjit/lipi/releases)** |
 
 ---
 
-## ✨ Features
+Press **`Alt + R`** anywhere to speak. Lipi transcribes your voice—either 100% offline with local Whisper or via high-speed cloud AI—optionally cleans up grammar or reformats with LLMs, and automatically pastes the result directly into your active window (VSCode, Cursor, browser, terminal).
 
-- 🎙️ **Dual ASR Architecture (Cloud API & 100% Offline Local)**:
-  - **Remote Providers**: One-click presets for **Groq** (`whisper-large-v3-turbo`), **Cloudflare Workers AI** (binary streaming & turbo JSON with Base64), **OpenAI**, and custom OpenAI-compatible endpoints (Ollama, LocalAI, vLLM).
-  - **Local Offline Engines**: Run speech recognition completely on-device without internet via `whisper-cli` (CPU), `faster-whisper` (isolated Python virtualenv), or Vulkan GPU acceleration.
-- 💾 **Model Weights & Custom Storage Management**:
-  - Stream model weights directly from Hugging Face with real-time download progress bars.
-  - Choose model sizes (`tiny`, `base`, `small`, etc.).
-  - Configurable storage folder: store heavy weights on external drives or USB SSDs to protect internal disk space.
-- ⚡ **In-Memory RAM Supervisor & Hardware Health**:
-  - Keeps local models warm in RAM between dictations to prevent latency and eliminate repetitive disk read wear on consumer drives.
-  - Configurable idle inactivity auto-unload timeout (2m, 5m, 10m, 30m, or Never) to free system memory when idle.
-  - Manual "Release RAM Now" controls and live RAM status tracking.
-- 🪟 **Mini Floating Mode & Window State Persistence**:
-  - Shrink Lipi into an unobtrusive, always-on-top floating pill widget for seamless dictation while multitasking (`Alt + M`).
-  - Automatically remembers and restores window coordinates `(x, y)`, dimensions, and maximized state across app sessions and mode transitions.
-- 📜 **Smart History Sidebar**:
-  - Distraction-free editing: History is hidden by default in compact/windowed mode and opens by default in full screen.
-  - Window resizing never interrupts workflow or auto-hides/shows the sidebar—toggle visibility anytime via the `☰` button.
-- ⏱️ **Extended & Custom Request Timeouts**:
-  - Robust 3-minute (180s) minimum timeout prevents premature connection drops during long audio processing.
-  - Configurable custom timeout in Settings (with 3m, 5m, 10m quick pills) applied across both ASR transcription and LLM transformations.
-- 🤖 **LLM Post-Processing & Voice Presets**:
-  - Automatic speech transformation, grammar rectification, summarization, and translation via OpenAI-compatible endpoints (Cloudflare Workers AI, Groq, OpenAI, Ollama, vLLM).
-  - Open Markdown-based presets (`presets/*.md`) with frontmatter metadata and live editing.
-  - Optional auto-mode: transcribes, transforms with LLM, and copies to clipboard in a single stroke.
+---
+
+## ⚡ Overview
+
+- 🎙️ **System-Wide Dictation (`Alt + R`)**: Speak from anywhere without leaving your working window. Lipi restores your target app and auto-pastes the text.
+- 🔒 **Offline or Cloud Speech-to-Text**: Run private Whisper models on CPU/GPU without internet, or connect fast cloud APIs (Groq, Cloudflare Workers AI, OpenAI).
+- 🤖 **Automated AI Polish**: Post-process speech on the fly—fix grammar, summarize, or reformat using local or remote LLMs.
+- 🪟 **Compact Floating Widget (`Alt + M`)**: Collapse Lipi into a minimalist, always-on-top pill widget that stays out of your way while multitasking.
+- 📝 **Local-First History**: Search and manage all previous dictations, notes, and AI transformations locally in SQLite.
 
 ---
 
@@ -64,7 +56,7 @@ Lipi is a lightweight, local-first desktop speech-to-text and voice note applica
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/<your-username>/lipi.git
+   git clone https://github.com/debjit/lipi.git
    cd lipi
    ```
 
@@ -128,11 +120,66 @@ Lipi provides a modular full-page Settings dashboard organized into four tabs:
 ### 3. ⚙ Preferences
 - **Language Code**: Optional ISO-639-1 code (e.g., `en`, `bn`, `es`, `hi`) or empty for auto-detection.
 - **Auto-Copy to Clipboard**: Copy transcript immediately upon recording completion.
+- **Auto-Paste to Previous Application**: Restore previous app window and send `Ctrl+V` after dictation/auto-transform.
 - **Always on Top**: Keep the window floating above all desktop applications.
+- **Start Lipi on System Startup**: Automatically launches Lipi upon desktop login.
+- **Alt+R Shortcut Recording Behavior**: Configure whether `Alt+R` creates an independent new note (default) or appends onto the active note.
+- **Mini Wizard Recording Behavior**: Configure whether finishing a recording in the Mini Wizard saves as a new note (default) or appends to the current note.
 
 ### 4. 📋 Diagnostic Logs
 - Real-time log history of transcription attempts, backend errors, endpoints, and models.
 - One-click `📋 Copy All Logs` to generate a formatted diagnostic report for troubleshooting.
+
+---
+
+## 💡 How-To & FAQ
+
+### How does Auto-Paste work?
+
+1. Open **Settings > Preferences** (or the ⚙ menu) and enable **"Paste into previous application"**.
+2. Work in your favorite app (VSCode, Cursor, browser, Slack, terminal).
+3. Press **`Alt + R`** from anywhere to start recording.
+4. Speak, then press **`Alt + R`** again to stop.
+5. Lipi transcribes (and optionally applies your active AI prompt), restores your target app, and types `Ctrl+V` directly into your editor.
+
+> [!NOTE]
+> **Working in Lipi:** If you press `Alt + R` while working directly inside Lipi's main window, Lipi automatically keeps the text in Lipi's own editor and will **not** minimize or switch away to a background window.
+
+---
+
+### Platform Paste Behavior: Linux vs. Windows
+
+| Platform | Auto-Paste Behavior | Setup Required |
+| :--- | :--- | :--- |
+| **Windows** | **Works seamlessly out of the box.** Lipi automatically restores your foreground window and simulates `Ctrl+V`. | None. |
+| **Linux (X11)** | **Works out of the box.** Window activation and `Ctrl+V` are simulated directly. | None. |
+| **Linux (Wayland)** | **Requires Screen Control approval.** Wayland sandboxes input between windows. When auto-paste triggers, GNOME shows a **"Remote Desktop"** prompt. Click **Allow** to permit `Ctrl+V` injection. | Click **Allow** on the GNOME prompt, or install `ydotool` for prompt-less background pasting. |
+
+#### Why does GNOME Wayland show a "Remote Desktop" prompt?
+Modern Wayland compositors (such as GNOME Mutter on Ubuntu / Fedora) isolate applications for security, preventing any background app from silently injecting synthetic keystrokes into other windows. To send `Ctrl+V`, Lipi routes the key through the official desktop portal, which prompts you to authorize input control.
+
+> **Optional (Bypass Prompt on Wayland):**
+> If you prefer completely silent background key injection on Wayland without any system prompt, you can install `ydotool`:
+> ```bash
+> sudo apt install ydotool
+> systemctl --user enable --now ydotoold
+> ```
+> When `ydotool` is detected on your system, Lipi uses it automatically.
+
+---
+
+### FAQ
+
+#### Q: How do I choose whether `Alt + R` creates a new note or appends?
+In **Settings > Preferences**, look for **"Alt+R Shortcut Recording Behavior"**:
+- **Create a new note for each recording (Default)**: Each recording starts a fresh note and clean transcription/conversion.
+- **Append to current active note**: Adds newly dictated speech to the end of the currently open note.
+
+#### Q: What is the Mini Floating Wizard?
+Press **`Alt + M`** (or click the `⊡ Mini Wizard` button in the navbar) to collapse Lipi into a compact, always-on-top floating pill. It lets you record, view audio levels, and monitor AI progress while multitasking. Press `Alt + M` again to expand back to full mode.
+
+#### Q: Where is my data stored?
+All recordings, notes, and preferences are stored locally on your machine in an embedded SQLite database located at `~/.local/share/com.lipi.app/lipi.db` (Linux) or `%LOCALAPPDATA%\com.lipi.app\lipi.db` (Windows). No audio or notes are uploaded to any external server unless you configure a remote cloud AI provider.
 
 ---
 

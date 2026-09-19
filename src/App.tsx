@@ -20,6 +20,7 @@ interface AppSettings {
   model: string;
   language?: string;
   auto_copy: boolean;
+  auto_paste: boolean;
   always_on_top: boolean;
   engine_mode: "cloud" | "local";
   local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan";
@@ -28,6 +29,7 @@ interface AppSettings {
   model_idle_timeout_mins?: number;
   request_timeout_secs?: number;
   mini_record_mode?: "new_note" | "append";
+  shortcut_record_mode?: "new_note" | "append";
   provider_id?: string;
   wizard_completed?: boolean;
 }
@@ -245,6 +247,7 @@ export default function App() {
     model: "whisper-1",
     language: "",
     auto_copy: true,
+    auto_paste: false,
     always_on_top: true,
     engine_mode: "local",
     local_engine: "whisper_cpu",
@@ -253,6 +256,7 @@ export default function App() {
     model_idle_timeout_mins: 10,
     request_timeout_secs: 180,
     mini_record_mode: "new_note",
+    shortcut_record_mode: "new_note",
   });
 
   const DEFAULT_PRESETS: PromptPreset[] = [
@@ -474,6 +478,11 @@ export default function App() {
   const miniModeRef = useRef(miniMode);
   miniModeRef.current = miniMode;
 
+  const isGlobalShortcutActiveRef = useRef(false);
+  const isShortcutRecordingRef = useRef(false);
+  const wasLipiFocusedOnRecordRef = useRef(false);
+  const lastToggleTimeRef = useRef(0);
+
   useEffect(() => {
     loadNotes();
     loadSettings();
@@ -646,7 +655,9 @@ export default function App() {
       // Alt+R: toggle recording
       if (e.altKey && (e.key === "r" || e.key === "R")) {
         e.preventDefault();
-        toggleRecording();
+        if (!isGlobalShortcutActiveRef.current) {
+          toggleRecording("shortcut");
+        }
         return;
       }
 
@@ -1123,10 +1134,14 @@ export default function App() {
         details: logDetails,
       });
 
-      if (settingsRef.current.auto_copy) {
-        await copyText(transformed);
+      if (_isAuto || settingsRef.current.auto_paste) {
+        await deliverTranscript(transformed, "✓ Transformed with LLM!");
       } else {
-        showToast("✓ Transformed with LLM!");
+        if (settingsRef.current.auto_copy) {
+          await copyText(transformed);
+        } else {
+          showToast("✓ Transformed with LLM!");
+        }
       }
     } catch (err: any) {
       const errStr = String(err);
@@ -1153,6 +1168,12 @@ export default function App() {
       await refreshModelStatus(s.local_engine, s.local_model_size);
       await refreshMemoryStatus();
       await loadLlmSettings();
+
+      invoke<boolean>("is_global_shortcut_registered")
+        .then((reg) => {
+          isGlobalShortcutActiveRef.current = !!reg;
+        })
+        .catch(() => {});
 
       // Check first-run wizard
       if (!s.wizard_completed && !s.api_key && s.engine_mode !== "local") {
@@ -1251,11 +1272,25 @@ export default function App() {
     setTimeout(() => setCopiedNotification(null), 2500);
   }
 
-  async function toggleRecording() {
+  async function toggleRecording(source: "shortcut" | "manual" = "manual") {
+    const now = Date.now();
+    if (now - lastToggleTimeRef.current < 350) return;
+    lastToggleTimeRef.current = now;
+
     if (isTranscribingRef.current) return;
     setErrorMsg(null);
 
     if (!isRecordingRef.current) {
+      wasLipiFocusedOnRecordRef.current = document.hasFocus() && !miniModeRef.current;
+      if (source === "shortcut") {
+        isShortcutRecordingRef.current = true;
+        if (settingsRef.current.shortcut_record_mode !== "append") {
+          await handleNewNote();
+        }
+      } else {
+        isShortcutRecordingRef.current = false;
+      }
+
       try {
         await invoke("start_recording");
         setIsRecording(true);
@@ -1273,7 +1308,10 @@ export default function App() {
 
         if (transcript) {
           const isMini = miniModeRef.current;
-          const shouldCreateNewNote = isMini && (settingsRef.current.mini_record_mode !== "append");
+          const isShortcut = isShortcutRecordingRef.current;
+          const shouldCreateNewNote =
+            (isMini && (settingsRef.current.mini_record_mode !== "append")) ||
+            (isShortcut && (settingsRef.current.shortcut_record_mode !== "append"));
           await loadCfUsage();
 
           const isCfAsr = settingsRef.current.engine_mode === "cloud" && (settingsRef.current.api_base_url || "").includes("api.cloudflare.com");
@@ -1335,11 +1373,7 @@ export default function App() {
             if (llmSettingsRef.current.auto_mode) {
               await handleTransform(nextRaw, true);
             } else {
-              if (settingsRef.current.auto_copy) {
-                await copyText(transcript);
-              } else {
-                showToast("✓ Transcribed to raw buffer!");
-              }
+              await deliverTranscript(transcript, "✓ Transcribed to raw buffer!");
             }
           } else {
             // Standard scratchpad behavior or fresh item
@@ -1371,11 +1405,7 @@ export default function App() {
               details: asrDetails,
             });
 
-            if (settingsRef.current.auto_copy) {
-              await copyText(transcript);
-            } else {
-              showToast("✓ Transcribed!");
-            }
+            await deliverTranscript(transcript, "✓ Transcribed!");
           }
         }
       } catch (err: any) {
@@ -1392,6 +1422,8 @@ export default function App() {
         });
       } finally {
         setIsTranscribing(false);
+        isShortcutRecordingRef.current = false;
+        wasLipiFocusedOnRecordRef.current = false;
         refreshMemoryStatus();
       }
     }
@@ -1445,7 +1477,7 @@ export default function App() {
     }).then((fn) => { unlistenMini = fn; });
 
     listen("tray_toggle_recording", () => {
-      toggleRecording();
+      toggleRecording("shortcut");
     }).then((fn) => { unlistenRec = fn; });
 
     listen("open_preferences", () => {
@@ -1561,6 +1593,42 @@ export default function App() {
       } else {
         showToast("✓ Copied to clipboard!");
       }
+    }
+  }
+
+  async function deliverTranscript(text: string, defaultToast?: string) {
+    if (!text) return;
+    if (wasLipiFocusedOnRecordRef.current) {
+      // User was working inside Lipi's editor: keep text in Lipi editor, do not paste externally
+      if (settingsRef.current.auto_copy) {
+        await copyText(text);
+      } else if (defaultToast) {
+        showToast(defaultToast);
+      }
+      return;
+    }
+
+    if (settingsRef.current.auto_paste) {
+      try {
+        const pasted = await invoke<boolean>("paste_into_previous_app", { text });
+        if (pasted) {
+          showToast("✓ Pasted into previous app!");
+        } else {
+          if (settingsRef.current.auto_copy) {
+            await copyText(text);
+          } else if (defaultToast) {
+            showToast(defaultToast);
+          }
+        }
+      } catch (err: any) {
+        console.warn("Auto-paste failed, falling back to copy:", err);
+        await copyText(text);
+        showToast("Copied to clipboard. Press Ctrl+V to paste.");
+      }
+    } else if (settingsRef.current.auto_copy) {
+      await copyText(text);
+    } else if (defaultToast) {
+      showToast(defaultToast);
     }
   }
 
@@ -3527,6 +3595,23 @@ export default function App() {
                     <input
                       type="checkbox"
                       className="checkbox-input"
+                      checked={settings.auto_paste}
+                      onChange={(e) =>
+                        updateAndSaveSettings({ auto_paste: e.target.checked })
+                      }
+                    />
+                    <span>Paste into the previous application</span>
+                  </label>
+                  <span className="form-hint" style={{ marginLeft: "26px" }}>
+                    Restores target app and sends Ctrl+V after dictation or auto-transformation. Alt+R works system-wide. Works best with mini widget or Lipi in tray (an always-on-top window can cover target).
+                  </span>
+                </div>
+
+                <div className="form-group">
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      className="checkbox-input"
                       checked={settings.always_on_top}
                       onChange={(e) =>
                         updateAndSaveSettings({ always_on_top: e.target.checked })
@@ -3598,8 +3683,53 @@ export default function App() {
                     </label>
                   </div>
                   <span className="form-hint" style={{ display: "block", marginTop: "10px", fontStyle: "italic" }}>
-                    Note: In full screen mode, recordings append to the active note by default, and you can create a fresh note anytime using the "New Note" button.
+                    Note: When using the on-screen Record button in full screen mode, recordings append to the active note by default, and you can create a fresh note anytime using the "New Note" button.
                   </span>
+                </div>
+
+                <div className="form-group" style={{ marginTop: "18px", paddingTop: "14px", borderTop: "1px solid var(--border)" }}>
+                  <label className="form-label" style={{ fontWeight: 600, display: "block", marginBottom: "8px" }}>
+                    Alt+R Shortcut Recording Behavior
+                  </label>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                    <label className="radio-label" style={{ display: "flex", alignItems: "flex-start", gap: "10px", cursor: "pointer" }}>
+                      <input
+                        type="radio"
+                        name="shortcut_record_mode"
+                        value="new_note"
+                        checked={settings.shortcut_record_mode !== "append"}
+                        onChange={() => updateAndSaveSettings({ shortcut_record_mode: "new_note" })}
+                        style={{ marginTop: "3px" }}
+                      />
+                      <div>
+                        <span style={{ fontWeight: 500, color: "var(--text-primary)" }}>
+                          Create a new note for each recording (Default)
+                        </span>
+                        <div className="form-hint" style={{ marginTop: "2px" }}>
+                          Each recording triggered via Alt+R or the global shortcut starts a fresh note and transcription.
+                        </div>
+                      </div>
+                    </label>
+
+                    <label className="radio-label" style={{ display: "flex", alignItems: "flex-start", gap: "10px", cursor: "pointer" }}>
+                      <input
+                        type="radio"
+                        name="shortcut_record_mode"
+                        value="append"
+                        checked={settings.shortcut_record_mode === "append"}
+                        onChange={() => updateAndSaveSettings({ shortcut_record_mode: "append" })}
+                        style={{ marginTop: "3px" }}
+                      />
+                      <div>
+                        <span style={{ fontWeight: 500, color: "var(--text-primary)" }}>
+                          Append to current active note
+                        </span>
+                        <div className="form-hint" style={{ marginTop: "2px" }}>
+                          Appends transcribed speech onto the end of the currently selected note.
+                        </div>
+                      </div>
+                    </label>
+                  </div>
                 </div>
               </div>
             )}
@@ -3778,7 +3908,7 @@ export default function App() {
                   aria-label="Settings & Quick Controls"
                 >
                   ⚙
-                  {(llmSettings.auto_mode || settings.auto_copy || settings.always_on_top) && (
+                  {(llmSettings.auto_mode || settings.auto_copy || settings.auto_paste || settings.always_on_top) && (
                     <span className="nav-overflow-dot" />
                   )}
                 </button>
@@ -3812,6 +3942,23 @@ export default function App() {
                       />
                       <span className={`mini-status-pill ${settings.auto_copy ? "active" : ""}`}>
                         {settings.auto_copy ? "ON" : "OFF"}
+                      </span>
+                    </label>
+
+                    <label className="nav-overflow-item">
+                      <span className="nav-overflow-item-left">
+                        <span>📋</span>
+                        <span>Auto Paste</span>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={settings.auto_paste}
+                        onChange={(e) =>
+                          updateAndSaveSettings({ auto_paste: e.target.checked })
+                        }
+                      />
+                      <span className={`mini-status-pill ${settings.auto_paste ? "active" : ""}`}>
+                        {settings.auto_paste ? "ON" : "OFF"}
                       </span>
                     </label>
 
@@ -4149,7 +4296,7 @@ export default function App() {
                 className={`btn btn-record ${isRecording ? "recording" : ""} ${
                   isTranscribing ? "transcribing" : ""
                 }`}
-                onClick={toggleRecording}
+                onClick={() => toggleRecording("manual")}
                 disabled={isTranscribing}
                 title="Shortcut: Alt+R"
               >
