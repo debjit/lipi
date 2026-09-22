@@ -1,5 +1,6 @@
 mod audio;
 mod db;
+mod vad;
 mod engine;
 mod env_config;
 mod llm;
@@ -12,7 +13,9 @@ mod transcribe;
 use audio::AudioRecorder;
 use db::{AppSettings, Database, Note};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use tauri::{
     menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -216,6 +219,8 @@ pub struct AppState {
     paste_target: Arc<std::sync::Mutex<Option<paste::PasteTarget>>>,
     global_shortcut_registered: std::sync::atomic::AtomicBool,
     tray_record_item: MenuItem<tauri::Wry>,
+    live_worker: Arc<std::sync::Mutex<Option<JoinHandle<Result<String, String>>>>>,
+    live_cancel: Arc<AtomicBool>,
 }
 
 #[tauri::command]
@@ -231,15 +236,138 @@ fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> 
         *guard = None;
     }
 
-    state.audio.start()?;
+    let live = settings.engine_mode == "local" && settings.live_dictation;
+    if live {
+        let custom = models_folder(&settings);
+        if !models::vad_installed(&state.app_data_dir, custom) {
+            return Err("Live dictation needs the VAD model. Turn it on in Settings to download it.".into());
+        }
+        let path = models::vad_model_path(&state.app_data_dir, custom);
+        let rx = state.audio.start_live(path)?;
+        state.live_cancel.store(false, Ordering::SeqCst);
+        let worker = spawn_live_worker(
+            app.clone(),
+            state.supervisor.clone(),
+            state.db.clone(),
+            state.app_data_dir.clone(),
+            state.live_cancel.clone(),
+            rx,
+        );
+        if let Ok(mut slot) = state.live_worker.lock() {
+            *slot = Some(worker);
+        }
+        let supervisor = state.supervisor.clone();
+        let engine = settings.local_engine.clone();
+        let size = settings.local_model_size.clone();
+        let dir = state.app_data_dir.clone();
+        let folder = settings.models_folder.clone();
+        tauri::async_runtime::spawn(async move {
+            let custom = if folder.trim().is_empty() { None } else { Some(folder) };
+            let _ = supervisor.ensure_loaded(&engine, &size, &dir, custom.as_deref()).await;
+        });
+    } else {
+        state.audio.start()?;
+    }
     apply_tray_activity(&app, &state.tray_record_item, "recording", 0);
     Ok(())
 }
 
+fn models_folder(settings: &AppSettings) -> Option<&str> {
+    if settings.models_folder.trim().is_empty() {
+        None
+    } else {
+        Some(settings.models_folder.as_str())
+    }
+}
+
+fn spawn_live_worker(
+    app: tauri::AppHandle,
+    supervisor: Arc<engine::ModelSupervisor>,
+    db: Arc<Database>,
+    app_data_dir: std::path::PathBuf,
+    cancel: Arc<AtomicBool>,
+    rx: std::sync::mpsc::Receiver<Vec<f32>>,
+) -> JoinHandle<Result<String, String>> {
+    std::thread::spawn(move || {
+        let mut full = String::new();
+        let mut seq = 0u32;
+        let mut last_error = None;
+        while let Ok(pcm) = rx.recv() {
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            let wav = match audio::pcm_f32_to_wav(&pcm) {
+                Ok(wav) => wav,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+            let settings = db.get_settings().unwrap_or_default();
+            let prompt = prompt_tail(&full);
+            let text = tauri::async_runtime::block_on(supervisor.transcribe(
+                wav,
+                &settings.local_engine,
+                &settings.local_model_size,
+                settings.language.as_deref(),
+                &app_data_dir,
+                models_folder(&settings),
+                prompt.as_deref(),
+            ));
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            match text {
+                Ok(text) => {
+                    let text = text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if !full.is_empty() {
+                        full.push(' ');
+                    }
+                    full.push_str(text);
+                    seq += 1;
+                    let _ = app.emit("transcript_chunk", serde_json::json!({ "seq": seq, "text": text }));
+                }
+                Err(e) => {
+                    last_error = Some(e.clone());
+                    let _ = app.emit("transcript_error", e);
+                }
+            }
+        }
+        if full.is_empty() {
+            if let Some(e) = last_error {
+                return Err(e);
+            }
+        }
+        Ok(full)
+    })
+}
+
+fn prompt_tail(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let tail: String = trimmed.chars().rev().take(200).collect::<String>().chars().rev().collect();
+    Some(tail)
+}
+
+fn take_live_worker(state: &AppState) -> Option<JoinHandle<Result<String, String>>> {
+    state.live_worker.lock().ok().and_then(|mut slot| slot.take())
+}
+
 #[tauri::command]
 fn cancel_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    if state.audio.is_recording() {
-        state.audio.stop()?;
+    state.live_cancel.store(true, Ordering::SeqCst);
+    if state.audio.is_live() {
+        state.audio.end_live(false)?;
+        if let Some(handle) = take_live_worker(&state) {
+            let _ = handle.join();
+        }
+    } else if state.audio.is_recording() {
+        let _ = state.audio.stop()?;
     }
     apply_tray_activity(&app, &state.tray_record_item, "idle", 0);
     Ok(())
@@ -291,15 +419,30 @@ async fn stop_recording_and_transcribe(
     state: tauri::State<'_, AppState>,
 ) -> Result<OperationResult, String> {
     apply_tray_activity(&app, &state.tray_record_item, "transcribing", 0);
+    if state.audio.is_live() {
+        state.audio.end_live(true)?;
+        let handle = take_live_worker(&state);
+        let text = if let Some(handle) = handle {
+            tauri::async_runtime::spawn_blocking(move || match handle.join() {
+                Ok(result) => result,
+                Err(_) => Err("Live dictation thread panicked".into()),
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            Ok(String::new())
+        }?;
+        return Ok(OperationResult {
+            text,
+            cf_neurons: None,
+            cf_cost: None,
+        });
+    }
     let wav_bytes = state.audio.stop()?;
     let settings = state.db.get_settings()?;
 
     if settings.engine_mode == "local" {
-        let custom_dir = if settings.models_folder.trim().is_empty() {
-            None
-        } else {
-            Some(settings.models_folder.as_str())
-        };
+        let custom_dir = models_folder(&settings);
         let text = state
             .supervisor
             .transcribe(
@@ -309,6 +452,7 @@ async fn stop_recording_and_transcribe(
                 settings.language.as_deref(),
                 &state.app_data_dir,
                 custom_dir,
+                None,
             )
             .await?;
         return Ok(OperationResult {
@@ -591,6 +735,21 @@ fn get_model_status(
         }
     });
     models::check_model_status(&state.app_data_dir, folder, &engine, &model_size)
+}
+
+#[tauri::command]
+fn vad_installed(state: tauri::State<'_, AppState>) -> bool {
+    let settings = state.db.get_settings().unwrap_or_default();
+    models::vad_installed(&state.app_data_dir, models_folder(&settings))
+}
+
+#[tauri::command]
+async fn download_vad_model(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let settings = state.db.get_settings().unwrap_or_default();
+    models::download_vad_model(&app, &state.app_data_dir, models_folder(&settings)).await
 }
 
 #[tauri::command]
@@ -1095,6 +1254,8 @@ pub fn run() {
                 paste_target: Arc::new(std::sync::Mutex::new(None)),
                 global_shortcut_registered: std::sync::atomic::AtomicBool::new(global_shortcut_registered),
                 tray_record_item: record_item,
+                live_worker: Arc::new(std::sync::Mutex::new(None)),
+                live_cancel: Arc::new(AtomicBool::new(false)),
             });
 
             Ok(())
@@ -1117,6 +1278,8 @@ pub fn run() {
             refresh_tray_presets,
             start_recording,
             cancel_recording,
+            vad_installed,
+            download_vad_model,
             is_recording,
             stop_recording_and_transcribe,
             paste_into_previous_app,

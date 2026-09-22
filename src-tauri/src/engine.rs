@@ -9,6 +9,17 @@ use crate::models::{
     resolve_models_dir,
 };
 
+fn percent_encode(text: &str) -> String {
+    let mut out = String::new();
+    for b in text.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMemoryStatus {
     pub is_loaded: bool,
@@ -260,6 +271,11 @@ class H(BaseHTTPRequestHandler):
             kw = {}
             if lang and lang != 'auto':
                 kw['language'] = lang
+            from urllib.parse import urlparse, parse_qs, unquote
+            qs = parse_qs(urlparse(self.path).query)
+            prompt = unquote(qs.get('prompt', [''])[0]).strip()
+            if prompt:
+                kw['initial_prompt'] = prompt
             segments, _ = model.transcribe(io.BytesIO(audio), **kw)
             text = "".join(s.text for s in segments).strip()
             res = json.dumps({"text": text}).encode('utf-8')
@@ -418,6 +434,7 @@ server.serve_forever()
         language: Option<&str>,
         app_data_dir: &Path,
         custom_models_dir: Option<&str>,
+        prompt: Option<&str>,
     ) -> Result<String, String> {
         if wav_bytes.is_empty() {
             return Err("Audio buffer is empty".into());
@@ -431,8 +448,12 @@ server.serve_forever()
                     .unwrap_or_else(|_| reqwest::Client::new());
 
                 let res = if engine == "faster_whisper" {
+                    let mut url = format!("http://127.0.0.1:{}/transcribe", port);
+                    if let Some(p) = prompt.map(str::trim).filter(|p| !p.is_empty()) {
+                        url = format!("{}?prompt={}", url, percent_encode(p));
+                    }
                     let mut req = client
-                        .post(format!("http://127.0.0.1:{}/transcribe", port))
+                        .post(url)
                         .header("Content-Type", "audio/wav")
                         .body(wav_bytes.clone());
 
@@ -460,6 +481,9 @@ server.serve_forever()
                         if !trimmed.is_empty() && trimmed != "auto" {
                             form = form.text("language", trimmed.to_string());
                         }
+                    }
+                    if let Some(p) = prompt.map(str::trim).filter(|p| !p.is_empty()) {
+                        form = form.text("prompt", p.to_string());
                     }
 
                     client

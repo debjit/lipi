@@ -30,6 +30,7 @@ pub struct AppSettings {
     pub shortcut_record_mode: String,
     pub provider_id: Option<String>,
     pub wizard_completed: bool,
+    pub live_dictation: bool,
 }
 
 impl Default for AppSettings {
@@ -52,6 +53,7 @@ impl Default for AppSettings {
             shortcut_record_mode: "new_note".into(),
             provider_id: None,
             wizard_completed: false,
+            live_dictation: false,
         }
     }
 }
@@ -279,6 +281,7 @@ impl Database {
             shortcut_record_mode: get_val("shortcut_record_mode").unwrap_or_else(|| "new_note".into()),
             provider_id: get_val("provider_id").filter(|s| !s.is_empty()),
             wizard_completed: get_val("wizard_completed").map(|v| v == "true" || v == "1").unwrap_or(false),
+            live_dictation: get_val("live_dictation").map(|v| v == "true" || v == "1").unwrap_or(false),
         })
     }
 
@@ -309,6 +312,7 @@ impl Database {
         set_val("shortcut_record_mode", &settings.shortcut_record_mode).map_err(|e| e.to_string())?;
         set_val("provider_id", settings.provider_id.as_deref().unwrap_or("")).map_err(|e| e.to_string())?;
         set_val("wizard_completed", if settings.wizard_completed { "true" } else { "false" }).map_err(|e| e.to_string())?;
+        set_val("live_dictation", if settings.live_dictation { "true" } else { "false" }).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -530,6 +534,7 @@ mod tests {
             shortcut_record_mode: "append".into(),
             provider_id: Some("GROQ_DEFAULT".into()),
             wizard_completed: true,
+            live_dictation: true,
         };
         db.save_settings(&new_settings).unwrap();
         let loaded = db.get_settings().unwrap();
@@ -550,6 +555,8 @@ mod tests {
         assert_eq!(loaded.shortcut_record_mode, "append");
         assert_eq!(loaded.provider_id, Some("GROQ_DEFAULT".into()));
         assert_eq!(loaded.wizard_completed, true);
+        assert_eq!(loaded.live_dictation, true);
+        assert!(!default_settings.live_dictation);
     }
 
     #[test]

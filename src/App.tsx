@@ -32,6 +32,17 @@ interface AppSettings {
   shortcut_record_mode?: "new_note" | "append";
   provider_id?: string;
   wizard_completed?: boolean;
+  live_dictation?: boolean;
+}
+
+function liveCpuNote(size: string): string {
+  const sizeLine =
+    size === "medium" || size === "turbo_q8"
+      ? "Medium and Turbo Q8 can use most of a CPU core for the whole session, and words can show up a few seconds late. The speech model stays in RAM the entire time."
+      : size === "small"
+      ? "Small keeps one core busy longer after each phrase."
+      : "Tiny and Base usually keep up, with a short burst after each pause.";
+  return `The VAD model is about 2 MB. The cost is transcribing every pause while the mic is open, instead of once when you stop. ${sizeLine} If LLM auto-transform is on, the rewrite still runs once after you stop.`;
 }
 
 interface LlmProvider {
@@ -259,6 +270,7 @@ export default function App() {
     request_timeout_secs: 180,
     mini_record_mode: "new_note",
     shortcut_record_mode: "new_note",
+    live_dictation: false,
   });
 
   const DEFAULT_PRESETS: PromptPreset[] = [
@@ -467,6 +479,12 @@ export default function App() {
   const timerRef = useRef<number | null>(null);
   const activeContentRef = useRef(content);
   activeContentRef.current = content;
+  const liveActiveRef = useRef(false);
+  const liveBaseRef = useRef("");
+  const liveAccRef = useRef("");
+  const liveNoteIdRef = useRef<number | null>(null);
+  const liveNewNoteRef = useRef(false);
+  const livePersistTimer = useRef<number | null>(null);
 
   const activeIdRef = useRef(activeNoteId);
   activeIdRef.current = activeNoteId;
@@ -547,6 +565,9 @@ export default function App() {
         modelSize: settingsRef.current.local_model_size,
         customModelsDir: settingsRef.current.models_folder || undefined,
       });
+      if (settingsRef.current.live_dictation && settingsRef.current.engine_mode === "local") {
+        await invoke("download_vad_model");
+      }
       await updateAndSaveSettings({
         engine_mode: "local",
         local_engine: settingsRef.current.local_engine,
@@ -1303,12 +1324,51 @@ export default function App() {
     setTimeout(() => setCopiedNotification(null), 2500);
   }
 
+  useEffect(() => {
+    let unlistenChunk: (() => void) | undefined;
+    let unlistenErr: (() => void) | undefined;
+    listen<{ seq: number; text: string }>("transcript_chunk", (event) => {
+      if (!liveActiveRef.current) return;
+      const piece = (event.payload?.text || "").trim();
+      if (!piece) return;
+      liveAccRef.current = liveAccRef.current ? `${liveAccRef.current} ${piece}` : piece;
+      const base = liveBaseRef.current.trim();
+      const next = base ? `${base} ${liveAccRef.current}` : liveAccRef.current;
+      setRawTranscript(next);
+      rawTranscriptRef.current = next;
+      setContent(next);
+      if (livePersistTimer.current) window.clearTimeout(livePersistTimer.current);
+      livePersistTimer.current = window.setTimeout(() => {
+        const id = liveNewNoteRef.current ? liveNoteIdRef.current : activeIdRef.current;
+        persistNote(next, id)
+          .then((savedId) => {
+            if (liveNewNoteRef.current) liveNoteIdRef.current = savedId;
+          })
+          .catch(() => {});
+      }, 1000);
+    }).then((fn) => {
+      unlistenChunk = fn;
+    });
+    listen<string>("transcript_error", (event) => {
+      if (!liveActiveRef.current) return;
+      setErrorMsg(String(event.payload || "Live transcription failed"));
+    }).then((fn) => {
+      unlistenErr = fn;
+    });
+    return () => {
+      if (unlistenChunk) unlistenChunk();
+      if (unlistenErr) unlistenErr();
+    };
+  }, []);
+
   async function discardRecording() {
     if (!isRecordingRef.current || isTranscribingRef.current) return;
     lastToggleTimeRef.current = Date.now();
     try {
       await invoke("cancel_recording");
       setIsRecording(false);
+      liveActiveRef.current = false;
+      if (livePersistTimer.current) window.clearTimeout(livePersistTimer.current);
       isShortcutRecordingRef.current = false;
       wasLipiFocusedOnRecordRef.current = false;
       showToast("Recording cancelled");
@@ -1336,18 +1396,49 @@ export default function App() {
         isShortcutRecordingRef.current = false;
       }
 
+      const live =
+        settingsRef.current.engine_mode === "local" && !!settingsRef.current.live_dictation;
+      liveActiveRef.current = live;
+      liveAccRef.current = "";
+      liveNoteIdRef.current = null;
+      if (live) {
+        const createNew =
+          (miniModeRef.current && settingsRef.current.mini_record_mode !== "append") ||
+          (source === "shortcut" && settingsRef.current.shortcut_record_mode !== "append");
+        liveNewNoteRef.current = createNew;
+        liveBaseRef.current = createNew
+          ? ""
+          : llmSettingsRef.current.enabled
+          ? rawTranscriptRef.current
+          : activeContentRef.current;
+      } else {
+        liveNewNoteRef.current = false;
+        liveBaseRef.current = "";
+      }
+
       try {
         await invoke("start_recording");
         setIsRecording(true);
       } catch (err: any) {
+        liveActiveRef.current = false;
         setErrorMsg(String(err));
       }
     } else {
+      const wasLive = liveActiveRef.current;
+      const liveBase = liveBaseRef.current;
+      const liveAcc = liveAccRef.current;
+      const liveNoteId = liveNoteIdRef.current;
+      liveActiveRef.current = false;
       setIsRecording(false);
+      if (livePersistTimer.current) {
+        window.clearTimeout(livePersistTimer.current);
+        livePersistTimer.current = null;
+      }
       setIsTranscribing(true);
       try {
         const res: OperationResult = await invoke("stop_recording_and_transcribe");
-        const transcript = (res && typeof res === "object" ? res.text : String(res || "")).trim();
+        const returned = (res && typeof res === "object" ? res.text : String(res || "")).trim();
+        const transcript = returned || (wasLive ? liveAcc.trim() : "");
         const itemNeurons = res?.cf_neurons ?? null;
         const itemCost = res?.cf_cost ?? null;
 
@@ -1392,8 +1483,12 @@ export default function App() {
 
             if (shouldCreateNewNote) {
               nextRaw = transcript;
-              targetNoteId = null;
+              targetNoteId = wasLive ? liveNoteId : null;
               setLlmResult("");
+            } else if (wasLive) {
+              const base = liveBase.trim();
+              nextRaw = base ? `${base} ${transcript}` : transcript;
+              targetNoteId = activeIdRef.current;
             } else {
               const currentRaw = rawTranscriptRef.current;
               nextRaw = currentRaw ? `${currentRaw.trim()} ${transcript}` : transcript;
@@ -1427,8 +1522,12 @@ export default function App() {
 
             if (shouldCreateNewNote) {
               nextContent = transcript;
-              targetNoteId = null;
+              targetNoteId = wasLive ? liveNoteId : null;
               setLlmResult("");
+            } else if (wasLive) {
+              const base = liveBase.trim();
+              nextContent = base ? `${base} ${transcript}` : transcript;
+              targetNoteId = activeIdRef.current;
             } else {
               const current = activeContentRef.current;
               nextContent = current ? `${current.trim()} ${transcript}` : transcript;
@@ -1467,6 +1566,9 @@ export default function App() {
         });
       } finally {
         setIsTranscribing(false);
+        liveActiveRef.current = false;
+        liveAccRef.current = "";
+        if (livePersistTimer.current) window.clearTimeout(livePersistTimer.current);
         isShortcutRecordingRef.current = false;
         wasLipiFocusedOnRecordRef.current = false;
         refreshMemoryStatus();
@@ -2634,6 +2736,35 @@ export default function App() {
                         Vulkan-Accelerated Whisper (GPU) — Hardware GPU compute (cross-vendor)
                       </option>
                     </select>
+                  </div>
+                  <div className="form-group">
+                    <label className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        className="checkbox-input"
+                        checked={!!settings.live_dictation}
+                        onChange={async (e) => {
+                          const on = e.target.checked;
+                          if (on) {
+                            try {
+                              setIsDownloading(true);
+                              await invoke("download_vad_model");
+                            } catch (err: any) {
+                              setErrorMsg(String(err));
+                              return;
+                            } finally {
+                              setIsDownloading(false);
+                            }
+                          }
+                          await updateAndSaveSettings({ live_dictation: on });
+                        }}
+                      />
+                      <span>Live dictation</span>
+                    </label>
+                    <span className="form-hint" style={{ marginLeft: "26px" }}>
+                      {settings.live_dictation ? "On. " : "Off. "}
+                      {liveCpuNote(settings.local_model_size)} API transcription stays one shot after you stop.
+                    </span>
                   </div>
                 </div>
               )}

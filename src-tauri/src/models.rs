@@ -936,6 +936,78 @@ pub fn delete_model(
     Ok(())
 }
 
+pub fn vad_model_path(app_data_dir: &Path, custom_dir: Option<&str>) -> PathBuf {
+    resolve_models_dir(app_data_dir, custom_dir).join("silero_vad.onnx")
+}
+
+pub fn vad_installed(app_data_dir: &Path, custom_dir: Option<&str>) -> bool {
+    fs::metadata(vad_model_path(app_data_dir, custom_dir))
+        .map(|m| m.len() > 1000)
+        .unwrap_or(false)
+}
+
+pub async fn download_vad_model(
+    app_handle: &tauri::AppHandle,
+    app_data_dir: &Path,
+    custom_dir: Option<&str>,
+) -> Result<String, String> {
+    let models_dir = resolve_models_dir(app_data_dir, custom_dir);
+    fs::create_dir_all(&models_dir).map_err(|e| format!("Failed to create models dir: {}", e))?;
+    let target_path = models_dir.join("silero_vad.onnx");
+    if vad_installed(app_data_dir, custom_dir) {
+        return Ok(target_path.to_string_lossy().to_string());
+    }
+
+    let url = "https://github.com/snakers4/silero-vad/raw/v5.1.2/src/silero_vad/data/silero_vad.onnx";
+    let temp_path = models_dir.join("silero_vad.onnx.part");
+    let client = reqwest::Client::new();
+    let mut response = client
+        .get(url)
+        .header("User-Agent", "lipi")
+        .send()
+        .await
+        .map_err(|e| format!("VAD download failed: {}", e))?;
+    if !response.status().is_success() {
+        return Err(format!("VAD download failed with status: {}", response.status()));
+    }
+
+    let total_size = response.content_length().unwrap_or(0);
+    let mut file = File::create(&temp_path).map_err(|e| format!("Failed to create VAD file: {}", e))?;
+    let mut downloaded: u64 = 0;
+    let mut last_emit_percent: i64 = -1;
+    let start_time = std::time::Instant::now();
+    while let Some(chunk) = response.chunk().await.map_err(|e| format!("Failed reading VAD chunk: {}", e))? {
+        file.write_all(&chunk).map_err(|e| format!("Failed writing VAD chunk: {}", e))?;
+        downloaded += chunk.len() as u64;
+        let percent = if total_size > 0 { (downloaded as f64 / total_size as f64 * 100.0) as i64 } else { 0 };
+        if percent != last_emit_percent {
+            last_emit_percent = percent;
+            let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+            let speed = downloaded as f64 / elapsed;
+            let eta = if total_size > downloaded { (total_size - downloaded) as f64 / speed } else { 0.0 };
+            let _ = app_handle.emit(
+                "model-download-progress",
+                serde_json::json!({
+                    "engine": "vad",
+                    "model_size": "silero",
+                    "downloaded": downloaded,
+                    "total": total_size,
+                    "percentage": percent,
+                    "speed_bps": speed,
+                    "eta_secs": eta
+                }),
+            );
+        }
+    }
+    file.flush().map_err(|e| e.to_string())?;
+    drop(file);
+    if target_path.exists() {
+        let _ = fs::remove_file(&target_path);
+    }
+    fs::rename(&temp_path, &target_path).map_err(|e| format!("Failed to save VAD model: {}", e))?;
+    Ok(target_path.to_string_lossy().to_string())
+}
+
 pub fn delete_whisper_binary(app_data_dir: &Path) -> Result<(), String> {
     let bin_dir = get_bin_dir(app_data_dir);
     if bin_dir.exists() {
