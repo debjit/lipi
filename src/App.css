@@ -247,6 +247,21 @@ body, html, #root {
   animation: pulse 1s infinite;
 }
 
+.live-wait {
+  width: 10px;
+  height: 10px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+  animation: live-wait-spin 0.7s linear infinite;
+}
+
+@keyframes live-wait-spin {
+  to { transform: rotate(360deg); }
+}
+
 @keyframes pulse {
   0% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.4; transform: scale(1.2); }
@@ -747,6 +762,9 @@ body, html, #root {
 }
 
 .mini-elapsed-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 11px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;

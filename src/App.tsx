@@ -228,6 +228,7 @@ export default function App() {
   const [content, setContent] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
+  const [liveChunkBusy, setLiveChunkBusy] = useState(false);
   const [activitySeconds, setActivitySeconds] = useState(0);
   const [copiedNotification, setCopiedNotification] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<number | null>(null);
@@ -1355,9 +1356,17 @@ export default function App() {
     }).then((fn) => {
       unlistenErr = fn;
     });
+    let unlistenBusy: (() => void) | undefined;
+    listen<boolean>("live_transcribing", (event) => {
+      if (!liveActiveRef.current) return;
+      setLiveChunkBusy(!!event.payload);
+    }).then((fn) => {
+      unlistenBusy = fn;
+    });
     return () => {
       if (unlistenChunk) unlistenChunk();
       if (unlistenErr) unlistenErr();
+      if (unlistenBusy) unlistenBusy();
     };
   }, []);
 
@@ -1368,6 +1377,7 @@ export default function App() {
       await invoke("cancel_recording");
       setIsRecording(false);
       liveActiveRef.current = false;
+      setLiveChunkBusy(false);
       if (livePersistTimer.current) window.clearTimeout(livePersistTimer.current);
       isShortcutRecordingRef.current = false;
       wasLipiFocusedOnRecordRef.current = false;
@@ -1399,6 +1409,7 @@ export default function App() {
       const live =
         settingsRef.current.engine_mode === "local" && !!settingsRef.current.live_dictation;
       liveActiveRef.current = live;
+      setLiveChunkBusy(false);
       liveAccRef.current = "";
       liveNoteIdRef.current = null;
       if (live) {
@@ -1430,6 +1441,7 @@ export default function App() {
       const liveNoteId = liveNoteIdRef.current;
       liveActiveRef.current = false;
       setIsRecording(false);
+      setLiveChunkBusy(false);
       if (livePersistTimer.current) {
         window.clearTimeout(livePersistTimer.current);
         livePersistTimer.current = null;
@@ -1880,6 +1892,9 @@ export default function App() {
               : activityPhase === "transcribing"
               ? `⌛ ${formatTimer(activitySeconds)}`
               : `✨ ${formatTimer(activitySeconds)}`}
+            {activityPhase === "recording" && liveChunkBusy && (
+              <span className="live-wait" title="Transcribing the last pause" />
+            )}
           </span>
         )}
 
@@ -4060,6 +4075,9 @@ export default function App() {
                 <div className="badge-status badge-recording">
                   <span className="dot pulse"></span>
                   <span>Rec {formatTimer(activitySeconds)}</span>
+                  {liveChunkBusy && (
+                    <span className="live-wait" title="Transcribing the last pause" />
+                  )}
                 </div>
               )}
               {activityPhase === "transcribing" && (
@@ -4548,6 +4566,9 @@ export default function App() {
                       : activityPhase === "transcribing"
                       ? `Transcribing ${formatTimer(activitySeconds)}`
                       : `Transforming ${formatTimer(activitySeconds)}`}
+                    {activityPhase === "recording" && liveChunkBusy && (
+                      <span className="live-wait" title="Transcribing the last pause" />
+                    )}
                   </span>
                 </div>
               )}

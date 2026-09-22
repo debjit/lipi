@@ -305,6 +305,7 @@ fn spawn_live_worker(
             };
             let settings = db.get_settings().unwrap_or_default();
             let prompt = prompt_tail(&full);
+            let _ = app.emit("live_transcribing", true);
             let text = tauri::async_runtime::block_on(supervisor.transcribe(
                 wav,
                 &settings.local_engine,
@@ -314,6 +315,7 @@ fn spawn_live_worker(
                 models_folder(&settings),
                 prompt.as_deref(),
             ));
+            let _ = app.emit("live_transcribing", false);
             if cancel.load(Ordering::SeqCst) {
                 break;
             }

@@ -20,6 +20,7 @@ Press **`Alt + R`** anywhere to speak. Lipi transcribes your voice—either 100%
 ## ⚡ Overview
 
 - 🎙️ **System-Wide Dictation (`Alt + R`)**: Speak from anywhere without leaving your working window. Lipi restores your target app and auto-pastes the text.
+- ⏱️ **Live Dictation (local, off by default)**: With a local Whisper engine, text can appear at each pause while the mic stays open. Cloud and self-hosted APIs stay one transcript after you stop.
 - 🔒 **Offline or Cloud Speech-to-Text**: Run private Whisper models on CPU/GPU without internet, or connect fast cloud APIs (Groq, Cloudflare Workers AI, OpenAI).
 - 🤖 **Automated AI Polish**: Post-process speech on the fly—fix grammar, summarize, or reformat using local or remote LLMs.
 - 🪟 **Compact Floating Widget (`Alt + M`)**: Collapse Lipi into a minimalist, always-on-top pill widget that stays out of your way while multitasking.
@@ -36,6 +37,7 @@ Press **`Alt + R`** anywhere to speak. Lipi transcribes your voice—either 100%
 - **Database**: Embedded SQLite via [`rusqlite`](https://github.com/rusqlite/rusqlite)
 - **HTTP Client**: [`reqwest`](https://github.com/seanmonstar/reqwest) (rustls, multipart audio upload & base64 JSON streaming)
 - **Local ASR**: `whisper.cpp` (`whisper-cli`) and `faster-whisper` in an isolated virtual environment
+- **Live speech detection**: [Silero VAD v5](https://github.com/snakers4/silero-vad) (`silero_vad.onnx`, ~2 MB) via ONNX Runtime, in front of the local speech model
 
 ---
 
@@ -98,7 +100,12 @@ Lipi provides a modular full-page Settings dashboard organized into four tabs:
   - One-click setup for runner binary or isolated Python virtual environment.
 - **Model Storage & Weights**:
   - Select or browse storage directory (e.g. `/media/external/models`).
-  - Stream download weights (`tiny`, `base`, `small`) with live progress.
+  - Stream download weights (`tiny`, `base`, `small`, `medium`, `turbo_q8`) with live progress.
+- **Live Dictation** (local engines only, default off):
+  - Turning it on downloads Silero VAD next to the speech weights. Turning it off returns to one transcript after Stop and leaves the file in place.
+  - Speech is cut on a pause (about 0.6 s of silence), or at about 20 s, and each clip is transcribed in order. A spinner sits beside the recording timer while a clip is running. Cancel drops the phrase still open and keeps text already shown.
+  - The extra cost is transcribing every pause, not the VAD file. Tiny and Base usually keep up. Small holds a core longer. Medium and Turbo Q8 can keep a core busy and lag a few seconds, and the speech model stays in RAM.
+  - If LLM auto-transform is on, the rewrite still runs once, after you stop, on the finished dictation. Copy and paste happen once then, not per pause.
 - **RAM Supervisor**:
   - Configure idle unload timeout (2 min, 5 min, 10 min default, 30 min, or Never).
   - Live RAM usage monitor and manual unload button.
@@ -175,6 +182,9 @@ In **Settings > Preferences**, look for **"Alt+R Shortcut Recording Behavior"**:
 - **Create a new note for each recording (Default)**: Each recording starts a fresh note and clean transcription/conversion.
 - **Append to current active note**: Adds newly dictated speech to the end of the currently open note.
 
+#### Q: What is Live Dictation?
+In **Settings > ASR**, with a local engine selected, **Live dictation** is off until you turn it on. The same switch is on the local step of the setup wizard. It downloads a small Silero VAD model and writes text into the note as you pause, while the mic stays open. Groq, OpenAI, Cloudflare, and self-hosted APIs ignore the switch and still transcribe once when you stop.
+
 #### Q: What is the Mini Floating Wizard?
 Press **`Alt + M`** (or click the `⊡ Mini Wizard` button in the navbar) to collapse Lipi into a compact, always-on-top floating pill. It lets you record, view audio levels, and monitor AI progress while multitasking. Press `Alt + M` again to expand back to full mode.
 
@@ -193,7 +203,8 @@ lipi/
 │   └── main.tsx              # React root entry
 ├── src-tauri/                # Tauri Rust application
 │   ├── src/
-│   │   ├── audio.rs          # CPAL audio recording & linear resampling
+│   │   ├── audio.rs          # CPAL audio recording, resampling, live VAD capture
+│   │   ├── vad.rs            # Silero VAD and pause-based speech segments
 │   │   ├── db.rs             # SQLite storage (notes, app settings, window state)
 │   │   ├── engine.rs         # Local Whisper runner & RAM supervisor
 │   │   ├── env_config.rs     # Multi-provider LLM configuration & .env sync
