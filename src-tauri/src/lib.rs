@@ -14,7 +14,7 @@ use db::{AppSettings, Database, Note};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
@@ -22,22 +22,182 @@ use tauri::{
 const TRAY_IDLE_ICON: &[u8] = include_bytes!("../icons/tray_idle_32.png");
 const TRAY_RECORDING_ICON: &[u8] = include_bytes!("../icons/tray_recording_32.png");
 
-fn update_tray_icon(app: &tauri::AppHandle, is_recording: bool) {
+fn format_mmss(secs: u64) -> String {
+    format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+fn escape_menu_label(label: &str) -> String {
+    label.replace('&', "&&").replace('\n', " ")
+}
+
+fn activity_is_busy(phase: &str) -> bool {
+    matches!(phase, "recording" | "transcribing" | "transforming")
+}
+
+fn activity_tooltip(phase: &str, elapsed_secs: u64) -> String {
+    let clock = format_mmss(elapsed_secs);
+    match phase {
+        "recording" => format!("Lipi · Recording {clock}"),
+        "transcribing" => format!("Lipi · Transcribing {clock}"),
+        "transforming" => format!("Lipi · Transforming {clock}"),
+        _ => "Lipi - Voice to Notes".to_string(),
+    }
+}
+
+fn activity_menu_label(phase: &str, elapsed_secs: u64) -> String {
+    let clock = format_mmss(elapsed_secs);
+    match phase {
+        "recording" => format!("Recording {clock}"),
+        "transcribing" => format!("Transcribing {clock}"),
+        "transforming" => format!("Transforming {clock}"),
+        _ => "Start / Stop Recording".to_string(),
+    }
+}
+
+fn update_tray_icon(app: &tauri::AppHandle, busy: bool) {
     if let Some(tray) = app.tray_by_id("main-tray") {
-        let bytes = if is_recording {
-            TRAY_RECORDING_ICON
-        } else {
-            TRAY_IDLE_ICON
-        };
+        let bytes = if busy { TRAY_RECORDING_ICON } else { TRAY_IDLE_ICON };
         if let Ok(img) = tauri::image::Image::from_bytes(bytes) {
             let _ = tray.set_icon(Some(img));
         }
     }
 }
 
+fn apply_tray_activity(app: &tauri::AppHandle, record_item: &MenuItem<tauri::Wry>, phase: &str, elapsed_secs: u64) {
+    update_tray_icon(app, activity_is_busy(phase));
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_tooltip(Some(activity_tooltip(phase, elapsed_secs)));
+    }
+    let _ = record_item.set_text(activity_menu_label(phase, elapsed_secs));
+}
+
+fn build_preset_submenu(
+    app: &tauri::AppHandle,
+    app_data_dir: &std::path::Path,
+) -> Result<Submenu<tauri::Wry>, String> {
+    let settings = env_config::load_llm_settings(app_data_dir);
+    let active = settings.voice_preset;
+    let presets = presets::load_presets(app_data_dir);
+    let has_custom = presets.iter().any(|p| p.id == "custom");
+
+    let mut items: Vec<CheckMenuItem<tauri::Wry>> = Vec::new();
+    for preset in &presets {
+        let item = CheckMenuItem::with_id(
+            app,
+            format!("preset:{}", preset.id),
+            escape_menu_label(&preset.label),
+            true,
+            preset.id == active,
+            None::<&str>,
+        )
+        .map_err(|e| e.to_string())?;
+        items.push(item);
+    }
+    let custom_item = if has_custom {
+        None
+    } else {
+        Some(
+            CheckMenuItem::with_id(
+                app,
+                "preset:custom",
+                "Custom Instructions",
+                true,
+                active == "custom",
+                None::<&str>,
+            )
+            .map_err(|e| e.to_string())?,
+        )
+    };
+
+    let mut refs: Vec<&dyn IsMenuItem<tauri::Wry>> = items.iter().map(|item| item as _).collect();
+    if let Some(custom) = custom_item.as_ref() {
+        refs.push(custom);
+    }
+
+    Submenu::with_items(app, "Preset", true, &refs).map_err(|e| e.to_string())
+}
+
+fn build_tray_menu(
+    app: &tauri::AppHandle,
+    app_data_dir: &std::path::Path,
+    record_item: &MenuItem<tauri::Wry>,
+) -> Result<Menu<tauri::Wry>, String> {
+    let show_item = MenuItem::with_id(app, "show", "Show Lipi", true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    let mini_item = MenuItem::with_id(app, "toggle_mini", "Toggle Mini Mode", true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    let preset_menu = build_preset_submenu(app, app_data_dir)?;
+    let pref_item = MenuItem::with_id(app, "preferences", "Preferences", true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    let sep = PredefinedMenuItem::separator(app).map_err(|e| e.to_string())?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit Lipi", true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+
+    Menu::with_items(
+        app,
+        &[
+            &show_item,
+            &mini_item,
+            record_item,
+            &preset_menu,
+            &pref_item,
+            &sep,
+            &quit_item,
+        ],
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn refresh_tray_menu(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    let menu = build_tray_menu(app, &state.app_data_dir, &state.tray_record_item)?;
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn select_tray_preset(app: &tauri::AppHandle, preset_id: &str) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let app_data_dir = state.app_data_dir.clone();
+    drop(state);
+
+    let mut settings = env_config::load_llm_settings(&app_data_dir);
+    if settings.voice_preset == preset_id {
+        return;
+    }
+    settings.presets = presets::load_presets(&app_data_dir);
+    settings.voice_preset = preset_id.to_string();
+    if let Err(e) = env_config::save_llm_settings(&app_data_dir, &settings) {
+        eprintln!("Failed to save tray preset: {e}");
+        return;
+    }
+    let _ = app.emit("tray_preset_changed", preset_id.to_string());
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Err(e) = refresh_tray_menu(app, &state) {
+            eprintln!("Failed to refresh tray presets: {e}");
+        }
+    }
+}
+
 #[tauri::command]
-fn set_tray_recording_state(app: tauri::AppHandle, is_recording: bool) {
-    update_tray_icon(&app, is_recording);
+fn set_tray_activity(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    phase: String,
+    elapsed_secs: u64,
+) -> Result<(), String> {
+    apply_tray_activity(&app, &state.tray_record_item, &phase, elapsed_secs);
+    Ok(())
+}
+
+#[tauri::command]
+fn refresh_tray_presets(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    refresh_tray_menu(&app, &state)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -55,6 +215,7 @@ pub struct AppState {
     is_mini: std::sync::atomic::AtomicBool,
     paste_target: Arc<std::sync::Mutex<Option<paste::PasteTarget>>>,
     global_shortcut_registered: std::sync::atomic::AtomicBool,
+    tray_record_item: MenuItem<tauri::Wry>,
 }
 
 #[tauri::command]
@@ -71,7 +232,16 @@ fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> 
     }
 
     state.audio.start()?;
-    update_tray_icon(&app, true);
+    apply_tray_activity(&app, &state.tray_record_item, "recording", 0);
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if state.audio.is_recording() {
+        state.audio.stop()?;
+    }
+    apply_tray_activity(&app, &state.tray_record_item, "idle", 0);
     Ok(())
 }
 
@@ -120,7 +290,7 @@ async fn stop_recording_and_transcribe(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<OperationResult, String> {
-    update_tray_icon(&app, false);
+    apply_tray_activity(&app, &state.tray_record_item, "transcribing", 0);
     let wav_bytes = state.audio.stop()?;
     let settings = state.db.get_settings()?;
 
@@ -833,17 +1003,9 @@ pub fn run() {
             }
 
             // Setup System Tray
-            let show_item = MenuItem::with_id(app, "show", "Show Lipi", true, None::<&str>)?;
-            let mini_item = MenuItem::with_id(app, "toggle_mini", "Toggle Mini Mode", true, None::<&str>)?;
             let record_item = MenuItem::with_id(app, "toggle_record", "Start / Stop Recording", true, None::<&str>)?;
-            let pref_item = MenuItem::with_id(app, "preferences", "Preferences", true, None::<&str>)?;
-            let sep = PredefinedMenuItem::separator(app)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Quit Lipi", true, None::<&str>)?;
-
-            let tray_menu = Menu::with_items(
-                app,
-                &[&show_item, &mini_item, &record_item, &pref_item, &sep, &quit_item],
-            )?;
+            let tray_menu = build_tray_menu(app.handle(), &app_data_dir, &record_item)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
             let tray_icon = tauri::image::Image::from_bytes(TRAY_IDLE_ICON)
                 .unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
@@ -879,7 +1041,11 @@ pub fn run() {
                         "quit" => {
                             app.exit(0);
                         }
-                        _ => {}
+                        other => {
+                            if let Some(preset_id) = other.strip_prefix("preset:") {
+                                select_tray_preset(app, preset_id);
+                            }
+                        }
                     }
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -928,6 +1094,7 @@ pub fn run() {
                 is_mini: std::sync::atomic::AtomicBool::new(false),
                 paste_target: Arc::new(std::sync::Mutex::new(None)),
                 global_shortcut_registered: std::sync::atomic::AtomicBool::new(global_shortcut_registered),
+                tray_record_item: record_item,
             });
 
             Ok(())
@@ -946,8 +1113,10 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            set_tray_recording_state,
+            set_tray_activity,
+            refresh_tray_presets,
             start_recording,
+            cancel_recording,
             is_recording,
             stop_recording_and_transcribe,
             paste_into_previous_app,
