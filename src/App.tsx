@@ -200,6 +200,8 @@ interface LogEntry {
   details?: string;
 }
 
+const COMPACT_SIDEBAR_WIDTH = 800;
+
 function isFullScreenMode(): boolean {
   if (typeof window === "undefined" || !window.screen) return false;
   if (window.screen.availWidth < 1200) return false;
@@ -215,7 +217,7 @@ export default function App() {
   const [content, setContent] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
-  const [recordSeconds, setRecordSeconds] = useState(0);
+  const [activitySeconds, setActivitySeconds] = useState(0);
   const [copiedNotification, setCopiedNotification] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -623,33 +625,46 @@ export default function App() {
     }
   }
 
-  // Recording timer
+  const activityPhase: "idle" | "recording" | "transcribing" | "transforming" = isTransforming
+    ? "transforming"
+    : isTranscribing
+    ? "transcribing"
+    : isRecording
+    ? "recording"
+    : "idle";
+
   useEffect(() => {
-    if (isRecording) {
-      setRecordSeconds(0);
-      timerRef.current = window.setInterval(() => {
-        setRecordSeconds((s) => s + 1);
-      }, 1000);
-    } else {
+    if (activityPhase === "idle") {
+      setActivitySeconds(0);
+      return;
+    }
+    setActivitySeconds(0);
+    timerRef.current = window.setInterval(() => {
+      setActivitySeconds((s) => s + 1);
+    }, 1000);
+    return () => {
       if (timerRef.current) {
         clearInterval(timerRef.current);
         timerRef.current = null;
       }
-      setRecordSeconds(0);
-    }
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [isRecording]);
+  }, [activityPhase]);
 
   // Keyboard shortcuts (Alt+R, Alt+M, Escape for settings, Space in mini mode)
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       // Escape: return to notes from settings
-      if (e.key === "Escape" && activeViewRef.current === "settings") {
-        e.preventDefault();
-        closeSettings();
-        return;
+      if (e.key === "Escape") {
+        if (activeViewRef.current === "settings") {
+          e.preventDefault();
+          closeSettings();
+          return;
+        }
+        if (isRecordingRef.current && !isTranscribingRef.current) {
+          e.preventDefault();
+          discardRecording();
+          return;
+        }
       }
 
       // Alt+R: toggle recording
@@ -742,6 +757,21 @@ export default function App() {
   }, []);
 
   const isStackedNav = !isFullScreen || windowWidth < 1150;
+  const wasCompactRef = useRef(windowWidth < COMPACT_SIDEBAR_WIDTH);
+  const sidebarOpenBeforeCompactRef = useRef(sidebarOpen);
+
+  useEffect(() => {
+    const compact = windowWidth < COMPACT_SIDEBAR_WIDTH;
+    if (compact && !wasCompactRef.current) {
+      setSidebarOpen((open) => {
+        sidebarOpenBeforeCompactRef.current = open;
+        return false;
+      });
+    } else if (!compact && wasCompactRef.current) {
+      setSidebarOpen(sidebarOpenBeforeCompactRef.current);
+    }
+    wasCompactRef.current = compact;
+  }, [windowWidth]);
 
   async function loadNotes() {
     try {
@@ -819,6 +849,7 @@ export default function App() {
     llmSettingsRef.current = next;
     try {
       await invoke("save_llm_config", { config: next });
+      await invoke("refresh_tray_presets");
     } catch (e) {
       console.error("Failed saving LLM config:", e);
       setErrorMsg(String(e));
@@ -1272,6 +1303,20 @@ export default function App() {
     setTimeout(() => setCopiedNotification(null), 2500);
   }
 
+  async function discardRecording() {
+    if (!isRecordingRef.current || isTranscribingRef.current) return;
+    lastToggleTimeRef.current = Date.now();
+    try {
+      await invoke("cancel_recording");
+      setIsRecording(false);
+      isShortcutRecordingRef.current = false;
+      wasLipiFocusedOnRecordRef.current = false;
+      showToast("Recording cancelled");
+    } catch (err: any) {
+      setErrorMsg(String(err));
+    }
+  }
+
   async function toggleRecording(source: "shortcut" | "manual" = "manual") {
     const now = Date.now();
     if (now - lastToggleTimeRef.current < 350) return;
@@ -1461,16 +1506,19 @@ export default function App() {
     }
   }
 
-  // Sync tray icon with recording state
   useEffect(() => {
-    invoke("set_tray_recording_state", { isRecording }).catch(() => {});
-  }, [isRecording]);
+    invoke("set_tray_activity", {
+      phase: activityPhase,
+      elapsedSecs: activitySeconds,
+    }).catch(() => {});
+  }, [activityPhase, activitySeconds]);
 
   // Listen to system tray events
   useEffect(() => {
     let unlistenMini: (() => void) | undefined;
     let unlistenRec: (() => void) | undefined;
     let unlistenPref: (() => void) | undefined;
+    let unlistenPreset: (() => void) | undefined;
 
     listen("tray_toggle_mini", () => {
       toggleMiniMode(!miniModeRef.current);
@@ -1484,10 +1532,19 @@ export default function App() {
       openSettings("preferences");
     }).then((fn) => { unlistenPref = fn; });
 
+    listen<string>("tray_preset_changed", (event) => {
+      const presetId = event.payload;
+      if (!presetId || presetId === llmSettingsRef.current.voice_preset) return;
+      const next = { ...llmSettingsRef.current, voice_preset: presetId };
+      setLlmSettings(next);
+      llmSettingsRef.current = next;
+    }).then((fn) => { unlistenPreset = fn; });
+
     return () => {
       if (unlistenMini) unlistenMini();
       if (unlistenRec) unlistenRec();
       if (unlistenPref) unlistenPref();
+      if (unlistenPreset) unlistenPreset();
     };
   }, []);
 
@@ -1522,7 +1579,7 @@ export default function App() {
     rawTranscriptRef.current = note.content;
     setLlmResult("");
     setErrorMsg(null);
-    if (typeof window !== "undefined" && window.innerWidth <= 768) {
+    if (typeof window !== "undefined" && window.innerWidth < COMPACT_SIDEBAR_WIDTH) {
       setSidebarOpen(false);
     }
   }
@@ -1681,35 +1738,62 @@ export default function App() {
 
         <button
           className={`btn-mini-record ${isRecording ? "recording" : ""} ${
-            isTranscribing ? "transcribing" : ""
+            isTranscribing || isTransforming ? "transcribing" : ""
           } ${copiedNotification ? "copied" : ""}`}
           onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             e.stopPropagation();
             toggleRecording();
           }}
-          disabled={isTranscribing}
+          disabled={isTranscribing || isTransforming}
           title={
             isRecording
-              ? `Stop Recording (${formatTimer(recordSeconds)})`
+              ? `Stop Recording (${formatTimer(activitySeconds)})`
               : isTranscribing
-              ? "Transcribing..."
+              ? `Transcribing ${formatTimer(activitySeconds)}`
+              : isTransforming
+              ? `Transforming ${formatTimer(activitySeconds)}`
               : copiedNotification
               ? "Copied to clipboard!"
               : "Record (Alt+R or Space)"
           }
         >
-          {isRecording ? "■" : isTranscribing ? "…" : copiedNotification ? "✓" : "●"}
+          {isRecording ? "■" : isTranscribing || isTransforming ? "…" : copiedNotification ? "✓" : "●"}
         </button>
 
-        {isRecording && (
+        {activityPhase !== "idle" && (
           <span
-            className="mini-elapsed-pill"
+            className={`mini-elapsed-pill ${activityPhase === "recording" ? "" : "busy"}`}
             onMouseDown={(e) => e.stopPropagation()}
-            title={`Recording: ${formatTimer(recordSeconds)}`}
+            title={
+              activityPhase === "recording"
+                ? `Recording: ${formatTimer(activitySeconds)}`
+                : activityPhase === "transcribing"
+                ? `Transcribing: ${formatTimer(activitySeconds)}`
+                : `Transforming: ${formatTimer(activitySeconds)}`
+            }
           >
-            {formatTimer(recordSeconds)}
+            {activityPhase === "recording"
+              ? formatTimer(activitySeconds)
+              : activityPhase === "transcribing"
+              ? `⌛ ${formatTimer(activitySeconds)}`
+              : `✨ ${formatTimer(activitySeconds)}`}
           </span>
+        )}
+
+        {isRecording && (
+          <button
+            type="button"
+            className="btn-mini-discard"
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              discardRecording();
+            }}
+            title="Cancel recording"
+          >
+            ✕
+          </button>
         )}
 
         <button
@@ -3841,19 +3925,25 @@ export default function App() {
               </button>
               <span className="brand-name">Lipi</span>
 
-              {isRecording && (
+              {activityPhase === "recording" && (
                 <div className="badge-status badge-recording">
                   <span className="dot pulse"></span>
-                  <span>Rec {formatTimer(recordSeconds)}</span>
+                  <span>Rec {formatTimer(activitySeconds)}</span>
                 </div>
               )}
-              {isTranscribing && (
+              {activityPhase === "transcribing" && (
                 <div className="badge-status badge-transcribing">
                   <span className="dot pulse"></span>
-                  <span>Transcribing...</span>
+                  <span>Transcribing {formatTimer(activitySeconds)}</span>
                 </div>
               )}
-              {!isRecording && !isTranscribing && (
+              {activityPhase === "transforming" && (
+                <div className="badge-status badge-transcribing">
+                  <span className="dot pulse"></span>
+                  <span>Transforming {formatTimer(activitySeconds)}</span>
+                </div>
+              )}
+              {activityPhase === "idle" && (
                 <div className="badge-status badge-idle">
                   <span className="dot"></span>
                   <span>Ready</span>
@@ -4133,7 +4223,7 @@ export default function App() {
                     title="Transform raw transcript using selected LLM voice"
                   >
                     {isTransforming ? (
-                      <>⏳ <span className="btn-transform-text">Transforming...</span></>
+                      <>⏳ <span className="btn-transform-text">Transforming {formatTimer(activitySeconds)}</span></>
                     ) : (
                       <>✨ <span className="btn-transform-text">Transform with LLM</span></>
                     )}
@@ -4309,11 +4399,36 @@ export default function App() {
                 )}
               </button>
 
-              {isRecording && (
-                <div className="record-elapsed-pill" title="Recording elapsed time">
+              {activityPhase !== "idle" && (
+                <div
+                  className={`record-elapsed-pill ${activityPhase === "recording" ? "" : "busy"}`}
+                  title={
+                    activityPhase === "recording"
+                      ? "Recording elapsed time"
+                      : activityPhase === "transcribing"
+                      ? "Transcription elapsed time"
+                      : "Transform elapsed time"
+                  }
+                >
                   <span className="record-elapsed-dot pulse" />
-                  <span className="record-elapsed-time">{formatTimer(recordSeconds)}</span>
+                  <span className="record-elapsed-time">
+                    {activityPhase === "recording"
+                      ? formatTimer(activitySeconds)
+                      : activityPhase === "transcribing"
+                      ? `Transcribing ${formatTimer(activitySeconds)}`
+                      : `Transforming ${formatTimer(activitySeconds)}`}
+                  </span>
                 </div>
+              )}
+              {isRecording && (
+                <button
+                  type="button"
+                  className="btn btn-discard"
+                  onClick={discardRecording}
+                  title="Cancel this recording without transcribing (Esc)"
+                >
+                  Cancel
+                </button>
               )}
             </div>
 
