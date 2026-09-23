@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Lipi Logo" width="160" />
+</p>
+
 # Lipi (লিপি)
 
 **Lipi** (Bengali for *"script"* or *"writing"*) is a fast, lightweight, local-first voice dictation app and AI writing assistant for the desktop.
