@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::models::{
@@ -113,12 +114,14 @@ impl Drop for RunningDaemon {
 
 pub struct ModelSupervisor {
     daemon: Mutex<Option<RunningDaemon>>,
+    loading: AtomicBool,
 }
 
 impl ModelSupervisor {
     pub fn new() -> Self {
         Self {
             daemon: Mutex::new(None),
+            loading: AtomicBool::new(false),
         }
     }
 
@@ -207,6 +210,20 @@ impl ModelSupervisor {
         app_data_dir: &Path,
         custom_models_dir: Option<&str>,
     ) -> Result<u16, String> {
+        while self.loading.swap(true, Ordering::SeqCst) {
+            let _ = tauri::async_runtime::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            })
+            .await;
+        }
+        struct LoadGuard<'a>(&'a AtomicBool);
+        impl Drop for LoadGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _load_guard = LoadGuard(&self.loading);
+
         {
             let mut lock = match self.daemon.lock() {
                 Ok(l) => l,
@@ -307,13 +324,20 @@ server.serve_forever()
 
             let mut cmd = Command::new(&python_exe);
             configure_binary_env_and_flags(&mut cmd, &python_exe);
+            let stderr_path = std::env::temp_dir().join("lipi_fw_daemon.err");
+            let stderr_file = fs::File::create(&stderr_path).ok();
+            if let Some(file) = stderr_file {
+                cmd.stderr(std::process::Stdio::from(file));
+            } else {
+                cmd.stderr(std::process::Stdio::null());
+            }
+
             cmd.arg("-c")
                 .arg(py_server_code)
                 .arg(port.to_string())
                 .arg(target_arg)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
                 .spawn()
                 .map_err(|e| format!("Failed to spawn faster-whisper daemon: {}", e))?
         } else {
@@ -366,40 +390,54 @@ server.serve_forever()
         };
 
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        let mut ready = false;
-        let mut child = child;
-        let daemon_log = std::env::temp_dir().join("lipi_whisper_daemon.err");
+        let daemon_log = if engine == "faster_whisper" {
+            std::env::temp_dir().join("lipi_fw_daemon.err")
+        } else {
+            std::env::temp_dir().join("lipi_whisper_daemon.err")
+        };
+        let attempts = if engine == "faster_whisper" { 300 } else { 75 };
+        let timeout_secs = if engine == "faster_whisper" { 60 } else { 15 };
 
-        for _ in 0..75 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-
-            if let Ok(Some(exit)) = child.try_wait() {
+        let wait_result = tauri::async_runtime::spawn_blocking(move || {
+            let mut child = child;
+            let mut ready = false;
+            for _ in 0..attempts {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if let Ok(Some(exit)) = child.try_wait() {
+                    let details = fs::read_to_string(&daemon_log).unwrap_or_default();
+                    let details = details.trim().to_string();
+                    return Err(if details.is_empty() {
+                        format!("Daemon exited prematurely with status: {}", exit)
+                    } else {
+                        format!("Daemon exited prematurely with status: {}. {}", exit, details)
+                    });
+                }
+                if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(150)).is_ok()
+                {
+                    ready = true;
+                    break;
+                }
+            }
+            if !ready {
+                let _ = child.kill();
+                let _ = child.wait();
                 let details = fs::read_to_string(&daemon_log).unwrap_or_default();
-                let details = details.trim();
+                let details = details.trim().to_string();
                 return Err(if details.is_empty() {
-                    format!("Daemon exited prematurely with status: {}", exit)
+                    format!("Daemon failed to respond within {} seconds", timeout_secs)
                 } else {
-                    format!("Daemon exited prematurely with status: {}. {}", exit, details)
+                    format!(
+                        "Daemon failed to respond within {} seconds. {}",
+                        timeout_secs, details
+                    )
                 });
             }
+            Ok(child)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
-            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(150)).is_ok() {
-                ready = true;
-                break;
-            }
-        }
-
-        if !ready {
-            let _ = child.kill();
-            let _ = child.wait();
-            let details = fs::read_to_string(&daemon_log).unwrap_or_default();
-            let details = details.trim();
-            return Err(if details.is_empty() {
-                "Daemon failed to respond within 15 seconds".into()
-            } else {
-                format!("Daemon failed to respond within 15 seconds. {}", details)
-            });
-        }
+        let child = wait_result?;
 
         let now_instant = std::time::Instant::now();
         let epoch = current_epoch_seconds();

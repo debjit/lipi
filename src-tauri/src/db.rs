@@ -144,8 +144,8 @@ impl Database {
                 total_tokens INTEGER NOT NULL DEFAULT 0,
                 neurons_consumed REAL NOT NULL DEFAULT 0.0,
                 cost_usd REAL NOT NULL DEFAULT 0.0,
-                day_date TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d', 'now')),
-                month TEXT NOT NULL DEFAULT (strftime('%Y-%m', 'now')),
+                day_date TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d', 'now', 'localtime')),
+                month TEXT NOT NULL DEFAULT (strftime('%Y-%m', 'now', 'localtime')),
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             ",
@@ -161,11 +161,11 @@ impl Database {
             [],
         );
         let _ = conn.execute(
-            "UPDATE cf_usage_logs SET day_date = strftime('%Y-%m-%d', created_at) WHERE day_date IS NULL OR day_date = ''",
+            "UPDATE cf_usage_logs SET day_date = strftime('%Y-%m-%d', created_at, 'localtime') WHERE day_date IS NULL OR day_date = ''",
             [],
         );
         let _ = conn.execute(
-            "UPDATE cf_usage_logs SET month = strftime('%Y-%m', created_at) WHERE month IS NULL OR month = ''",
+            "UPDATE cf_usage_logs SET month = strftime('%Y-%m', created_at, 'localtime') WHERE month IS NULL OR month = ''",
             [],
         );
 
@@ -271,7 +271,7 @@ impl Database {
             auto_copy: get_val("auto_copy").map(|v| v != "false" && v != "0").unwrap_or(true),
             auto_paste: get_val("auto_paste").map(|v| v == "true" || v == "1").unwrap_or(false),
             always_on_top: get_val("always_on_top").map(|v| v != "false" && v != "0").unwrap_or(true),
-            engine_mode: get_val("engine_mode").unwrap_or_else(|| "cloud".into()),
+            engine_mode: get_val("engine_mode").unwrap_or_else(|| "local".into()),
             local_engine: get_val("local_engine").unwrap_or_else(|| "whisper_cpu".into()),
             local_model_size: get_val("local_model_size").unwrap_or_else(|| "base".into()),
             models_folder: get_val("models_folder").unwrap_or_default(),
@@ -344,7 +344,7 @@ impl Database {
                 prompt_tokens, completion_tokens, total_tokens,
                 neurons_consumed, cost_usd, day_date, month, created_at
             ) VALUES (
-                'asr', ?1, ?2, 0, 0, 0, ?3, ?4, strftime('%Y-%m-%d', 'now'), strftime('%Y-%m', 'now'), CURRENT_TIMESTAMP
+                'asr', ?1, ?2, 0, 0, 0, ?3, ?4, strftime('%Y-%m-%d', 'now', 'localtime'), strftime('%Y-%m', 'now', 'localtime'), CURRENT_TIMESTAMP
             )",
             params![model, audio_duration_secs, neurons, cost],
         )
@@ -363,7 +363,7 @@ impl Database {
                 prompt_tokens, completion_tokens, total_tokens,
                 neurons_consumed, cost_usd, day_date, month, created_at
             ) VALUES (
-                'llm', ?1, 0.0, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%d', 'now'), strftime('%Y-%m', 'now'), CURRENT_TIMESTAMP
+                'llm', ?1, 0.0, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%d', 'now', 'localtime'), strftime('%Y-%m', 'now', 'localtime'), CURRENT_TIMESTAMP
             )",
             params![model, prompt_tokens, completion_tokens, total_tokens, neurons, cost],
         )
@@ -375,7 +375,7 @@ impl Database {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
         let today_str: String = conn
-            .query_row("SELECT strftime('%Y-%m-%d', 'now')", [], |r| r.get(0))
+            .query_row("SELECT strftime('%Y-%m-%d', 'now', 'localtime')", [], |r| r.get(0))
             .unwrap_or_else(|_| "today".to_string());
 
         let today = conn
@@ -388,7 +388,7 @@ impl Database {
                     COALESCE(SUM(total_tokens), 0),
                     COALESCE(SUM(CASE WHEN service_type = 'llm' THEN 1 ELSE 0 END), 0)
                 FROM cf_usage_logs
-                WHERE day_date = strftime('%Y-%m-%d', 'now')",
+                WHERE day_date = strftime('%Y-%m-%d', 'now', 'localtime')",
                 [],
                 |row| {
                     Ok(CloudflareUsagePeriod {
@@ -405,7 +405,7 @@ impl Database {
             .unwrap_or_default();
 
         let current_month_str: String = conn
-            .query_row("SELECT strftime('%Y-%m', 'now')", [], |r| r.get(0))
+            .query_row("SELECT strftime('%Y-%m', 'now', 'localtime')", [], |r| r.get(0))
             .unwrap_or_else(|_| "current".to_string());
 
         let mut stmt = conn
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(default_settings.auto_copy, true);
         assert_eq!(default_settings.auto_paste, false);
         assert_eq!(default_settings.always_on_top, true);
-        assert_eq!(default_settings.engine_mode, "cloud");
+        assert_eq!(default_settings.engine_mode, "local");
         assert_eq!(default_settings.local_engine, "whisper_cpu");
         assert_eq!(default_settings.local_model_size, "base");
         assert_eq!(default_settings.models_folder, "");

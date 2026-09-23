@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 import "./App.css";
 import { SetupWizard } from "./SetupWizard";
@@ -33,6 +34,13 @@ interface AppSettings {
   provider_id?: string;
   wizard_completed?: boolean;
   live_dictation?: boolean;
+}
+
+function listenForever<T>(event: string, handler: (event: { payload: T }) => void) {
+  const p = listen<T>(event, handler);
+  return () => {
+    void p.then((unlisten) => unlisten());
+  };
 }
 
 function liveCpuNote(size: string): string {
@@ -213,15 +221,6 @@ interface LogEntry {
 
 const COMPACT_SIDEBAR_WIDTH = 800;
 
-function isFullScreenMode(): boolean {
-  if (typeof window === "undefined" || !window.screen) return false;
-  if (window.screen.availWidth < 1200) return false;
-  return (
-    window.innerWidth >= window.screen.availWidth - 40 &&
-    window.innerHeight >= window.screen.availHeight - 80
-  );
-}
-
 export default function App() {
   const [notes, setNotes] = useState<Note[]>([]);
   const [activeNoteId, setActiveNoteId] = useState<number | null>(null);
@@ -233,9 +232,10 @@ export default function App() {
   const [copiedNotification, setCopiedNotification] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(() => isFullScreenMode());
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [activeView, setActiveView] = useState<"notes" | "settings">("notes");
   const [miniMode, setMiniMode] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [memoryStatus, setMemoryStatus] = useState<ModelMemoryStatus | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
@@ -365,6 +365,8 @@ export default function App() {
   rawTranscriptRef.current = rawTranscript;
 
   const [llmResult, setLlmResult] = useState("");
+  const llmResultRef = useRef(llmResult);
+  llmResultRef.current = llmResult;
   const [isTransforming, setIsTransforming] = useState(false);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
@@ -485,7 +487,13 @@ export default function App() {
   const liveAccRef = useRef("");
   const liveNoteIdRef = useRef<number | null>(null);
   const liveNewNoteRef = useRef(false);
+  const liveSeqRef = useRef(0);
   const livePersistTimer = useRef<number | null>(null);
+  const downloadDoneTimer = useRef<number | null>(null);
+  const recordingOpInFlightRef = useRef(false);
+  const toggleRecordingRef = useRef<(source?: "shortcut" | "manual") => void>(() => {});
+  const discardRecordingRef = useRef<() => void>(() => {});
+  const toggleMiniModeRef = useRef<(enable: boolean) => void>(() => {});
 
   const activeIdRef = useRef(activeNoteId);
   activeIdRef.current = activeNoteId;
@@ -499,7 +507,6 @@ export default function App() {
   const miniModeRef = useRef(miniMode);
   miniModeRef.current = miniMode;
 
-  const isGlobalShortcutActiveRef = useRef(false);
   const isShortcutRecordingRef = useRef(false);
   const wasLipiFocusedOnRecordRef = useRef(false);
   const lastToggleTimeRef = useRef(0);
@@ -509,33 +516,40 @@ export default function App() {
     loadSettings();
     loadLlmSettings();
     loadCfUsage();
+    getVersion().then(setAppVersion).catch(() => {});
   }, []);
 
   useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    listen<{ percentage: number; speed_bps?: number; eta_secs?: number }>("model-download-progress", (event) => {
-      setDownloadProgress(event.payload.percentage);
-      if (event.payload.speed_bps !== undefined) {
-        setDownloadSpeedBps(event.payload.speed_bps);
+    const unlisten = listenForever<{ percentage: number; speed_bps?: number; eta_secs?: number }>(
+      "model-download-progress",
+      (event) => {
+        setDownloadProgress(event.payload.percentage);
+        if (event.payload.speed_bps !== undefined) {
+          setDownloadSpeedBps(event.payload.speed_bps);
+        }
+        if (event.payload.eta_secs !== undefined) {
+          setDownloadEtaSecs(event.payload.eta_secs);
+        }
+        if (event.payload.percentage >= 100) {
+          if (downloadDoneTimer.current) window.clearTimeout(downloadDoneTimer.current);
+          downloadDoneTimer.current = window.setTimeout(() => {
+            setDownloadProgress(null);
+            setDownloadSpeedBps(0);
+            setDownloadEtaSecs(0);
+            setIsDownloading(false);
+            refreshModelStatus();
+            downloadDoneTimer.current = null;
+          }, 600);
+        }
       }
-      if (event.payload.eta_secs !== undefined) {
-        setDownloadEtaSecs(event.payload.eta_secs);
-      }
-      if (event.payload.percentage >= 100) {
-        setTimeout(() => {
-          setDownloadProgress(null);
-          setDownloadSpeedBps(0);
-          setDownloadEtaSecs(0);
-          setIsDownloading(false);
-          refreshModelStatus();
-        }, 600);
-      }
-    }).then((fn) => {
-      unlisten = fn;
-    });
+    );
 
     return () => {
-      if (unlisten) unlisten();
+      unlisten();
+      if (downloadDoneTimer.current) {
+        window.clearTimeout(downloadDoneTimer.current);
+        downloadDoneTimer.current = null;
+      }
     };
   }, []);
 
@@ -684,24 +698,23 @@ export default function App() {
         }
         if (isRecordingRef.current && !isTranscribingRef.current) {
           e.preventDefault();
-          discardRecording();
+          discardRecordingRef.current();
           return;
         }
       }
 
-      // Alt+R: toggle recording
-      if (e.altKey && (e.key === "r" || e.key === "R")) {
+      // Alt+R: toggle recording (ignore AltGr, which also sets ctrlKey, and key repeat)
+      if (e.altKey && !e.ctrlKey && !e.metaKey && e.code === "KeyR") {
+        if (e.repeat) return;
         e.preventDefault();
-        if (!isGlobalShortcutActiveRef.current) {
-          toggleRecording("shortcut");
-        }
+        toggleRecordingRef.current("shortcut");
         return;
       }
 
       // Alt+M: toggle mini mode
-      if (e.altKey && (e.key === "m" || e.key === "M")) {
+      if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === "m" || e.key === "M")) {
         e.preventDefault();
-        toggleMiniMode(!miniModeRef.current);
+        toggleMiniModeRef.current(!miniModeRef.current);
         return;
       }
 
@@ -710,7 +723,7 @@ export default function App() {
         const target = e.target as HTMLElement;
         if (target.tagName !== "INPUT" && target.tagName !== "TEXTAREA") {
           e.preventDefault();
-          toggleRecording();
+          toggleRecordingRef.current();
         }
       }
     }
@@ -747,8 +760,6 @@ export default function App() {
 
   // Track fullscreen / maximized state and window dimensions for stacked navbar
   useEffect(() => {
-    let unlistenResize: (() => void) | undefined;
-
     const updateWindowMetrics = async () => {
       setWindowWidth(window.innerWidth);
       try {
@@ -765,17 +776,19 @@ export default function App() {
 
     try {
       const win = getCurrentWindow();
-      win.onResized(() => {
+      const unlistenResizeP = win.onResized(() => {
         updateWindowMetrics();
-      }).then((unlisten) => {
-        unlistenResize = unlisten;
-      }).catch(() => {});
-    } catch {}
+      }).catch(() => undefined);
 
-    return () => {
-      window.removeEventListener("resize", updateWindowMetrics);
-      if (unlistenResize) unlistenResize();
-    };
+      return () => {
+        window.removeEventListener("resize", updateWindowMetrics);
+        void unlistenResizeP.then((unlisten) => unlisten?.());
+      };
+    } catch {
+      return () => {
+        window.removeEventListener("resize", updateWindowMetrics);
+      };
+    }
   }, []);
 
   const isStackedNav = !isFullScreen || windowWidth < 1150;
@@ -994,6 +1007,44 @@ export default function App() {
     handleCancelPresetForm();
   }
 
+  function defaultAsrModel(type: string, current: string): string {
+    if (type === "groq") return "whisper-large-v3-turbo";
+    if (type === "cloudflare") return "@cf/openai/whisper";
+    if (type === "openai" || type === "ollama") return "whisper-1";
+    return current;
+  }
+
+  function resolvedAsrProvider(
+    s: AppSettings = settings,
+    providers: LlmProvider[] = llmSettings.providers || [],
+    activeId: string = llmSettings.active_provider_id
+  ): LlmProvider | undefined {
+    if (s.provider_id) {
+      const byId = providers.find((p) => p.id === s.provider_id);
+      if (byId) return byId;
+    }
+    const url = (s.api_base_url || "").replace(/\/$/, "");
+    if (url && url !== "https://api.openai.com/v1") {
+      const byUrl = providers.find((p) => (p.base_url || "").replace(/\/$/, "") === url);
+      if (byUrl) return byUrl;
+    }
+    return providers.find((p) => p.id === activeId);
+  }
+
+  async function applyProviderToAsr(prov: LlmProvider, extra?: Partial<AppSettings>) {
+    const same = settingsRef.current.provider_id === prov.id;
+    const updated: Partial<AppSettings> = {
+      provider_id: prov.id,
+      api_base_url: prov.base_url,
+      api_key: prov.api_key,
+      ...extra,
+    };
+    if (!same) {
+      updated.model = defaultAsrModel(prov.provider_type, settingsRef.current.model);
+    }
+    await updateAndSaveSettings(updated);
+  }
+
   async function handleFetchModels(providerId?: string) {
     const targetId = providerId || llmSettingsRef.current.active_provider_id;
     setIsFetchingModels(true);
@@ -1001,6 +1052,8 @@ export default function App() {
     try {
       const models: string[] = await invoke("fetch_llm_models", { providerId: targetId });
       setAvailableModels(models);
+      const prov = llmSettingsRef.current.providers.find((p) => p.id === targetId);
+      if (prov) await applyProviderToAsr(prov);
       showToast(`✓ Loaded ${models.length} available models`);
     } catch (err: any) {
       setErrorMsg(String(err));
@@ -1222,14 +1275,8 @@ export default function App() {
       await refreshMemoryStatus();
       await loadLlmSettings();
 
-      invoke<boolean>("is_global_shortcut_registered")
-        .then((reg) => {
-          isGlobalShortcutActiveRef.current = !!reg;
-        })
-        .catch(() => {});
-
       // Check first-run wizard
-      if (!s.wizard_completed && !s.api_key && s.engine_mode !== "local") {
+      if (!s.wizard_completed) {
         setWizardOpen(true);
       }
     } catch (e) {
@@ -1326,10 +1373,11 @@ export default function App() {
   }
 
   useEffect(() => {
-    let unlistenChunk: (() => void) | undefined;
-    let unlistenErr: (() => void) | undefined;
-    listen<{ seq: number; text: string }>("transcript_chunk", (event) => {
+    const unlistenChunk = listenForever<{ seq: number; text: string }>("transcript_chunk", (event) => {
       if (!liveActiveRef.current) return;
+      const seq = event.payload?.seq ?? 0;
+      if (seq && seq <= liveSeqRef.current) return;
+      if (seq) liveSeqRef.current = seq;
       const piece = (event.payload?.text || "").trim();
       if (!piece) return;
       liveAccRef.current = liveAccRef.current ? `${liveAccRef.current} ${piece}` : piece;
@@ -1340,33 +1388,25 @@ export default function App() {
       setContent(next);
       if (livePersistTimer.current) window.clearTimeout(livePersistTimer.current);
       livePersistTimer.current = window.setTimeout(() => {
-        const id = liveNewNoteRef.current ? liveNoteIdRef.current : activeIdRef.current;
-        persistNote(next, id)
+        persistNote(next, liveNoteIdRef.current)
           .then((savedId) => {
-            if (liveNewNoteRef.current) liveNoteIdRef.current = savedId;
+            liveNoteIdRef.current = savedId;
           })
           .catch(() => {});
       }, 1000);
-    }).then((fn) => {
-      unlistenChunk = fn;
     });
-    listen<string>("transcript_error", (event) => {
+    const unlistenErr = listenForever<string>("transcript_error", (event) => {
       if (!liveActiveRef.current) return;
       setErrorMsg(String(event.payload || "Live transcription failed"));
-    }).then((fn) => {
-      unlistenErr = fn;
     });
-    let unlistenBusy: (() => void) | undefined;
-    listen<boolean>("live_transcribing", (event) => {
+    const unlistenBusy = listenForever<boolean>("live_transcribing", (event) => {
       if (!liveActiveRef.current) return;
       setLiveChunkBusy(!!event.payload);
-    }).then((fn) => {
-      unlistenBusy = fn;
     });
     return () => {
-      if (unlistenChunk) unlistenChunk();
-      if (unlistenErr) unlistenErr();
-      if (unlistenBusy) unlistenBusy();
+      unlistenChunk();
+      unlistenErr();
+      unlistenBusy();
     };
   }, []);
 
@@ -1386,6 +1426,7 @@ export default function App() {
       setErrorMsg(String(err));
     }
   }
+  discardRecordingRef.current = () => { void discardRecording(); };
 
   async function toggleRecording(source: "shortcut" | "manual" = "manual") {
     const now = Date.now();
@@ -1393,48 +1434,59 @@ export default function App() {
     lastToggleTimeRef.current = now;
 
     if (isTranscribingRef.current) return;
+    if (recordingOpInFlightRef.current) return;
     setErrorMsg(null);
 
     if (!isRecordingRef.current) {
-      wasLipiFocusedOnRecordRef.current = document.hasFocus() && !miniModeRef.current;
-      if (source === "shortcut") {
-        isShortcutRecordingRef.current = true;
-        if (settingsRef.current.shortcut_record_mode !== "append") {
-          await handleNewNote();
-        }
-      } else {
-        isShortcutRecordingRef.current = false;
-      }
-
-      const live =
-        settingsRef.current.engine_mode === "local" && !!settingsRef.current.live_dictation;
-      liveActiveRef.current = live;
-      setLiveChunkBusy(false);
-      liveAccRef.current = "";
-      liveNoteIdRef.current = null;
-      if (live) {
-        const createNew =
-          (miniModeRef.current && settingsRef.current.mini_record_mode !== "append") ||
-          (source === "shortcut" && settingsRef.current.shortcut_record_mode !== "append");
-        liveNewNoteRef.current = createNew;
-        liveBaseRef.current = createNew
-          ? ""
-          : llmSettingsRef.current.enabled
-          ? rawTranscriptRef.current
-          : activeContentRef.current;
-      } else {
-        liveNewNoteRef.current = false;
-        liveBaseRef.current = "";
-      }
-
+      recordingOpInFlightRef.current = true;
       try {
-        await invoke("start_recording");
+        wasLipiFocusedOnRecordRef.current = document.hasFocus() && !miniModeRef.current;
+        if (source === "shortcut") {
+          isShortcutRecordingRef.current = true;
+          if (settingsRef.current.shortcut_record_mode !== "append") {
+            await handleNewNote();
+          }
+        } else {
+          isShortcutRecordingRef.current = false;
+        }
+
+        const live =
+          settingsRef.current.engine_mode === "local" && !!settingsRef.current.live_dictation;
+        liveActiveRef.current = live;
+        liveSeqRef.current = 0;
+        setLiveChunkBusy(false);
+        liveAccRef.current = "";
+        if (live) {
+          const createNew =
+            (miniModeRef.current && settingsRef.current.mini_record_mode !== "append") ||
+            (source === "shortcut" && settingsRef.current.shortcut_record_mode !== "append");
+          liveNewNoteRef.current = createNew;
+          liveNoteIdRef.current = createNew ? null : activeIdRef.current;
+          liveBaseRef.current = createNew
+            ? ""
+            : llmSettingsRef.current.enabled
+            ? rawTranscriptRef.current
+            : activeContentRef.current;
+        } else {
+          liveNewNoteRef.current = false;
+          liveNoteIdRef.current = null;
+          liveBaseRef.current = "";
+        }
+
+        await invoke("start_recording", {
+          lipiFocused: wasLipiFocusedOnRecordRef.current,
+        });
         setIsRecording(true);
       } catch (err: any) {
         liveActiveRef.current = false;
+        isShortcutRecordingRef.current = false;
+        wasLipiFocusedOnRecordRef.current = false;
         setErrorMsg(String(err));
+      } finally {
+        recordingOpInFlightRef.current = false;
       }
     } else {
+      recordingOpInFlightRef.current = true;
       const wasLive = liveActiveRef.current;
       const liveBase = liveBaseRef.current;
       const liveAcc = liveAccRef.current;
@@ -1500,7 +1552,7 @@ export default function App() {
             } else if (wasLive) {
               const base = liveBase.trim();
               nextRaw = base ? `${base} ${transcript}` : transcript;
-              targetNoteId = activeIdRef.current;
+              targetNoteId = liveNoteId;
             } else {
               const currentRaw = rawTranscriptRef.current;
               nextRaw = currentRaw ? `${currentRaw.trim()} ${transcript}` : transcript;
@@ -1539,7 +1591,7 @@ export default function App() {
             } else if (wasLive) {
               const base = liveBase.trim();
               nextContent = base ? `${base} ${transcript}` : transcript;
-              targetNoteId = activeIdRef.current;
+              targetNoteId = liveNoteId;
             } else {
               const current = activeContentRef.current;
               nextContent = current ? `${current.trim()} ${transcript}` : transcript;
@@ -1577,6 +1629,7 @@ export default function App() {
           details: `Timestamp: ${new Date().toISOString()}\nEngine Mode: ${settingsRef.current.engine_mode}${settingsRef.current.engine_mode === "local" ? ` (${settingsRef.current.local_engine})` : ""}\nModel: ${settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : (settingsRef.current.local_model_size || "(default)")}\nEndpoint: ${settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.api_base_url || "(default)") : "(local)"}\nError:\n${errStr}`,
         });
       } finally {
+        recordingOpInFlightRef.current = false;
         setIsTranscribing(false);
         liveActiveRef.current = false;
         liveAccRef.current = "";
@@ -1587,6 +1640,9 @@ export default function App() {
       }
     }
   }
+  toggleRecordingRef.current = (source?: "shortcut" | "manual") => {
+    void toggleRecording(source);
+  };
 
   async function toggleMiniMode(enable: boolean) {
     try {
@@ -1597,6 +1653,9 @@ export default function App() {
       console.error("Failed to toggle mini mode:", e);
     }
   }
+  toggleMiniModeRef.current = (enable: boolean) => {
+    void toggleMiniMode(enable);
+  };
 
   // Load autostart status on mount
   useEffect(() => {
@@ -1629,36 +1688,39 @@ export default function App() {
 
   // Listen to system tray events
   useEffect(() => {
-    let unlistenMini: (() => void) | undefined;
-    let unlistenRec: (() => void) | undefined;
-    let unlistenPref: (() => void) | undefined;
-    let unlistenPreset: (() => void) | undefined;
+    const unlistenMini = listenForever("tray_toggle_mini", () => {
+      toggleMiniModeRef.current(!miniModeRef.current);
+    });
 
-    listen("tray_toggle_mini", () => {
-      toggleMiniMode(!miniModeRef.current);
-    }).then((fn) => { unlistenMini = fn; });
+    const unlistenRec = listenForever("tray_toggle_recording", () => {
+      toggleRecordingRef.current("shortcut");
+    });
 
-    listen("tray_toggle_recording", () => {
-      toggleRecording("shortcut");
-    }).then((fn) => { unlistenRec = fn; });
-
-    listen("open_preferences", () => {
+    const unlistenPref = listenForever("open_preferences", () => {
       openSettings("preferences");
-    }).then((fn) => { unlistenPref = fn; });
+    });
 
-    listen<string>("tray_preset_changed", (event) => {
+    const unlistenPreset = listenForever<string>("tray_preset_changed", (event) => {
       const presetId = event.payload;
-      if (!presetId || presetId === llmSettingsRef.current.voice_preset) return;
-      const next = { ...llmSettingsRef.current, voice_preset: presetId };
-      setLlmSettings(next);
-      llmSettingsRef.current = next;
-    }).then((fn) => { unlistenPreset = fn; });
+      if (!presetId) return;
+      void invoke<LlmSettings>("get_llm_config")
+        .then((cfg) => {
+          setLlmSettings(cfg);
+          llmSettingsRef.current = cfg;
+        })
+        .catch(() => {
+          if (presetId === llmSettingsRef.current.voice_preset) return;
+          const next = { ...llmSettingsRef.current, voice_preset: presetId };
+          setLlmSettings(next);
+          llmSettingsRef.current = next;
+        });
+    });
 
     return () => {
-      if (unlistenMini) unlistenMini();
-      if (unlistenRec) unlistenRec();
-      if (unlistenPref) unlistenPref();
-      if (unlistenPreset) unlistenPreset();
+      unlistenMini();
+      unlistenRec();
+      unlistenPref();
+      unlistenPreset();
     };
   }, []);
 
@@ -1669,20 +1731,25 @@ export default function App() {
   }
 
   async function handleBlurSave() {
-    if (content.trim()) {
-      await persistNote(content, activeNoteId);
+    const toSave = (llmResultRef.current.trim() || activeContentRef.current).trim();
+    if (toSave) {
+      await persistNote(toSave, activeIdRef.current);
     }
   }
 
   async function handleNewNote() {
-    if (content.trim() && !activeNoteId) {
-      await persistNote(content, null);
+    const draft = activeContentRef.current.trim();
+    if (draft && !activeIdRef.current) {
+      await persistNote(draft, null);
     }
     setActiveNoteId(null);
+    activeIdRef.current = null;
     setContent("");
+    activeContentRef.current = "";
     setRawTranscript("");
     rawTranscriptRef.current = "";
     setLlmResult("");
+    llmResultRef.current = "";
     setErrorMsg(null);
   }
 
@@ -1704,7 +1771,13 @@ export default function App() {
       await invoke("delete_note", { id });
       if (activeNoteId === id) {
         setActiveNoteId(null);
+        activeIdRef.current = null;
         setContent("");
+        activeContentRef.current = "";
+        setRawTranscript("");
+        rawTranscriptRef.current = "";
+        setLlmResult("");
+        llmResultRef.current = "";
       }
       await loadNotes();
     } catch (err: any) {
@@ -2088,9 +2161,9 @@ export default function App() {
               </button>
             </nav>
 
-            {settings.engine_mode === "local" && (
-              <div className="settings-sidebar-footer">
-                {memoryStatus?.is_loaded ? (
+            <div className="settings-sidebar-footer">
+              {settings.engine_mode === "local" && (
+                memoryStatus?.is_loaded ? (
                   <div className="memory-badge-loaded">
                     <span className="memory-pulse-dot"></span>
                     <span>RAM: ~{memoryStatus.estimated_ram_mb} MB</span>
@@ -2099,9 +2172,10 @@ export default function App() {
                   <div className="memory-badge-cold">
                     <span>○ RAM: Inactive (0 MB)</span>
                   </div>
-                )}
-              </div>
-            )}
+                )
+              )}
+              {appVersion && <span className="app-version">v{appVersion}</span>}
+            </div>
           </aside>
 
           {/* Settings Main Content Area */}
@@ -2190,8 +2264,7 @@ export default function App() {
                     {llmSettings.providers.map((p) => {
                       const isSelected = editingProviderId === p.id;
                       const isLlmActive = llmSettings.active_provider_id === p.id;
-                      const currentAsrPid = settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id);
-                      const isAsrActive = currentAsrPid === p.id;
+                      const isAsrActive = resolvedAsrProvider()?.id === p.id;
                       return (
                         <div
                           key={p.id}
@@ -2542,7 +2615,7 @@ export default function App() {
                         type="button"
                         className="btn btn-secondary btn-sm"
                         onClick={() => {
-                          const curPid = settings.provider_id || (llmSettings.providers.find((p) => p.base_url === settings.api_base_url)?.id) || llmSettings.providers[0]?.id;
+                          const curPid = resolvedAsrProvider()?.id;
                           if (curPid) setEditingProviderId(curPid);
                           setSettingsNavTab("providers");
                         }}
@@ -2552,24 +2625,11 @@ export default function App() {
                     </div>
                     <select
                       className="form-input form-select"
-                      value={settings.provider_id || (llmSettings.providers.find((p) => p.base_url === settings.api_base_url)?.id) || llmSettings.providers[0]?.id || ""}
+                      value={resolvedAsrProvider()?.id || ""}
                       onChange={(e) => {
-                        const pid = e.target.value;
-                        const prov = llmSettings.providers.find((p) => p.id === pid);
-                        if (prov) {
-                          let defaultModel = settings.model;
-                          if (prov.provider_type === "groq") defaultModel = "whisper-large-v3-turbo";
-                          else if (prov.provider_type === "cloudflare") defaultModel = "@cf/openai/whisper";
-                          else if (prov.provider_type === "openai" || prov.provider_type === "ollama") defaultModel = "whisper-1";
-                          const updated: Partial<AppSettings> = {
-                            provider_id: prov.id,
-                            api_base_url: prov.base_url,
-                            api_key: prov.api_key,
-                            model: defaultModel,
-                          };
-                          setSettings((prev) => ({ ...prev, ...updated }));
-                          updateAndSaveSettings(updated);
-                        }
+                        const prov = llmSettings.providers.find((p) => p.id === e.target.value);
+                        if (!prov || prov.id === settingsRef.current.provider_id) return;
+                        void applyProviderToAsr(prov);
                       }}
                     >
                       {llmSettings.providers.map((p) => (
@@ -2579,8 +2639,7 @@ export default function App() {
                       ))}
                     </select>
                     {(() => {
-                      const curPid = settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id) || llmSettings.providers[0]?.id;
-                      const prov = llmSettings.providers.find((p) => p.id === curPid);
+                      const prov = resolvedAsrProvider();
                       if (!prov) return null;
                       return (
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "4px", fontSize: "12px", color: "var(--text-secondary)" }}>
@@ -2602,8 +2661,7 @@ export default function App() {
                       onBlur={() => updateAndSaveSettings({ model: settings.model })}
                     />
                     {(() => {
-                      const curPid = settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id) || llmSettings.providers[0]?.id;
-                      const prov = llmSettings.providers.find((p) => p.id === curPid);
+                      const prov = resolvedAsrProvider();
                       const pType = prov?.provider_type;
                       if (pType === "cloudflare") {
                         return (
@@ -4065,11 +4123,12 @@ export default function App() {
                 type="button"
                 className="btn-icon"
                 onClick={() => setSidebarOpen(!sidebarOpen)}
-                title="Toggle sidebar"
+                title={sidebarOpen ? "Hide history" : "Show history"}
               >
                 ☰
               </button>
               <span className="brand-name">Lipi</span>
+              {appVersion && <span className="app-version">v{appVersion}</span>}
 
               {activityPhase === "recording" && (
                 <div className="badge-status badge-recording">
@@ -4491,6 +4550,7 @@ export default function App() {
                   }
                   value={llmResult}
                   onChange={(e) => setLlmResult(e.target.value)}
+                  onBlur={handleBlurSave}
                 />
                 <div className="panel-footer">
                   <span>{llmResult.trim() ? llmResult.trim().split(/\s+/).length : 0} words</span>

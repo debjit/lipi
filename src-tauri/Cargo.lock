@@ -2569,6 +2569,8 @@ dependencies = [
  "arboard",
  "cpal",
  "enigo",
+ "gio",
+ "glib",
  "hound",
  "ndarray",
  "ort",

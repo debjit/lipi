@@ -209,6 +209,12 @@ body, html, #root {
   letter-spacing: -0.01em;
 }
 
+.app-version {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
 .badge-status {
   display: inline-flex;
   align-items: center;
@@ -664,7 +670,7 @@ body, html, #root {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  background: transparent !important;
+  background: var(--bg-secondary) !important;
   border: none !important;
   box-shadow: none !important;
   padding: 0 4px;
@@ -672,6 +678,7 @@ body, html, #root {
   overflow: hidden;
   user-select: none;
   cursor: grab;
+  border-radius: 14px;
 }
 
 .mini-widget:active {
@@ -691,7 +698,6 @@ body, html, #root {
   font-size: 11px;
   cursor: grab;
   box-shadow: 0 4px 10px rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(8px);
   flex-shrink: 0;
   line-height: 1;
 }

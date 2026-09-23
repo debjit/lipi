@@ -247,6 +247,30 @@ fn build_stream(
             err_fn,
             None,
         ),
+        SampleFormat::I32 => device.build_input_stream(
+            &stream_config,
+            move |data: &[i32], _| {
+                if let Ok(mut lock) = samples.lock() {
+                    for &sample in data {
+                        lock.push(sample as f32 / 2147483648.0);
+                    }
+                }
+            },
+            err_fn,
+            None,
+        ),
+        SampleFormat::U8 => device.build_input_stream(
+            &stream_config,
+            move |data: &[u8], _| {
+                if let Ok(mut lock) = samples.lock() {
+                    for &sample in data {
+                        lock.push((sample as f32 - 128.0) / 128.0);
+                    }
+                }
+            },
+            err_fn,
+            None,
+        ),
         _ => return Err(format!("Unsupported sample format: {:?}", sample_format)),
     }
     .map_err(|e| format!("Failed to build input stream: {}", e))?;
