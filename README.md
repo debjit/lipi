@@ -1,231 +1,214 @@
 # Lipi (লিপি)
 
-> **Lipi** (*"script"* or *"writing"* in Bengali) is a fast, lightweight, local-first desktop voice dictation and AI assistant.
+**Lipi** (Bengali for *"script"* or *"writing"*) is a fast, lightweight, local-first voice dictation app and AI writing assistant for the desktop.
+
+Press **`Alt + R`** in any app, speak, and press it again. Lipi transcribes your voice, optionally polishes it with an LLM, and pastes the result straight into the window you were working in: your editor, browser, terminal, or chat app.
 
 <p align="center">
   <img src="assets/demo.gif" alt="Lipi demo: press Alt+R, dictate, polish with an LLM, and paste into the active window" width="860" />
 </p>
 
-### 📥 Download Pre-Release
-
-Get pre-compiled binaries for your OS from **[Latest GitHub Releases](https://github.com/debjit/lipi/releases)**:
-
-| Platform | Package Formats | Download |
-| :--- | :--- | :--- |
-| 🪟 **Windows** | `.msi`, `setup.exe` (NSIS) | **[Windows Binaries ➔](https://github.com/debjit/lipi/releases)** |
-| 🐧 **Linux** | `.deb`, `.AppImage` (x86_64) | **[Linux Binaries ➔](https://github.com/debjit/lipi/releases)** |
-
----
-
-Press **`Alt + R`** anywhere to speak. Lipi transcribes your voice—either 100% offline with local Whisper or via high-speed cloud AI—optionally cleans up grammar or reformats with LLMs, and automatically pastes the result directly into your active window (VSCode, Cursor, browser, terminal).
+<p align="center">
+  <a href="https://github.com/debjit/lipi/releases"><b>Download</b></a> ·
+  <a href="#features">Features</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#faq">FAQ</a> ·
+  <a href="#building-from-source">Build from source</a>
+</p>
 
 ---
 
-## ⚡ Overview
+## Features
 
-- 🎙️ **System-Wide Dictation (`Alt + R`)**: Speak from anywhere without leaving your working window. Lipi restores your target app and auto-pastes the text.
-- ⏱️ **Live Dictation (local, off by default)**: With a local Whisper engine, text can appear at each pause while the mic stays open. Cloud and self-hosted APIs stay one transcript after you stop.
-- 🔒 **Offline or Cloud Speech-to-Text**: Run private Whisper models on CPU/GPU without internet, or connect fast cloud APIs (Groq, Cloudflare Workers AI, OpenAI).
-- 🤖 **Automated AI Polish**: Post-process speech on the fly—fix grammar, summarize, or reformat using local or remote LLMs.
-- 🪟 **Compact Floating Widget (`Alt + M`)**: Collapse Lipi into a minimalist, always-on-top pill widget that stays out of your way while multitasking.
-- 📝 **Local-First History**: Search and manage all previous dictations, notes, and AI transformations locally in SQLite.
+- **Dictate anywhere with `Alt + R`.** Lipi records from any app, then brings your original window back and pastes the text for you.
+- **Offline or cloud transcription.** Run Whisper models locally on your CPU or GPU with no internet connection, or use fast cloud APIs such as Groq, Cloudflare Workers AI, or OpenAI.
+- **Live dictation (optional, local only).** Text appears each time you pause while the microphone stays open.
+- **AI polish.** Automatically fix grammar, change tone, summarize, or turn speech into bullet points with a local or remote LLM. Prompts are plain Markdown files you can edit.
+- **Mini floating widget with `Alt + M`.** Shrink Lipi into a small always-on-top pill that stays out of your way.
+- **Private, local history.** Every note and transcript is stored on your machine in SQLite and can be searched later.
 
----
+## Download
 
-## 🛠️ Tech Stack
+Pre-release builds are available on the **[GitHub Releases](https://github.com/debjit/lipi/releases)** page.
 
-- **Desktop Framework**: [Tauri v2](https://v2.tauri.app/)
-- **Frontend**: [React 19](https://react.dev/), [TypeScript](https://www.typescriptlang.org/), [Vite](https://vitejs.dev/)
-- **Backend**: [Rust](https://www.rust-lang.org/)
-- **Audio Capture**: [`cpal`](https://github.com/RustAudio/cpal) (16kHz mono capture) & [`hound`](https://github.com/ruuda/hound) (WAV encoding)
-- **Database**: Embedded SQLite via [`rusqlite`](https://github.com/rusqlite/rusqlite)
-- **HTTP Client**: [`reqwest`](https://github.com/seanmonstar/reqwest) (rustls, multipart audio upload & base64 JSON streaming)
-- **Local ASR**: `whisper.cpp` (`whisper-cli`) and `faster-whisper` in an isolated virtual environment
-- **Live speech detection**: [Silero VAD v5](https://github.com/snakers4/silero-vad) (`silero_vad.onnx`, ~2 MB) via ONNX Runtime, in front of the local speech model
+| Platform | Formats |
+| :--- | :--- |
+| Windows | `.msi`, `setup.exe` (NSIS) |
+| Linux (x86_64) | `.deb`, `.AppImage` |
 
----
+## Quick start
 
-## 🚀 Getting Started
+1. Install and open Lipi. The setup wizard checks your RAM and CPU and recommends either local or cloud transcription.
+2. Pick a speech engine:
+   - **Local:** choose a runner and a model (start with `base` or `small`), and Lipi downloads it for you.
+   - **Cloud:** choose a provider and paste your API key.
+3. Optional: in **Settings > Preferences**, turn on **Paste into previous application**.
+4. Switch to any app, press **`Alt + R`**, speak, then press **`Alt + R`** again to stop.
+
+The transcript (polished by your active AI preset, if auto-transform is on) is pasted into that app.
+
+> [!NOTE]
+> If you press `Alt + R` while Lipi's own window is focused, the text stays in Lipi's editor and Lipi does not switch to another window.
+
+### Keyboard shortcuts
+
+| Shortcut | Action |
+| :--- | :--- |
+| `Alt + R` | Start or stop recording from anywhere |
+| `Alt + M` | Switch between the full window and the mini floating widget |
+
+## Configuration
+
+All settings live in the **Settings** page, which has four tabs.
+
+### Speech recognition (ASR)
+
+- **Engine**
+  - **Remote API:** presets for Groq, Cloudflare Workers AI, OpenAI, a local/self-hosted server, or a custom endpoint.
+  - **Local engine:** `whisper_cpu`, `whisper_vulkan` (GPU), or `faster_whisper`. Each runner can be set up with one click; `faster_whisper` is installed into its own Python virtual environment.
+- **Models:** download `tiny`, `base`, `small`, `medium`, or `turbo_q8` with live progress, and store them in any folder, including an external drive.
+- **Memory:** local models are unloaded after a period of inactivity (2, 5, 10 (default), or 30 minutes, or never). The tab shows current RAM usage and has a button to unload the model now.
+- **Request timeout:** 3 minutes by default (also the minimum), with quick options for 5 and 10 minutes or a custom value in seconds.
+
+#### Live dictation
+
+Live dictation is **off by default** and only works with local engines. Cloud and self-hosted APIs ignore the setting and transcribe once when you stop.
+
+- Turning it on downloads [Silero VAD](https://github.com/snakers4/silero-vad) (about 2 MB), a small voice-activity detector, into your models folder.
+- Speech is split at each pause (about 0.6 seconds of silence) or every 20 seconds, and each piece is transcribed in order. A spinner next to the timer shows when a piece is being processed.
+- Cancelling discards the phrase in progress but keeps any text already shown.
+- The main cost is running the speech model at every pause. `tiny` and `base` usually keep up; `medium` and `turbo_q8` may fall a few seconds behind and keep a CPU core busy.
+- AI polish, copying, and pasting still happen **once**, after you stop recording.
+
+### AI post-processing (LLM)
+
+- **Providers:** add as many endpoints as you like: Cloudflare Workers AI, Groq, OpenAI, or any OpenAI-compatible server such as Ollama, vLLM, or Speaches. Available models are fetched from each provider's `/models` endpoint.
+- **Presets:** switch between Grammar Fix, Professional Tone, Casual, Concise Summary, Bullet Points, or your own prompts. Presets are Markdown files with YAML frontmatter, stored in the `presets` folder inside Lipi's data directory, so you can edit them in any text editor.
+- **Auto-transform:** run the active preset automatically as soon as recording stops.
+
+### Preferences
+
+| Setting | What it does |
+| :--- | :--- |
+| Language code | ISO-639-1 code such as `en`, `bn`, `es`, or `hi`. Leave empty to auto-detect. |
+| Auto-copy | Copy the transcript to the clipboard when recording finishes. |
+| Paste into previous application | Bring back the window you were using and paste with `Ctrl + V`. |
+| Always on top | Keep Lipi above other windows. |
+| Start on system startup | Launch Lipi when you log in. |
+| `Alt + R` recording behavior | Create a new note for each recording (default), or append to the open note. |
+| Mini widget recording behavior | Save recordings from the mini widget as new notes (default), or append to the open note. |
+
+### Diagnostic logs
+
+A live log of transcription attempts, errors, endpoints, and models. **Copy All Logs** produces a formatted report you can attach to a bug report.
+
+## Auto-paste on each platform
+
+| Platform | Behavior |
+| :--- | :--- |
+| Windows | Works out of the box. |
+| Linux (X11) | Works out of the box. |
+| Linux (Wayland) | GNOME shows a **Remote Desktop** permission prompt the first time Lipi pastes. Click **Allow**, or install `ydotool` to skip the prompt. |
+
+Wayland stops apps from sending keystrokes to other windows unless you allow it, so Lipi sends `Ctrl + V` through the desktop portal, which asks for permission. If you'd rather paste silently in the background, install `ydotool`; Lipi uses it automatically when it is available:
+
+```bash
+sudo apt install ydotool
+systemctl --user enable --now ydotoold
+```
+
+## FAQ
+
+**Where is my data stored?**
+Notes, transcripts, and settings are kept in a local SQLite database:
+
+- Linux: `~/.local/share/com.lipi.app/lipi.db`
+- Windows: `%LOCALAPPDATA%\com.lipi.app\lipi.db`
+
+Nothing leaves your machine unless you configure a cloud speech or LLM provider.
+
+**Can I use Lipi completely offline?**
+Yes. Use a local speech engine, and either turn off AI polish or point it at a local LLM such as Ollama.
+
+**Which local model should I pick?**
+`base` is a good default on most machines. Use `tiny` on low-end hardware or with live dictation, and `small`, `medium`, or `turbo_q8` if you want better accuracy and have RAM and CPU to spare. The setup wizard suggests a model based on your hardware.
+
+**Should `Alt + R` create a new note or append?**
+Your choice. Change it under **Settings > Preferences > `Alt + R` recording behavior**.
+
+## Building from source
 
 ### Prerequisites
 
-1. **Node.js**: v18+ recommended (npm, pnpm, or yarn)
-2. **Rust toolchain**: Install via [rustup](https://rustup.rs/)
-3. **System Dependencies** (Linux):
-   ```bash
-   # Debian / Ubuntu
-   sudo apt update
-   sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev python3 python3-venv zenity
-   ```
+- [Node.js](https://nodejs.org/) 18 or later
+- The Rust toolchain, installed with [rustup](https://rustup.rs/)
+- On Debian or Ubuntu, these system packages:
 
-### Installation & Setup
+  ```bash
+  sudo apt update
+  sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev \
+    libssl-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev \
+    python3 python3-venv zenity
+  ```
 
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/debjit/lipi.git
-   cd lipi
-   ```
+### Build and run
 
-2. **Install Node dependencies**:
-   ```bash
-   npm install
-   ```
+```bash
+git clone https://github.com/debjit/lipi.git
+cd lipi
+npm install
 
-3. **Run in development mode**:
-   ```bash
-   npm run tauri dev
-   ```
+# Run in development mode
+npm run tauri dev
 
-4. **Run automated tests**:
-   ```bash
-   # Rust backend tests
-   cargo test --manifest-path src-tauri/Cargo.toml
+# Run tests and type checks
+cargo test --manifest-path src-tauri/Cargo.toml
+npm run build
 
-   # Frontend TypeScript check and build
-   npm run build
-   ```
+# Build release installers
+npm run tauri build
+```
 
-5. **Build production binaries**:
-   ```bash
-   npm run tauri build
-   ```
+### Tech stack
 
----
+- **App framework:** [Tauri v2](https://v2.tauri.app/) with a [Rust](https://www.rust-lang.org/) backend
+- **Frontend:** [React 19](https://react.dev/), [TypeScript](https://www.typescriptlang.org/), [Vite](https://vitejs.dev/)
+- **Audio:** [`cpal`](https://github.com/RustAudio/cpal) for 16 kHz mono capture and [`hound`](https://github.com/ruuda/hound) for WAV encoding
+- **Local speech recognition:** `whisper.cpp` (`whisper-cli`) and `faster-whisper`
+- **Voice activity detection:** [Silero VAD v5](https://github.com/snakers4/silero-vad) via ONNX Runtime
+- **Storage:** SQLite via [`rusqlite`](https://github.com/rusqlite/rusqlite)
+- **HTTP:** [`reqwest`](https://github.com/seanmonstar/reqwest) with rustls
 
-## ⚙️ Settings & Configuration
-
-Lipi provides a modular full-page Settings dashboard organized into four tabs:
-
-### 1. 🎙 ASR (Automatic Speech Recognition)
-- **Engine Mode**:
-  - **Remote API**: Select from presets (**Groq**, **Cloudflare Workers AI**, **OpenAI**, **Local / Self-Hosted**, or **Custom**).
-  - **Local Offline Engine**: Select runner (`whisper_cpu`, `faster_whisper`, or `whisper_vulkan`).
-- **Runner Setup**:
-  - One-click setup for runner binary or isolated Python virtual environment.
-- **Model Storage & Weights**:
-  - Select or browse storage directory (e.g. `/media/external/models`).
-  - Stream download weights (`tiny`, `base`, `small`, `medium`, `turbo_q8`) with live progress.
-- **Live Dictation** (local engines only, default off):
-  - Turning it on downloads Silero VAD next to the speech weights. Turning it off returns to one transcript after Stop and leaves the file in place.
-  - Speech is cut on a pause (about 0.6 s of silence), or at about 20 s, and each clip is transcribed in order. A spinner sits beside the recording timer while a clip is running. Cancel drops the phrase still open and keeps text already shown.
-  - The extra cost is transcribing every pause, not the VAD file. Tiny and Base usually keep up. Small holds a core longer. Medium and Turbo Q8 can keep a core busy and lag a few seconds, and the speech model stays in RAM.
-  - If LLM auto-transform is on, the rewrite still runs once, after you stop, on the finished dictation. Copy and paste happen once then, not per pause.
-- **RAM Supervisor**:
-  - Configure idle unload timeout (2 min, 5 min, 10 min default, 30 min, or Never).
-  - Live RAM usage monitor and manual unload button.
-- **Request Timeout**:
-  - Unified timeout control with 3m (180s default/minimum), 5m, and 10m quick selectors or custom seconds input.
-
-### 2. 🤖 LLM (Post-Processing & Rectification)
-- **Configured Providers**:
-  - Add and manage multiple AI endpoints: **Cloudflare Workers AI**, **Groq Cloud**, **OpenAI**, and **Custom / Local** (Ollama, vLLM, Speaches).
-  - Live model directory lookup via `/models` endpoints with curated fallbacks.
-- **Voice Presets & Markdown Prompt Engine**:
-  - Switch transformation instructions on the fly: Grammar Fix, Professional Tone, Casual, Concise Summary, Bullet Points, or custom.
-  - Presets are stored as open `.md` files with YAML frontmatter in `presets/`—editable via your favorite text editor.
-- **Auto-Transform Mode**:
-  - Immediately post-process transcribed speech with your active LLM preset when recording stops.
-- **Request Timeout**:
-  - Shared timeout limit ensuring LLMs have adequate time for large generation tasks.
-
-### 3. ⚙ Preferences
-- **Language Code**: Optional ISO-639-1 code (e.g., `en`, `bn`, `es`, `hi`) or empty for auto-detection.
-- **Auto-Copy to Clipboard**: Copy transcript immediately upon recording completion.
-- **Auto-Paste to Previous Application**: Restore previous app window and send `Ctrl+V` after dictation/auto-transform.
-- **Always on Top**: Keep the window floating above all desktop applications.
-- **Start Lipi on System Startup**: Automatically launches Lipi upon desktop login.
-- **Alt+R Shortcut Recording Behavior**: Configure whether `Alt+R` creates an independent new note (default) or appends onto the active note.
-- **Mini Wizard Recording Behavior**: Configure whether finishing a recording in the Mini Wizard saves as a new note (default) or appends to the current note.
-
-### 4. 📋 Diagnostic Logs
-- Real-time log history of transcription attempts, backend errors, endpoints, and models.
-- One-click `📋 Copy All Logs` to generate a formatted diagnostic report for troubleshooting.
-
----
-
-## 💡 How-To & FAQ
-
-### How does Auto-Paste work?
-
-1. Open **Settings > Preferences** (or the ⚙ menu) and enable **"Paste into previous application"**.
-2. Work in your favorite app (VSCode, Cursor, browser, Slack, terminal).
-3. Press **`Alt + R`** from anywhere to start recording.
-4. Speak, then press **`Alt + R`** again to stop.
-5. Lipi transcribes (and optionally applies your active AI prompt), restores your target app, and types `Ctrl+V` directly into your editor.
-
-> [!NOTE]
-> **Working in Lipi:** If you press `Alt + R` while working directly inside Lipi's main window, Lipi automatically keeps the text in Lipi's own editor and will **not** minimize or switch away to a background window.
-
----
-
-### Platform Paste Behavior: Linux vs. Windows
-
-| Platform | Auto-Paste Behavior | Setup Required |
-| :--- | :--- | :--- |
-| **Windows** | **Works seamlessly out of the box.** Lipi automatically restores your foreground window and simulates `Ctrl+V`. | None. |
-| **Linux (X11)** | **Works out of the box.** Window activation and `Ctrl+V` are simulated directly. | None. |
-| **Linux (Wayland)** | **Requires Screen Control approval.** Wayland sandboxes input between windows. When auto-paste triggers, GNOME shows a **"Remote Desktop"** prompt. Click **Allow** to permit `Ctrl+V` injection. | Click **Allow** on the GNOME prompt, or install `ydotool` for prompt-less background pasting. |
-
-#### Why does GNOME Wayland show a "Remote Desktop" prompt?
-Modern Wayland compositors (such as GNOME Mutter on Ubuntu / Fedora) isolate applications for security, preventing any background app from silently injecting synthetic keystrokes into other windows. To send `Ctrl+V`, Lipi routes the key through the official desktop portal, which prompts you to authorize input control.
-
-> **Optional (Bypass Prompt on Wayland):**
-> If you prefer completely silent background key injection on Wayland without any system prompt, you can install `ydotool`:
-> ```bash
-> sudo apt install ydotool
-> systemctl --user enable --now ydotoold
-> ```
-> When `ydotool` is detected on your system, Lipi uses it automatically.
-
----
-
-### FAQ
-
-#### Q: How do I choose whether `Alt + R` creates a new note or appends?
-In **Settings > Preferences**, look for **"Alt+R Shortcut Recording Behavior"**:
-- **Create a new note for each recording (Default)**: Each recording starts a fresh note and clean transcription/conversion.
-- **Append to current active note**: Adds newly dictated speech to the end of the currently open note.
-
-#### Q: What is Live Dictation?
-In **Settings > ASR**, with a local engine selected, **Live dictation** is off until you turn it on. The same switch is on the local step of the setup wizard. It downloads a small Silero VAD model and writes text into the note as you pause, while the mic stays open. Groq, OpenAI, Cloudflare, and self-hosted APIs ignore the switch and still transcribe once when you stop.
-
-#### Q: What is the Mini Floating Wizard?
-Press **`Alt + M`** (or click the `⊡ Mini Wizard` button in the navbar) to collapse Lipi into a compact, always-on-top floating pill. It lets you record, view audio levels, and monitor AI progress while multitasking. Press `Alt + M` again to expand back to full mode.
-
-#### Q: Where is my data stored?
-All recordings, notes, and preferences are stored locally on your machine in an embedded SQLite database located at `~/.local/share/com.lipi.app/lipi.db` (Linux) or `%LOCALAPPDATA%\com.lipi.app\lipi.db` (Windows). No audio or notes are uploaded to any external server unless you configure a remote cloud AI provider.
-
----
-
-## 📂 Project Structure
+### Project structure
 
 ```
 lipi/
-├── src/                      # React frontend (Vite + TypeScript)
-│   ├── App.tsx               # Main UI, dual editor, settings tabs, shortcuts
-│   ├── App.css               # Responsive styling, mini wizard, settings themes
-│   └── main.tsx              # React root entry
-├── src-tauri/                # Tauri Rust application
+├── src/                     # React frontend
+│   ├── App.tsx              # Main UI, editor, settings, shortcuts
+│   ├── SetupWizard.tsx      # First-run setup wizard
+│   ├── App.css              # Styles, including the mini widget
+│   └── main.tsx             # React entry point
+├── src-tauri/               # Tauri / Rust backend
 │   ├── src/
-│   │   ├── audio.rs          # CPAL audio recording, resampling, live VAD capture
-│   │   ├── vad.rs            # Silero VAD and pause-based speech segments
-│   │   ├── db.rs             # SQLite storage (notes, app settings, window state)
-│   │   ├── engine.rs         # Local Whisper runner & RAM supervisor
-│   │   ├── env_config.rs     # Multi-provider LLM configuration & .env sync
-│   │   ├── llm.rs            # LLM API client & chat completions
-│   │   ├── models.rs         # Hugging Face download & binary setup
-│   │   ├── presets.rs        # Markdown voice preset manager
-│   │   ├── transcribe.rs     # Cloud ASR client (Groq, Cloudflare, OpenAI)
-│   │   ├── lib.rs            # Tauri commands, lifecycle events, window state
-│   │   └── main.rs           # Application entry
-│   ├── Cargo.toml            # Rust dependencies & optimization profiles
-│   └── tauri.conf.json       # Tauri configuration & window settings
-├── package.json              # Frontend dependencies & scripts
-└── README.md
+│   │   ├── lib.rs           # Tauri commands, lifecycle events, window state
+│   │   ├── main.rs          # Application entry point
+│   │   ├── audio.rs         # Audio capture, resampling, live capture
+│   │   ├── vad.rs           # Silero VAD and pause-based segmentation
+│   │   ├── engine.rs        # Local Whisper runners and RAM supervisor
+│   │   ├── transcribe.rs    # Cloud speech-to-text clients
+│   │   ├── llm.rs           # LLM chat-completion client
+│   │   ├── env_config.rs    # LLM provider configuration and .env sync
+│   │   ├── presets.rs       # Markdown preset manager
+│   │   ├── models.rs        # Model downloads and runner setup
+│   │   ├── paste.rs         # Window restore and auto-paste per platform
+│   │   ├── specs.rs         # Hardware detection and recommendations
+│   │   └── db.rs            # SQLite storage
+│   ├── Cargo.toml
+│   └── tauri.conf.json
+└── package.json
 ```
 
----
+## License
 
-## 📄 License
-
-GNU Affero General Public License v3.0 (AGPL-3.0). See [LICENSE](LICENSE) for details.
+Lipi is licensed under the [GNU Affero General Public License v3.0](LICENSE).
