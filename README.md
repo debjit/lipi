@@ -2,6 +2,10 @@
 
 > **Lipi** (*"script"* or *"writing"* in Bengali) is a fast, lightweight, local-first desktop voice dictation and AI assistant.
 
+<p align="center">
+  <img src="assets/demo.gif" alt="Lipi demo: press Alt+R, dictate, polish with an LLM, and paste into the active window" width="860" />
+</p>
+
 ### 📥 Download Pre-Release
 
 Get pre-compiled binaries for your OS from **[Latest GitHub Releases](https://github.com/debjit/lipi/releases)**:
