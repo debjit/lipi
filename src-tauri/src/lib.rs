@@ -1,20 +1,24 @@
 mod audio;
 mod db;
+mod vad;
 mod engine;
 mod env_config;
 mod llm;
 mod models;
 mod paste;
 mod presets;
+mod shortcut;
 mod specs;
 mod transcribe;
 
 use audio::AudioRecorder;
 use db::{AppSettings, Database, Note};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
@@ -22,22 +26,191 @@ use tauri::{
 const TRAY_IDLE_ICON: &[u8] = include_bytes!("../icons/tray_idle_32.png");
 const TRAY_RECORDING_ICON: &[u8] = include_bytes!("../icons/tray_recording_32.png");
 
-fn update_tray_icon(app: &tauri::AppHandle, is_recording: bool) {
+fn format_mmss(secs: u64) -> String {
+    format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+fn escape_menu_label(label: &str) -> String {
+    label.replace('&', "&&").replace('\n', " ")
+}
+
+fn activity_is_busy(phase: &str) -> bool {
+    matches!(phase, "recording" | "transcribing" | "transforming")
+}
+
+fn activity_tooltip(phase: &str, elapsed_secs: u64) -> String {
+    let clock = format_mmss(elapsed_secs);
+    match phase {
+        "recording" => format!("Lipi · Recording {clock}"),
+        "transcribing" => format!("Lipi · Transcribing {clock}"),
+        "transforming" => format!("Lipi · Transforming {clock}"),
+        _ => format!("Lipi v{} · Voice to Notes", env!("CARGO_PKG_VERSION")),
+    }
+}
+
+fn activity_menu_label(phase: &str, elapsed_secs: u64) -> String {
+    let clock = format_mmss(elapsed_secs);
+    match phase {
+        "recording" => format!("Recording {clock}"),
+        "transcribing" => format!("Transcribing {clock}"),
+        "transforming" => format!("Transforming {clock}"),
+        _ => "Start / Stop Recording".to_string(),
+    }
+}
+
+fn update_tray_icon(app: &tauri::AppHandle, busy: bool) {
     if let Some(tray) = app.tray_by_id("main-tray") {
-        let bytes = if is_recording {
-            TRAY_RECORDING_ICON
-        } else {
-            TRAY_IDLE_ICON
-        };
+        let bytes = if busy { TRAY_RECORDING_ICON } else { TRAY_IDLE_ICON };
         if let Ok(img) = tauri::image::Image::from_bytes(bytes) {
             let _ = tray.set_icon(Some(img));
         }
     }
 }
 
+fn apply_tray_activity(app: &tauri::AppHandle, record_item: &MenuItem<tauri::Wry>, phase: &str, elapsed_secs: u64) {
+    update_tray_icon(app, activity_is_busy(phase));
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_tooltip(Some(activity_tooltip(phase, elapsed_secs)));
+    }
+    let _ = record_item.set_text(activity_menu_label(phase, elapsed_secs));
+}
+
+fn build_preset_submenu(
+    app: &tauri::AppHandle,
+    app_data_dir: &std::path::Path,
+) -> Result<Submenu<tauri::Wry>, String> {
+    let settings = env_config::load_llm_settings(app_data_dir);
+    let active = settings.voice_preset;
+    let presets = presets::load_presets(app_data_dir);
+    let has_custom = presets.iter().any(|p| p.id == "custom");
+
+    let mut items: Vec<CheckMenuItem<tauri::Wry>> = Vec::new();
+    for preset in &presets {
+        let item = CheckMenuItem::with_id(
+            app,
+            format!("preset:{}", preset.id),
+            escape_menu_label(&preset.label),
+            true,
+            preset.id == active,
+            None::<&str>,
+        )
+        .map_err(|e| e.to_string())?;
+        items.push(item);
+    }
+    let custom_item = if has_custom {
+        None
+    } else {
+        Some(
+            CheckMenuItem::with_id(
+                app,
+                "preset:custom",
+                "Custom Instructions",
+                true,
+                active == "custom",
+                None::<&str>,
+            )
+            .map_err(|e| e.to_string())?,
+        )
+    };
+
+    let mut refs: Vec<&dyn IsMenuItem<tauri::Wry>> = items.iter().map(|item| item as _).collect();
+    if let Some(custom) = custom_item.as_ref() {
+        refs.push(custom);
+    }
+
+    Submenu::with_items(app, "Preset", true, &refs).map_err(|e| e.to_string())
+}
+
+fn build_tray_menu(
+    app: &tauri::AppHandle,
+    app_data_dir: &std::path::Path,
+    record_item: &MenuItem<tauri::Wry>,
+) -> Result<Menu<tauri::Wry>, String> {
+    let version_item = MenuItem::with_id(
+        app,
+        "version",
+        format!("Lipi v{}", env!("CARGO_PKG_VERSION")),
+        false,
+        None::<&str>,
+    )
+    .map_err(|e| e.to_string())?;
+    let show_item = MenuItem::with_id(app, "show", "Show Lipi", true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    let mini_item = MenuItem::with_id(app, "toggle_mini", "Toggle Mini Mode", true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    let preset_menu = build_preset_submenu(app, app_data_dir)?;
+    let pref_item = MenuItem::with_id(app, "preferences", "Preferences", true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    let sep = PredefinedMenuItem::separator(app).map_err(|e| e.to_string())?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit Lipi", true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+
+    Menu::with_items(
+        app,
+        &[
+            &version_item,
+            &show_item,
+            &mini_item,
+            record_item,
+            &preset_menu,
+            &pref_item,
+            &sep,
+            &quit_item,
+        ],
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn refresh_tray_menu(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    let menu = build_tray_menu(app, &state.app_data_dir, &state.tray_record_item)?;
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn select_tray_preset(app: &tauri::AppHandle, preset_id: &str) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let app_data_dir = state.app_data_dir.clone();
+    drop(state);
+
+    let mut settings = env_config::load_llm_settings(&app_data_dir);
+    if settings.voice_preset == preset_id {
+        return;
+    }
+    settings.presets = presets::load_presets(&app_data_dir);
+    settings.voice_preset = preset_id.to_string();
+    if let Err(e) = env_config::save_llm_settings(&app_data_dir, &settings) {
+        eprintln!("Failed to save tray preset: {e}");
+        return;
+    }
+    let _ = app.emit("tray_preset_changed", preset_id.to_string());
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Err(e) = refresh_tray_menu(app, &state) {
+            eprintln!("Failed to refresh tray presets: {e}");
+        }
+    }
+}
+
 #[tauri::command]
-fn set_tray_recording_state(app: tauri::AppHandle, is_recording: bool) {
-    update_tray_icon(&app, is_recording);
+fn set_tray_activity(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    phase: String,
+    elapsed_secs: u64,
+) -> Result<(), String> {
+    apply_tray_activity(&app, &state.tray_record_item, &phase, elapsed_secs);
+    Ok(())
+}
+
+#[tauri::command]
+fn refresh_tray_presets(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    refresh_tray_menu(&app, &state)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -54,15 +227,22 @@ pub struct AppState {
     app_data_dir: std::path::PathBuf,
     is_mini: std::sync::atomic::AtomicBool,
     paste_target: Arc<std::sync::Mutex<Option<paste::PasteTarget>>>,
-    global_shortcut_registered: std::sync::atomic::AtomicBool,
+    clipboard: Arc<paste::ClipboardService>,
+    tray_record_item: MenuItem<tauri::Wry>,
+    live_worker: Arc<std::sync::Mutex<Option<JoinHandle<Result<String, String>>>>>,
+    live_cancel: Arc<AtomicBool>,
 }
 
 #[tauri::command]
-fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+fn start_recording(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    lipi_focused: Option<bool>,
+) -> Result<(), String> {
     let settings = state.db.get_settings().unwrap_or_default();
     let is_mini = state.is_mini.load(std::sync::atomic::Ordering::SeqCst);
     if settings.auto_paste {
-        let target = paste::capture_paste_target(is_mini);
+        let target = paste::capture_paste_target(is_mini, lipi_focused.unwrap_or(!is_mini));
         if let Ok(mut guard) = state.paste_target.lock() {
             *guard = if target.has_target() { Some(target) } else { None };
         }
@@ -70,8 +250,142 @@ fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> 
         *guard = None;
     }
 
-    state.audio.start()?;
-    update_tray_icon(&app, true);
+    let live = settings.engine_mode == "local" && settings.live_dictation;
+    if live {
+        let custom = models_folder(&settings);
+        if !models::vad_installed(&state.app_data_dir, custom) {
+            return Err("Live dictation needs the VAD model. Turn it on in Settings to download it.".into());
+        }
+        let path = models::vad_model_path(&state.app_data_dir, custom);
+        let rx = state.audio.start_live(path)?;
+        state.live_cancel.store(false, Ordering::SeqCst);
+        let worker = spawn_live_worker(
+            app.clone(),
+            state.supervisor.clone(),
+            state.db.clone(),
+            state.app_data_dir.clone(),
+            state.live_cancel.clone(),
+            rx,
+        );
+        if let Ok(mut slot) = state.live_worker.lock() {
+            *slot = Some(worker);
+        }
+        let supervisor = state.supervisor.clone();
+        let engine = settings.local_engine.clone();
+        let size = settings.local_model_size.clone();
+        let dir = state.app_data_dir.clone();
+        let folder = settings.models_folder.clone();
+        tauri::async_runtime::spawn(async move {
+            let custom = if folder.trim().is_empty() { None } else { Some(folder) };
+            let _ = supervisor.ensure_loaded(&engine, &size, &dir, custom.as_deref()).await;
+        });
+    } else {
+        state.audio.start()?;
+    }
+    apply_tray_activity(&app, &state.tray_record_item, "recording", 0);
+    Ok(())
+}
+
+fn models_folder(settings: &AppSettings) -> Option<&str> {
+    if settings.models_folder.trim().is_empty() {
+        None
+    } else {
+        Some(settings.models_folder.as_str())
+    }
+}
+
+fn spawn_live_worker(
+    app: tauri::AppHandle,
+    supervisor: Arc<engine::ModelSupervisor>,
+    db: Arc<Database>,
+    app_data_dir: std::path::PathBuf,
+    cancel: Arc<AtomicBool>,
+    rx: std::sync::mpsc::Receiver<Vec<f32>>,
+) -> JoinHandle<Result<String, String>> {
+    std::thread::spawn(move || {
+        let mut full = String::new();
+        let mut seq = 0u32;
+        let mut last_error = None;
+        while let Ok(pcm) = rx.recv() {
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            let wav = match audio::pcm_f32_to_wav(&pcm) {
+                Ok(wav) => wav,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+            let settings = db.get_settings().unwrap_or_default();
+            let prompt = prompt_tail(&full);
+            let _ = app.emit("live_transcribing", true);
+            let text = tauri::async_runtime::block_on(supervisor.transcribe(
+                wav,
+                &settings.local_engine,
+                &settings.local_model_size,
+                settings.language.as_deref(),
+                &app_data_dir,
+                models_folder(&settings),
+                prompt.as_deref(),
+            ));
+            let _ = app.emit("live_transcribing", false);
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            match text {
+                Ok(text) => {
+                    let text = text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if !full.is_empty() {
+                        full.push(' ');
+                    }
+                    full.push_str(text);
+                    seq += 1;
+                    let _ = app.emit("transcript_chunk", serde_json::json!({ "seq": seq, "text": text }));
+                }
+                Err(e) => {
+                    last_error = Some(e.clone());
+                    let _ = app.emit("transcript_error", e);
+                }
+            }
+        }
+        if full.is_empty() {
+            if let Some(e) = last_error {
+                return Err(e);
+            }
+        }
+        Ok(full)
+    })
+}
+
+fn prompt_tail(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let tail: String = trimmed.chars().rev().take(200).collect::<String>().chars().rev().collect();
+    Some(tail)
+}
+
+fn take_live_worker(state: &AppState) -> Option<JoinHandle<Result<String, String>>> {
+    state.live_worker.lock().ok().and_then(|mut slot| slot.take())
+}
+
+#[tauri::command]
+async fn cancel_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.live_cancel.store(true, Ordering::SeqCst);
+    if state.audio.is_live() {
+        state.audio.end_live(false)?;
+        if let Some(handle) = take_live_worker(&state) {
+            let _ = tauri::async_runtime::spawn_blocking(move || handle.join()).await;
+        }
+    } else if state.audio.is_recording() {
+        let _ = state.audio.stop()?;
+    }
+    apply_tray_activity(&app, &state.tray_record_item, "idle", 0);
     Ok(())
 }
 
@@ -99,15 +413,8 @@ async fn paste_into_previous_app(
         }
     }
 
-    paste::paste_into_previous_app(target, &text)?;
+    paste::paste_into_previous_app(&state.clipboard, target, &text)?;
     Ok(true)
-}
-
-#[tauri::command]
-fn is_global_shortcut_registered(state: tauri::State<'_, AppState>) -> bool {
-    state
-        .global_shortcut_registered
-        .load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[tauri::command]
@@ -120,16 +427,31 @@ async fn stop_recording_and_transcribe(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<OperationResult, String> {
-    update_tray_icon(&app, false);
+    apply_tray_activity(&app, &state.tray_record_item, "transcribing", 0);
+    if state.audio.is_live() {
+        state.audio.end_live(true)?;
+        let handle = take_live_worker(&state);
+        let text = if let Some(handle) = handle {
+            tauri::async_runtime::spawn_blocking(move || match handle.join() {
+                Ok(result) => result,
+                Err(_) => Err("Live dictation thread panicked".into()),
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            Ok(String::new())
+        }?;
+        return Ok(OperationResult {
+            text,
+            cf_neurons: None,
+            cf_cost: None,
+        });
+    }
     let wav_bytes = state.audio.stop()?;
     let settings = state.db.get_settings()?;
 
     if settings.engine_mode == "local" {
-        let custom_dir = if settings.models_folder.trim().is_empty() {
-            None
-        } else {
-            Some(settings.models_folder.as_str())
-        };
+        let custom_dir = models_folder(&settings);
         let text = state
             .supervisor
             .transcribe(
@@ -139,6 +461,7 @@ async fn stop_recording_and_transcribe(
                 settings.language.as_deref(),
                 &state.app_data_dir,
                 custom_dir,
+                None,
             )
             .await?;
         return Ok(OperationResult {
@@ -149,15 +472,7 @@ async fn stop_recording_and_transcribe(
     }
 
     let llm_cfg = env_config::load_llm_settings(&state.app_data_dir);
-    let (api_base_url, api_key) = if let Some(pid) = &settings.provider_id {
-        if let Some(prov) = llm_cfg.providers.iter().find(|p| &p.id == pid) {
-            (prov.resolved_base_url(), prov.api_key.clone())
-        } else {
-            (settings.api_base_url.clone(), settings.api_key.clone())
-        }
-    } else {
-        (settings.api_base_url.clone(), settings.api_key.clone())
-    };
+    let (api_base_url, api_key) = env_config::resolve_asr_endpoint(&settings, &llm_cfg);
 
     if api_base_url.trim().is_empty() {
         return Err("API endpoint URL is missing. Set it in Settings.".into());
@@ -366,10 +681,8 @@ fn set_always_on_top(window: tauri::Window, always_on_top: bool) -> Result<(), S
 }
 
 #[tauri::command]
-fn write_to_clipboard(text: String) -> Result<(), String> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-    clipboard.set_text(text).map_err(|e| e.to_string())?;
-    Ok(())
+fn write_to_clipboard(state: tauri::State<'_, AppState>, text: String) -> Result<(), String> {
+    state.clipboard.set_text(&text)
 }
 
 #[tauri::command]
@@ -424,6 +737,21 @@ fn get_model_status(
 }
 
 #[tauri::command]
+fn vad_installed(state: tauri::State<'_, AppState>) -> bool {
+    let settings = state.db.get_settings().unwrap_or_default();
+    models::vad_installed(&state.app_data_dir, models_folder(&settings))
+}
+
+#[tauri::command]
+async fn download_vad_model(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let settings = state.db.get_settings().unwrap_or_default();
+    models::download_vad_model(&app, &state.app_data_dir, models_folder(&settings)).await
+}
+
+#[tauri::command]
 async fn download_model(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -449,6 +777,7 @@ fn delete_model(
     model_size: String,
     custom_models_dir: Option<String>,
 ) -> Result<(), String> {
+    state.supervisor.unload();
     let settings = state.db.get_settings().unwrap_or_default();
     let folder = custom_models_dir.as_deref().or_else(|| {
         if settings.models_folder.trim().is_empty() {
@@ -791,15 +1120,6 @@ pub fn run() {
             if old_db_path.exists() && !db_path.exists() {
                 let _ = std::fs::rename(&old_db_path, &db_path);
             }
-            if !db_path.exists() {
-                if let Ok(home) = std::env::var("HOME") {
-                    let snap_db = std::path::PathBuf::from(home)
-                        .join("snap/code/261/.local/share/com.lipi.app/lipi.db");
-                    if snap_db.exists() {
-                        let _ = std::fs::copy(&snap_db, &db_path);
-                    }
-                }
-            }
             let db = Database::new(db_path).expect("Failed to initialize SQLite database");
             let db_arc = Arc::new(db);
             let supervisor_arc = Arc::new(engine::ModelSupervisor::new());
@@ -833,26 +1153,22 @@ pub fn run() {
             }
 
             // Setup System Tray
-            let show_item = MenuItem::with_id(app, "show", "Show Lipi", true, None::<&str>)?;
-            let mini_item = MenuItem::with_id(app, "toggle_mini", "Toggle Mini Mode", true, None::<&str>)?;
             let record_item = MenuItem::with_id(app, "toggle_record", "Start / Stop Recording", true, None::<&str>)?;
-            let pref_item = MenuItem::with_id(app, "preferences", "Preferences", true, None::<&str>)?;
-            let sep = PredefinedMenuItem::separator(app)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Quit Lipi", true, None::<&str>)?;
-
-            let tray_menu = Menu::with_items(
-                app,
-                &[&show_item, &mini_item, &record_item, &pref_item, &sep, &quit_item],
-            )?;
+            let tray_menu = build_tray_menu(app.handle(), &app_data_dir, &record_item)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
             let tray_icon = tauri::image::Image::from_bytes(TRAY_IDLE_ICON)
                 .unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
 
+            // Linux AppIndicator/StatusNotifierItem does not show a menu on right-click.
+            // The menu is bound to the primary (left) click. Windows keeps the usual
+            // left-click toggle / right-click menu split.
+            let menu_on_left = cfg!(target_os = "linux");
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(tray_icon)
-                .tooltip("Lipi - Voice to Notes")
+                .tooltip(format!("Lipi v{} · Voice to Notes", env!("CARGO_PKG_VERSION")))
                 .menu(&tray_menu)
-                .show_menu_on_left_click(false)
+                .show_menu_on_left_click(menu_on_left)
                 .on_menu_event(|app, event| {
                     match event.id.as_ref() {
                         "show" => {
@@ -877,12 +1193,25 @@ pub fn run() {
                             let _ = app.emit("open_preferences", ());
                         }
                         "quit" => {
+                            if let Some(state) = app.try_state::<AppState>() {
+                                state.supervisor.unload();
+                            }
                             app.exit(0);
                         }
-                        _ => {}
+                        other => {
+                            if let Some(preset_id) = other.strip_prefix("preset:") {
+                                select_tray_preset(app, preset_id);
+                            }
+                        }
                     }
                 })
                 .on_tray_icon_event(|tray, event| {
+                    // Linux shows the menu on left-click (AppIndicator). Window show/hide
+                    // is the "Show Lipi" menu item.
+                    if cfg!(target_os = "linux") {
+                        let _ = (tray, &event);
+                        return;
+                    }
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
@@ -904,21 +1233,17 @@ pub fn run() {
                 .build(app)?;
 
             let app_handle_for_shortcut = app.handle().clone();
-            let mut global_shortcut_registered = false;
             use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
             let shortcut = Shortcut::new(Some(Modifiers::ALT), Code::KeyR);
-            match app.global_shortcut().on_shortcut(shortcut, move |_app, _sc, event| {
+            if let Err(e) = app.global_shortcut().on_shortcut(shortcut, move |_app, _sc, event| {
                 if event.state() == ShortcutState::Pressed {
                     let _ = app_handle_for_shortcut.emit("tray_toggle_recording", ());
                 }
             }) {
-                Ok(_) => {
-                    global_shortcut_registered = true;
-                }
-                Err(e) => {
-                    eprintln!("[GlobalShortcut] Warning: Could not register global Alt+R: {}", e);
-                }
+                eprintln!("[GlobalShortcut] Warning: Could not register global Alt+R: {}", e);
             }
+            // X11 grabs do not see keys delivered to Wayland windows. The portal does.
+            shortcut::spawn_wayland_shortcuts(app.handle().clone());
 
             app.manage(AppState {
                 db: db_arc,
@@ -927,7 +1252,10 @@ pub fn run() {
                 app_data_dir,
                 is_mini: std::sync::atomic::AtomicBool::new(false),
                 paste_target: Arc::new(std::sync::Mutex::new(None)),
-                global_shortcut_registered: std::sync::atomic::AtomicBool::new(global_shortcut_registered),
+                clipboard: Arc::new(paste::ClipboardService::new()),
+                tray_record_item: record_item,
+                live_worker: Arc::new(std::sync::Mutex::new(None)),
+                live_cancel: Arc::new(AtomicBool::new(false)),
             });
 
             Ok(())
@@ -946,12 +1274,15 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            set_tray_recording_state,
+            set_tray_activity,
+            refresh_tray_presets,
             start_recording,
+            cancel_recording,
+            vad_installed,
+            download_vad_model,
             is_recording,
             stop_recording_and_transcribe,
             paste_into_previous_app,
-            is_global_shortcut_registered,
             get_notes,
             save_note,
             update_note,
@@ -988,6 +1319,13 @@ pub fn run() {
             check_system_prerequisites,
             test_and_fetch_models
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.supervisor.unload();
+                }
+            }
+        });
 }

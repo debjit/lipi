@@ -57,8 +57,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: v__VERSION__
-          releaseName: 'Lipi v__VERSION__'
-          releaseBody: 'See the assets to download Lipi for your platform.'
-          releaseDraft: true
-          prerelease: false
+          releaseName: 'Lipi v__VERSION__ (dev)'
+          releaseBody: 'Developer pre-release from the dev branch. Download the installer for your platform from the assets below. This build is not a stable release.'
+          releaseDraft: false
+          prerelease: true
           args: ${{ matrix.args }}
