@@ -95,6 +95,7 @@ fn record_shortcuts() -> Result<glib::Variant, String> {
     Ok(glib::Variant::array_from_iter_with_type(ty, [shortcut]))
 }
 
+#[cfg(target_os = "linux")]
 fn options_dict(token: &str) -> glib::Variant {
     let dict = glib::VariantDict::new(None);
     dict.insert("handle_token", token);
