@@ -37,6 +37,7 @@ export interface SetupWizardProps {
       model: string;
       provider_id?: string;
       wizard_completed: boolean;
+      live_dictation?: boolean;
     },
     llmPatch?: {
       enabled: boolean;
@@ -159,6 +160,7 @@ export function SetupWizard({
   const [setupPath, setSetupPath] = useState<"local" | "cloud">("local");
 
   // Local ASR model settings
+  const [liveDictation, setLiveDictation] = useState(false);
   const [localWhisperSize, setLocalWhisperSize] = useState<LocalModelSize>("base");
   const [localWhisperEngine, setLocalWhisperEngine] = useState<"whisper_cpu" | "faster_whisper">(
     currentSettings.local_engine === "faster_whisper" ? "faster_whisper" : "whisper_cpu"
@@ -375,6 +377,13 @@ export function SetupWizard({
 
   async function handleCompleteSetup() {
     if (setupPath === "local") {
+      if (liveDictation) {
+        const ready = await invoke<boolean>("vad_installed");
+        if (!ready) {
+          showToast("Turn Live dictation on and download the VAD model before finishing, or switch it off.");
+          return;
+        }
+      }
       const llmEnabled = localLlmMode === "ollama";
       await onFinish(
         {
@@ -385,6 +394,7 @@ export function SetupWizard({
           api_key: "",
           model: `whisper-${localWhisperSize}`,
           wizard_completed: true,
+          live_dictation: liveDictation,
         },
         llmEnabled
           ? {
@@ -424,6 +434,7 @@ export function SetupWizard({
             model: "@cf/openai/whisper-large-v3-turbo",
             provider_id: "CLOUDFLARE_DEFAULT",
             wizard_completed: true,
+            live_dictation: false,
           },
           {
             enabled: true,
@@ -467,6 +478,7 @@ export function SetupWizard({
             model: cloudModel.trim() || "whisper-1",
             provider_id: provId,
             wizard_completed: true,
+            live_dictation: false,
           },
           {
             enabled: true,
@@ -1073,6 +1085,39 @@ export function SetupWizard({
                       </label>
                     </div>
 
+                    <div className="form-group" style={{ marginTop: "14px" }}>
+                      <label className="checkbox-label">
+                        <input
+                          type="checkbox"
+                          className="checkbox-input"
+                          checked={liveDictation}
+                          onChange={async (e) => {
+                            const on = e.target.checked;
+                            setLiveDictation(on);
+                            if (!on) return;
+                            try {
+                              await invoke("download_vad_model");
+                              showToast("VAD model ready");
+                            } catch (err: any) {
+                              setLiveDictation(false);
+                              showToast(String(err));
+                            }
+                          }}
+                        />
+                        <span>Live dictation (download VAD model)</span>
+                      </label>
+                      <span className="form-hint" style={{ marginLeft: "26px" }}>
+                        {liveDictation ? "On. " : "Off. "}
+                        The VAD model is about 2 MB. The cost is transcribing every pause while the mic is open, instead of once when you stop.{" "}
+                        {localWhisperSize === "medium" || localWhisperSize === "turbo_q8"
+                          ? "Medium and Turbo Q8 can use most of a CPU core for the whole session, and words can show up a few seconds late."
+                          : localWhisperSize === "small"
+                          ? "Small keeps one core busy longer after each phrase."
+                          : "Tiny and Base usually keep up, with a short burst after each pause."}{" "}
+                        If LLM auto-transform is on, the rewrite still runs once after you stop. API transcription is not live.
+                      </span>
+                    </div>
+
                     {(localWhisperSize === "turbo_q8" || localWhisperSize === "medium") && (
                       <div style={{ marginTop: "10px", padding: "8px 12px", background: "rgba(234, 179, 8, 0.1)", border: "1px solid rgba(234, 179, 8, 0.3)", borderRadius: "6px", fontSize: "12px", color: "var(--text-secondary)" }}>
                         ⚡ <strong>RAM Notice:</strong> {localWhisperSize === "turbo_q8" ? "Turbo Q8 requires ~2.2 GB RAM (over 2 GB)" : "Medium requires ~2.5 GB RAM"}. Your PC has {specs?.total_ram_gb ?? 8} GB RAM.
@@ -1118,7 +1163,17 @@ export function SetupWizard({
                           <button
                             type="button"
                             className="btn btn-secondary"
-                            onClick={() => onDownloadModel(localWhisperEngine, localWhisperSize)}
+                            onClick={async () => {
+                              await onDownloadModel(localWhisperEngine, localWhisperSize);
+                              if (liveDictation) {
+                                try {
+                                  await invoke("download_vad_model");
+                                  showToast("VAD model ready");
+                                } catch (err: any) {
+                                  showToast(String(err));
+                                }
+                              }
+                            }}
                           >
                             {modelStatus?.installed && modelStatus.model_size === localWhisperSize
                               ? "Re-download Weights"

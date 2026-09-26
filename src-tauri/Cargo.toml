@@ -31,13 +31,17 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 rusqlite = { version = "0.33", features = ["bundled"] }
 arboard = "3"
 enigo = "0.2"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "ndarray"] }
+ndarray = "0.16"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
+gio = "0.18"
+glib = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 rfd = "0.15"
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading", "Win32_Graphics_Dwm"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
