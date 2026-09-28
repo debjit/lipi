@@ -239,6 +239,8 @@ export default function App() {
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [memoryStatus, setMemoryStatus] = useState<ModelMemoryStatus | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
+  const [vadDownloadProgress, setVadDownloadProgress] = useState<number | null>(null);
+  const [vadInstalled, setVadInstalled] = useState(false);
   const [downloadSpeedBps, setDownloadSpeedBps] = useState<number>(0);
   const [downloadEtaSecs, setDownloadEtaSecs] = useState<number>(0);
   const [isDownloading, setIsDownloading] = useState(false);
@@ -490,6 +492,42 @@ export default function App() {
   const liveSeqRef = useRef(0);
   const livePersistTimer = useRef<number | null>(null);
   const downloadDoneTimer = useRef<number | null>(null);
+  const vadDownloadActiveRef = useRef(false);
+
+  async function refreshVadInstalled() {
+    try {
+      setVadInstalled(await invoke<boolean>("vad_installed"));
+    } catch {
+      setVadInstalled(false);
+    }
+  }
+
+  async function downloadVadModel() {
+    if (await invoke<boolean>("vad_installed")) {
+      setVadInstalled(true);
+      return;
+    }
+    setDownloadProgress(null);
+    vadDownloadActiveRef.current = true;
+    setVadDownloadProgress(0);
+    try {
+      await invoke("download_vad_model");
+      setVadInstalled(true);
+    } finally {
+      vadDownloadActiveRef.current = false;
+      setVadDownloadProgress(null);
+    }
+  }
+
+  function askEnableLiveDictation(onConfirm: () => void) {
+    setConfirmModal({
+      title: "Live dictation is in beta",
+      message:
+        "Live dictation can be less accurate than transcribing once when you stop. We are actively working on it.",
+      confirmLabel: "Enable beta",
+      onConfirm,
+    });
+  }
   const recordingOpInFlightRef = useRef(false);
   const toggleRecordingRef = useRef<(source?: "shortcut" | "manual") => void>(() => {});
   const discardRecordingRef = useRef<() => void>(() => {});
@@ -520,9 +558,13 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const unlisten = listenForever<{ percentage: number; speed_bps?: number; eta_secs?: number }>(
+    const unlisten = listenForever<{ percentage: number; speed_bps?: number; eta_secs?: number; engine?: string }>(
       "model-download-progress",
       (event) => {
+        if (event.payload.engine === "vad") {
+          if (vadDownloadActiveRef.current) setVadDownloadProgress(event.payload.percentage);
+          return;
+        }
         setDownloadProgress(event.payload.percentage);
         if (event.payload.speed_bps !== undefined) {
           setDownloadSpeedBps(event.payload.speed_bps);
@@ -581,7 +623,7 @@ export default function App() {
         customModelsDir: settingsRef.current.models_folder || undefined,
       });
       if (settingsRef.current.live_dictation && settingsRef.current.engine_mode === "local") {
-        await invoke("download_vad_model");
+        await downloadVadModel();
       }
       await updateAndSaveSettings({
         engine_mode: "local",
@@ -1272,6 +1314,7 @@ export default function App() {
       settingsRef.current = s;
       await invoke("set_always_on_top", { alwaysOnTop: s.always_on_top });
       await refreshModelStatus(s.local_engine, s.local_model_size);
+      await refreshVadInstalled();
       await refreshMemoryStatus();
       await loadLlmSettings();
 
@@ -2816,28 +2859,45 @@ export default function App() {
                         type="checkbox"
                         className="checkbox-input"
                         checked={!!settings.live_dictation}
-                        onChange={async (e) => {
+                        onChange={(e) => {
                           const on = e.target.checked;
-                          if (on) {
-                            try {
-                              setIsDownloading(true);
-                              await invoke("download_vad_model");
-                            } catch (err: any) {
-                              setErrorMsg(String(err));
-                              return;
-                            } finally {
-                              setIsDownloading(false);
-                            }
+                          if (!on) {
+                            void updateAndSaveSettings({ live_dictation: false });
+                            return;
                           }
-                          await updateAndSaveSettings({ live_dictation: on });
+                          askEnableLiveDictation(() => {
+                            void (async () => {
+                              try {
+                                await downloadVadModel();
+                                await updateAndSaveSettings({ live_dictation: true });
+                              } catch (err: any) {
+                                setErrorMsg(String(err));
+                                await refreshVadInstalled();
+                              }
+                            })();
+                          });
                         }}
                       />
-                      <span>Live dictation</span>
+                      <span>
+                        Live dictation
+                        <span className="tag-beta">Beta</span>
+                      </span>
+                      <span className={`badge-pill ${vadInstalled ? "installed" : "missing"}`} style={{ fontSize: "10px", padding: "2px 6px" }}>
+                        {vadInstalled ? "VAD ready" : "VAD not downloaded"}
+                      </span>
                     </label>
                     <span className="form-hint" style={{ marginLeft: "26px" }}>
                       {settings.live_dictation ? "On. " : "Off. "}
-                      {liveCpuNote(settings.local_model_size)} API transcription stays one shot after you stop.
+                      {liveCpuNote(settings.local_model_size)} API transcription stays one shot after you stop. We are still working on live dictation, so results can be rough.
                     </span>
+                    {vadDownloadProgress !== null && (
+                      <div className="progress-container" style={{ marginLeft: "26px", marginTop: "6px" }}>
+                        <div className="progress-bar">
+                          <div className="progress-fill" style={{ width: `${Math.min(100, vadDownloadProgress)}%` }} />
+                        </div>
+                        <span className="progress-text">Downloading VAD: {vadDownloadProgress}%</span>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
@@ -3021,7 +3081,7 @@ export default function App() {
                           type="button"
                           className="btn btn-primary btn-sm"
                           onClick={handleDownloadModel}
-                          disabled={isDownloading}
+                          disabled={isDownloading || vadDownloadProgress !== null}
                         >
                           {isDownloading ? "Downloading..." : `⬇ Download ${settings.local_model_size} Model`}
                         </button>
@@ -3030,7 +3090,7 @@ export default function App() {
                           type="button"
                           className="btn btn-danger-outline btn-sm"
                           onClick={handleDeleteModel}
-                          disabled={isDownloading}
+                          disabled={isDownloading || vadDownloadProgress !== null}
                         >
                           🗑 Delete Weights
                         </button>
@@ -4679,6 +4739,10 @@ export default function App() {
           await handleDownloadModel();
         }}
         showToast={showToast}
+        requestConfirm={askEnableLiveDictation}
+        vadInstalled={vadInstalled}
+        vadDownloadProgress={vadDownloadProgress}
+        downloadVadModel={downloadVadModel}
       />
 
       {/* Confirmation Modal */}

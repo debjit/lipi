@@ -72,6 +72,10 @@ export interface SetupWizardProps {
   isDownloading: boolean;
   onDownloadModel: (engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan", size: LocalModelSize) => Promise<void>;
   showToast: (msg: string) => void;
+  requestConfirm: (onConfirm: () => void) => void;
+  vadInstalled: boolean;
+  vadDownloadProgress: number | null;
+  downloadVadModel: () => Promise<void>;
 }
 
 function formatSpeed(bytesPerSec: number): string {
@@ -144,6 +148,10 @@ export function SetupWizard({
   isDownloading,
   onDownloadModel,
   showToast,
+  requestConfirm,
+  vadInstalled,
+  vadDownloadProgress,
+  downloadVadModel,
 }: SetupWizardProps) {
   const [step, setStep] = useState<1 | 2 | 3 | 4 | 5>(1);
   const [specs, setSpecs] = useState<SystemSpecs | null>(null);
@@ -1091,20 +1099,32 @@ export function SetupWizard({
                           type="checkbox"
                           className="checkbox-input"
                           checked={liveDictation}
-                          onChange={async (e) => {
-                            const on = e.target.checked;
-                            setLiveDictation(on);
-                            if (!on) return;
-                            try {
-                              await invoke("download_vad_model");
-                              showToast("VAD model ready");
-                            } catch (err: any) {
+                          onChange={(e) => {
+                            if (!e.target.checked) {
                               setLiveDictation(false);
-                              showToast(String(err));
+                              return;
                             }
+                            requestConfirm(() => {
+                              void (async () => {
+                                setLiveDictation(true);
+                                try {
+                                  await downloadVadModel();
+                                  showToast("VAD model ready");
+                                } catch (err: any) {
+                                  setLiveDictation(false);
+                                  showToast(String(err));
+                                }
+                              })();
+                            });
                           }}
                         />
-                        <span>Live dictation (download VAD model)</span>
+                        <span>
+                          Live dictation
+                          <span className="tag-beta">Beta</span>
+                        </span>
+                        <span className={`badge-pill ${vadInstalled ? "installed" : "missing"}`} style={{ fontSize: "10px", padding: "2px 6px" }}>
+                          {vadInstalled ? "VAD ready" : "VAD not downloaded"}
+                        </span>
                       </label>
                       <span className="form-hint" style={{ marginLeft: "26px" }}>
                         {liveDictation ? "On. " : "Off. "}
@@ -1114,8 +1134,16 @@ export function SetupWizard({
                           : localWhisperSize === "small"
                           ? "Small keeps one core busy longer after each phrase."
                           : "Tiny and Base usually keep up, with a short burst after each pause."}{" "}
-                        If LLM auto-transform is on, the rewrite still runs once after you stop. API transcription is not live.
+                        If LLM auto-transform is on, the rewrite still runs once after you stop. API transcription is not live. We are still working on live dictation, so results can be rough.
                       </span>
+                      {vadDownloadProgress !== null && (
+                        <div className="progress-container" style={{ marginLeft: "26px", marginTop: "6px" }}>
+                          <div className="progress-bar">
+                            <div className="progress-fill" style={{ width: `${Math.min(100, vadDownloadProgress)}%` }} />
+                          </div>
+                          <span className="progress-text">Downloading VAD: {vadDownloadProgress}%</span>
+                        </div>
+                      )}
                     </div>
 
                     {(localWhisperSize === "turbo_q8" || localWhisperSize === "medium") && (
@@ -1143,7 +1171,7 @@ export function SetupWizard({
                       </div>
 
                       <div>
-                        {isDownloading ? (
+                        {downloadProgress !== null ? (
                           <div className="wizard-downloading-box">
                             <div className="downloading-info">
                               <span>Downloading {localWhisperSize} weights... {downloadProgress ?? 0}%</span>
@@ -1163,11 +1191,12 @@ export function SetupWizard({
                           <button
                             type="button"
                             className="btn btn-secondary"
+                            disabled={isDownloading || vadDownloadProgress !== null}
                             onClick={async () => {
                               await onDownloadModel(localWhisperEngine, localWhisperSize);
                               if (liveDictation) {
                                 try {
-                                  await invoke("download_vad_model");
+                                  await downloadVadModel();
                                   showToast("VAD model ready");
                                 } catch (err: any) {
                                   showToast(String(err));
