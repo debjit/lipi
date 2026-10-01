@@ -215,6 +215,36 @@ body, html, #root {
   color: var(--text-secondary);
 }
 
+.update-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 2px 1px 8px;
+  border-radius: 9999px;
+  background: rgba(34, 197, 94, 0.14);
+  border: 1px solid rgba(34, 197, 94, 0.4);
+  color: #4ade80;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.update-pill-open,
+.update-pill-dismiss {
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.update-pill-dismiss {
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0.8;
+}
+
 .badge-status {
   display: inline-flex;
   align-items: center;

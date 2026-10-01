@@ -1092,6 +1092,116 @@ async fn test_and_fetch_models(base_url: String, api_key: String) -> Result<Vec<
     llm::fetch_models(&base_url, &api_key).await
 }
 
+#[derive(Debug, Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    body: Option<String>,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateNotice {
+    latest: String,
+    notes: String,
+    download_url: String,
+}
+
+fn version_parts(raw: &str) -> Option<((u64, u64, u64), bool)> {
+    let raw = raw.trim().trim_start_matches('v');
+    if raw.is_empty() {
+        return None;
+    }
+    let (core, pre) = match raw.split_once('-') {
+        Some((core, _)) => (core, true),
+        None => (raw, false),
+    };
+    let mut nums = core.split('.');
+    let major: u64 = nums.next()?.parse().ok()?;
+    let minor: u64 = nums.next()?.parse().ok()?;
+    let patch: u64 = nums.next().unwrap_or("0").parse().ok()?;
+    if nums.next().is_some() {
+        return None;
+    }
+    Some(((major, minor, patch), pre))
+}
+
+fn is_newer_release(latest: &str, current: &str) -> bool {
+    let (Some((latest_core, latest_pre)), Some((current_core, current_pre))) =
+        (version_parts(latest), version_parts(current))
+    else {
+        return false;
+    };
+    if latest_core != current_core {
+        return latest_core > current_core;
+    }
+    !latest_pre && current_pre
+}
+
+fn asset_url(assets: &[GithubAsset], exact: &str, suffix: &str) -> Option<String> {
+    if let Some(asset) = assets.iter().find(|asset| asset.name == exact) {
+        return Some(asset.browser_download_url.clone());
+    }
+    assets
+        .iter()
+        .find(|asset| asset.name.ends_with(suffix) && !asset.name.ends_with(".sig"))
+        .map(|asset| asset.browser_download_url.clone())
+}
+
+fn download_url_for_platform(assets: &[GithubAsset]) -> Option<String> {
+    let (exact, suffix, fallback_exact, fallback_suffix) = if cfg!(target_os = "windows") {
+        ("Lipi-windows-setup.exe", "-setup.exe", "Lipi-windows.msi", ".msi")
+    } else if cfg!(target_os = "linux") {
+        ("Lipi-linux.deb", ".deb", "Lipi-linux.AppImage", ".AppImage")
+    } else {
+        return None;
+    };
+    asset_url(assets, exact, suffix).or_else(|| asset_url(assets, fallback_exact, fallback_suffix))
+}
+
+#[tauri::command]
+async fn check_for_update() -> Result<Option<UpdateNotice>, String> {
+    let current = env!("CARGO_PKG_VERSION");
+    let client = reqwest::Client::builder()
+        .user_agent("lipi")
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let response = client
+        .get("https://api.github.com/repos/debjit/lipi/releases/latest")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("Update check failed: {e}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(format!("GitHub returned {}", response.status()));
+    }
+    let release: GithubRelease = response
+        .json()
+        .await
+        .map_err(|e| format!("Could not read the GitHub release: {e}"))?;
+    if !is_newer_release(&release.tag_name, current) {
+        return Ok(None);
+    }
+    let Some(download_url) = download_url_for_platform(&release.assets) else {
+        return Ok(None);
+    };
+    Ok(Some(UpdateNotice {
+        latest: release.tag_name.trim_start_matches('v').to_string(),
+        notes: release.body.unwrap_or_default(),
+        download_url,
+    }))
+}
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1317,7 +1427,8 @@ pub fn run() {
             clear_cf_usage_logs,
             get_system_specs,
             check_system_prerequisites,
-            test_and_fetch_models
+            test_and_fetch_models,
+            check_for_update
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1328,4 +1439,36 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::{asset_url, is_newer_release, GithubAsset};
+
+    #[test]
+    fn stable_release_is_newer_than_the_dev_build() {
+        assert!(is_newer_release("v0.1.5", "0.1.5-2"));
+        assert!(is_newer_release("0.2.0", "0.1.5-2"));
+        assert!(!is_newer_release("0.1.5", "0.1.5"));
+        assert!(!is_newer_release("v0.1.4", "0.1.5"));
+        assert!(!is_newer_release("0.1.5-3", "0.1.5"));
+    }
+
+    #[test]
+    fn installer_prefers_the_stable_filename() {
+        let assets = vec![
+            GithubAsset {
+                name: "Lipi_0.2.0_x64-setup.exe".into(),
+                browser_download_url: "https://example.com/versioned.exe".into(),
+            },
+            GithubAsset {
+                name: "Lipi-windows-setup.exe".into(),
+                browser_download_url: "https://example.com/stable.exe".into(),
+            },
+        ];
+        assert_eq!(
+            asset_url(&assets, "Lipi-windows-setup.exe", "-setup.exe").as_deref(),
+            Some("https://example.com/stable.exe")
+        );
+    }
 }

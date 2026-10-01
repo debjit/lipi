@@ -13,6 +13,7 @@ Press **`Alt + R`** in any app, speak, and press it again. Lipi transcribes your
 </p>
 
 <p align="center">
+  <a href="https://lipi.debjit.in"><b>Website</b></a> ·
   <a href="https://github.com/debjit/lipi/releases"><b>Download</b></a> ·
   <a href="#features">Features</a> ·
   <a href="#quick-start">Quick start</a> ·
@@ -34,12 +35,14 @@ Press **`Alt + R`** in any app, speak, and press it again. Lipi transcribes your
 
 ## Download
 
-Pre-release builds are available on the **[GitHub Releases](https://github.com/debjit/lipi/releases)** page.
+Stable installers, after the first stable release:
 
-| Platform | Formats |
+| Platform | Download |
 | :--- | :--- |
-| Windows | `.msi`, `setup.exe` (NSIS) |
-| Linux (x86_64) | `.deb`, `.AppImage` |
+| Windows | [Setup](https://github.com/debjit/lipi/releases/latest/download/Lipi-windows-setup.exe), [MSI](https://github.com/debjit/lipi/releases/latest/download/Lipi-windows.msi) |
+| Linux (x86_64) | [deb](https://github.com/debjit/lipi/releases/latest/download/Lipi-linux.deb), [AppImage](https://github.com/debjit/lipi/releases/latest/download/Lipi-linux.AppImage) |
+
+Dev builds stay on the **[GitHub Releases](https://github.com/debjit/lipi/releases)** page and are not linked as the latest download. The site at [lipi.debjit.in](https://lipi.debjit.in) reads [`latest.json`](https://raw.githubusercontent.com/debjit/lipi/release-meta/latest.json) on the `release-meta` branch.
 
 ## Quick start
 
@@ -212,6 +215,14 @@ lipi/
 │   └── tauri.conf.json
 └── package.json
 ```
+
+## Releasing
+
+`npm run release -- patch` bumps the version, commits, tags `vX.Y.Z`, and pushes. `minor`, `major`, or an explicit version such as `0.2.0` work the same way. `patch`, `minor`, and `major` always produce a stable version. From `0.1.5-2`, `patch` becomes `0.1.6`.
+
+A version with a hyphen, such as `npm run release -- 0.1.5-3`, is a dev prerelease. It is published on GitHub Releases and does not update the website or the in-app update notice.
+
+A version without a hyphen is stable. After the Windows and Linux builds both finish, CI publishes the release, copies the installers to stable filenames, writes `latest.json` and `changelog.json` on the `release-meta` branch, and POSTs that manifest to the `LIPI_SITE_DEPLOY_HOOK` repository secret so the site can redeploy. If the secret is unset, the release still publishes.
 
 ## License
 
