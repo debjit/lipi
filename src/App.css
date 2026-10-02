@@ -209,6 +209,42 @@ body, html, #root {
   letter-spacing: -0.01em;
 }
 
+.app-version {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.update-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 2px 1px 8px;
+  border-radius: 9999px;
+  background: rgba(34, 197, 94, 0.14);
+  border: 1px solid rgba(34, 197, 94, 0.4);
+  color: #4ade80;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.update-pill-open,
+.update-pill-dismiss {
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.update-pill-dismiss {
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0.8;
+}
+
 .badge-status {
   display: inline-flex;
   align-items: center;
@@ -245,6 +281,21 @@ body, html, #root {
 
 .pulse {
   animation: pulse 1s infinite;
+}
+
+.live-wait {
+  width: 10px;
+  height: 10px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+  animation: live-wait-spin 0.7s linear infinite;
+}
+
+@keyframes live-wait-spin {
+  to { transform: rotate(360deg); }
 }
 
 @keyframes pulse {
@@ -390,6 +441,31 @@ body, html, #root {
   animation: fadeIn 0.15s ease-out;
   user-select: none;
   white-space: nowrap !important;
+}
+
+.record-elapsed-pill.busy {
+  background: rgba(251, 191, 36, 0.12);
+  border-color: rgba(251, 191, 36, 0.4);
+  color: #fbbf24;
+}
+
+.record-elapsed-pill.busy .record-elapsed-dot {
+  background: #fbbf24;
+}
+
+.btn-discard {
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 20px;
+  background: transparent;
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, 0.45);
+}
+
+.btn-discard:hover {
+  background: rgba(239, 68, 68, 0.16);
+  color: #fecaca;
 }
 
 .record-elapsed-dot {
@@ -583,6 +659,16 @@ body, html, #root {
   cursor: pointer;
 }
 
+.tag-beta {
+  font-size: 9.5px;
+  font-weight: 600;
+  background: rgba(234, 179, 8, 0.2);
+  color: #eab308;
+  padding: 1px 5px;
+  border-radius: 4px;
+  margin-left: 6px;
+}
+
 .modal-footer {
   display: flex;
   justify-content: flex-end;
@@ -624,7 +710,7 @@ body, html, #root {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  background: transparent !important;
+  background: var(--bg-secondary) !important;
   border: none !important;
   box-shadow: none !important;
   padding: 0 4px;
@@ -632,6 +718,7 @@ body, html, #root {
   overflow: hidden;
   user-select: none;
   cursor: grab;
+  border-radius: 14px;
 }
 
 .mini-widget:active {
@@ -651,7 +738,6 @@ body, html, #root {
   font-size: 11px;
   cursor: grab;
   box-shadow: 0 4px 10px rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(8px);
   flex-shrink: 0;
   line-height: 1;
 }
@@ -694,7 +780,37 @@ body, html, #root {
   box-shadow: 0 4px 14px rgba(16, 185, 129, 0.6);
 }
 
+.mini-elapsed-pill.busy {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.45);
+}
+
+.btn-mini-discard {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  background: rgba(22, 25, 35, 0.88);
+  color: #fca5a5;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 1;
+  flex-shrink: 0;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.45);
+}
+
+.btn-mini-discard:hover {
+  background: rgba(239, 68, 68, 0.25);
+  color: #fff;
+}
+
 .mini-elapsed-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 11px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
@@ -2406,6 +2522,21 @@ optgroup {
 
 /* Responsive Design Breakpoints */
 @media (max-width: 800px) {
+  .sidebar {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 50;
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5);
+  }
+  .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: 40;
+  }
   .badge-text-full {
     display: none;
   }
@@ -2438,21 +2569,6 @@ optgroup {
 }
 
 @media (max-width: 660px) {
-  .sidebar {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    z-index: 50;
-    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5);
-  }
-  .sidebar-backdrop {
-    display: block;
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.45);
-    z-index: 40;
-  }
   .panel-sub {
     display: none;
   }
@@ -3562,6 +3678,89 @@ optgroup {
   padding-top: 18px;
   border-top: 1px solid var(--border);
   margin-top: auto;
+}
+
+.wizard-path-selector.stack {
+  grid-template-columns: 1fr;
+}
+
+.wizard-choice-label {
+  margin: 4px 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.wizard-provider-tabs.five {
+  grid-template-columns: repeat(5, 1fr);
+}
+
+.wizard-key-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.wizard-key-row .form-input {
+  flex: 1;
+}
+
+.wizard-footer-next {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.wizard-step-note {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.wizard-inline-warn {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.wizard-size-card .size-ram {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.wizard-prepare-progress {
+  margin-bottom: 16px;
+}
+
+.wizard-defer-toggle {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+}
+
+.wizard-defer-toggle .wizard-step-note {
+  margin: 6px 0 0 24px;
+}
+
+.setup-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 16px 0;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  font-size: 13px;
 }
 
 /* Wizard OS Toggle & Prerequisite Styles */

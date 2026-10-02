@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface SystemSpecs {
@@ -11,18 +11,101 @@ export interface SystemSpecs {
 }
 
 export interface PrerequisiteStatus {
-  os: string;
   has_audio_device: boolean;
   audio_device_name: string | null;
-  whisper_binary_found: boolean;
-  whisper_binary_path: string | null;
-  python_found: boolean;
-  python_path: string | null;
-  venv_python_found: boolean;
-  ollama_binary_found: boolean;
 }
 
 export type LocalModelSize = "tiny" | "base" | "small" | "medium" | "turbo_q8";
+type SetupPath = "local" | "cloud";
+type PolishChoice = "later" | "api";
+type ProviderKind = "cloudflare" | "groq" | "openai" | "ollama" | "custom";
+type PreparePhase = "idle" | "runner" | "weights" | "ready" | "error";
+
+interface SpeechModelOption {
+  id: LocalModelSize;
+  title: string;
+  ram: string;
+  ramGb: number;
+  summary: string;
+}
+
+interface ProviderOption {
+  id: ProviderKind;
+  title: string;
+  subtitle: string;
+}
+
+interface EndpointDraft {
+  kind: ProviderKind;
+  apiKey: string;
+  accountId: string;
+  baseUrl: string;
+  tested: boolean;
+  testing: boolean;
+  error: string | null;
+  detail: string | null;
+  models: string[];
+  speechModel: string;
+  chatModel: string;
+}
+
+interface SavedProvider {
+  id: string;
+  name: string;
+  provider_type: string;
+  api_key: string;
+  account_id: string;
+  base_url: string;
+  model: string;
+}
+
+const SPEECH_MODELS: SpeechModelOption[] = [
+  {
+    id: "turbo_q8",
+    title: "Turbo v3",
+    ram: "About 2.2 GB RAM",
+    ramGb: 2.2,
+    summary: "Best accuracy. Recommended when this PC can spare about 2.2 GB.",
+  },
+  {
+    id: "medium",
+    title: "Medium",
+    ram: "About 2.5 GB RAM",
+    ramGb: 2.5,
+    summary: "Strong accuracy, and quicker than Turbo v3.",
+  },
+  {
+    id: "small",
+    title: "Small",
+    ram: "About 1 GB RAM",
+    ramGb: 1,
+    summary: "Fast transcription, and better with accents than Base.",
+  },
+  {
+    id: "base",
+    title: "Base",
+    ram: "About 0.5 GB RAM",
+    ramGb: 0.5,
+    summary: "Quick everyday transcription.",
+  },
+  {
+    id: "tiny",
+    title: "Tiny",
+    ram: "About 0.3 GB RAM",
+    ramGb: 0.3,
+    summary: "Fastest and lightest. Good for short notes.",
+  },
+];
+
+const PROVIDERS: ProviderOption[] = [
+  { id: "cloudflare", title: "Cloudflare", subtitle: "Workers AI" },
+  { id: "groq", title: "Groq", subtitle: "api.groq.com" },
+  { id: "openai", title: "OpenAI", subtitle: "api.openai.com" },
+  { id: "ollama", title: "Ollama", subtitle: "localhost:11434" },
+  { id: "custom", title: "Custom", subtitle: "OpenAPI-compatible" },
+];
+
+const SETTINGS_HINT = "You can correct this provider in Settings.";
 
 export interface SetupWizardProps {
   isOpen: boolean;
@@ -37,22 +120,18 @@ export interface SetupWizardProps {
       model: string;
       provider_id?: string;
       wizard_completed: boolean;
+      live_dictation?: boolean;
     },
     llmPatch?: {
       enabled: boolean;
+      auto_mode?: boolean;
       active_provider_id: string;
       model: string;
-      provider?: {
-        id: string;
-        name: string;
-        provider_type: string;
-        api_key: string;
-        account_id: string;
-        base_url: string;
-        model: string;
-      };
+      provider?: SavedProvider;
+      speech_provider?: SavedProvider;
     }
   ) => Promise<void>;
+  onStartRecording: () => Promise<void>;
   currentSettings: {
     engine_mode: "local" | "cloud";
     local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan";
@@ -61,16 +140,90 @@ export interface SetupWizardProps {
     api_key: string;
     model: string;
   };
-  modelStatus: {
-    installed: boolean;
-    model_size: string;
-  } | null;
   downloadProgress: number | null;
   downloadSpeedBps: number;
   downloadEtaSecs: number;
   isDownloading: boolean;
-  onDownloadModel: (engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan", size: LocalModelSize) => Promise<void>;
+  onDownloadModel: (
+    engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan",
+    size: LocalModelSize
+  ) => Promise<string | null>;
   showToast: (msg: string) => void;
+}
+
+function emptyEndpoint(kind: ProviderKind = "groq"): EndpointDraft {
+  return {
+    kind,
+    apiKey: "",
+    accountId: "",
+    baseUrl: kind === "custom" ? "https://openrouter.ai/api/v1" : "",
+    tested: false,
+    testing: false,
+    error: null,
+    detail: null,
+    models: [],
+    speechModel: "",
+    chatModel: "",
+  };
+}
+
+function recommendedModel(ramGb: number): LocalModelSize {
+  if (ramGb >= 8) return "turbo_q8";
+  if (ramGb >= 6) return "small";
+  if (ramGb >= 4) return "base";
+  return "tiny";
+}
+
+function speechModel(id: LocalModelSize): SpeechModelOption {
+  return SPEECH_MODELS.find((model) => model.id === id) ?? SPEECH_MODELS[3];
+}
+
+function endpointUrl(endpoint: EndpointDraft): string {
+  if (endpoint.kind === "groq") return "https://api.groq.com/openai/v1";
+  if (endpoint.kind === "openai") return "https://api.openai.com/v1";
+  if (endpoint.kind === "ollama") return "http://localhost:11434/v1";
+  if (endpoint.kind === "cloudflare") {
+    const account = endpoint.accountId.trim();
+    return account ? `https://api.cloudflare.com/client/v4/accounts/${account}/ai/v1` : "";
+  }
+  return endpoint.baseUrl.trim().replace(/\/$/, "");
+}
+
+function providerRecord(endpoint: EndpointDraft, model: string, role: "speech" | "polish"): SavedProvider {
+  const names: Record<ProviderKind, string> = {
+    cloudflare: "Cloudflare Workers AI",
+    groq: "Groq Cloud",
+    openai: "OpenAI",
+    ollama: "Ollama (Local)",
+    custom: "Custom",
+  };
+  const id =
+    endpoint.kind === "custom"
+      ? role === "speech"
+        ? "CUSTOM_SPEECH"
+        : "CUSTOM_POLISH"
+      : endpoint.kind === "openai"
+      ? "OPENAI_CUSTOM"
+      : endpoint.kind === "groq"
+      ? "GROQ_DEFAULT"
+      : endpoint.kind === "ollama"
+      ? "OLLAMA_DEFAULT"
+      : "CLOUDFLARE_DEFAULT";
+  return {
+    id,
+    name: names[endpoint.kind],
+    provider_type: endpoint.kind,
+    api_key: endpoint.apiKey.trim(),
+    account_id: endpoint.kind === "cloudflare" ? endpoint.accountId.trim() : "",
+    base_url: endpointUrl(endpoint),
+    model,
+  };
+}
+
+function canTest(endpoint: EndpointDraft): boolean {
+  if (!endpointUrl(endpoint)) return false;
+  if (endpoint.kind === "ollama") return true;
+  return endpoint.apiKey.trim().length > 0;
 }
 
 function formatSpeed(bytesPerSec: number): string {
@@ -84,59 +237,187 @@ function formatEta(seconds: number): string {
   const s = Math.round(seconds);
   if (s < 60) return `~${s}s left`;
   const m = Math.floor(s / 60);
-  const rem = s % 60;
-  return `~${m}m ${rem}s left`;
+  return `~${m}m ${s % 60}s left`;
 }
 
-function getModelRamFeedback(modelName: string, totalRamGb: number) {
-  const lower = (modelName || "").toLowerCase();
-  let paramSizeBillion = 3.0;
-  if (lower.includes(":1b") || lower.includes("1.3b") || lower.includes("1b") || lower.includes("smollm")) {
-    paramSizeBillion = 1.2;
-  } else if (lower.includes(":2b") || lower.includes("2b")) {
-    paramSizeBillion = 2.0;
-  } else if (lower.includes(":3b") || lower.includes("3b")) {
-    paramSizeBillion = 3.2;
-  } else if (lower.includes(":7b") || lower.includes("7b") || lower.includes("bonsai") || lower.includes("mistral")) {
-    paramSizeBillion = 7.0;
-  } else if (lower.includes(":8b") || lower.includes("8b")) {
-    paramSizeBillion = 8.0;
-  } else if (lower.includes(":14b") || lower.includes("14b")) {
-    paramSizeBillion = 14.0;
-  } else if (lower.includes(":32b") || lower.includes("32b")) {
-    paramSizeBillion = 32.0;
-  } else if (lower.includes(":70b") || lower.includes("70b")) {
-    paramSizeBillion = 70.0;
-  }
+function ModelPicker({
+  id,
+  label,
+  value,
+  models,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  models: string[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="form-group">
+      <label className="form-label" htmlFor={id}>
+        {label}
+      </label>
+      <select id={id} className="form-input" value={value} onChange={(e) => onChange(e.target.value)}>
+        <option value="">Choose a model</option>
+        {models.map((model) => (
+          <option key={model} value={model}>
+            {model}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
 
-  const ramNeededGb = Math.round((paramSizeBillion * 0.75 + 1.2) * 10) / 10;
-  if (totalRamGb >= ramNeededGb + 3.0) {
-    return {
-      status: "great",
-      badgeClass: "wizard-ram-badge-great",
-      label: `🟢 Runs smooth on this PC (~${ramNeededGb} GB RAM needed)`,
-    };
-  } else if (totalRamGb >= ramNeededGb + 0.5) {
-    return {
-      status: "moderate",
-      badgeClass: "wizard-ram-badge-moderate",
-      label: `🟡 Fits in RAM (~${ramNeededGb} GB RAM needed, tight)`,
-    };
-  } else {
-    return {
-      status: "heavy",
-      badgeClass: "wizard-ram-badge-heavy",
-      label: `🔴 Exceeds RAM (~${ramNeededGb} GB needed) - Cloud recommended`,
-    };
-  }
+function ProviderForm({
+  legend,
+  endpoint,
+  onChange,
+  onTest,
+  speechPicker,
+  chatPicker,
+}: {
+  legend: string;
+  endpoint: EndpointDraft;
+  onChange: (patch: Partial<EndpointDraft>) => void;
+  onTest: () => void;
+  speechPicker: boolean;
+  chatPicker: boolean;
+}) {
+  const fieldId = legend.toLowerCase().replace(/[^a-z]+/g, "-");
+  return (
+    <div className="wizard-subpanel">
+      <h4 className="wizard-subheading">{legend}</h4>
+      <div className="wizard-provider-tabs five">
+        {PROVIDERS.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            className={`wizard-prov-btn ${endpoint.kind === item.id ? "active" : ""}`}
+            onClick={() =>
+              onChange({
+                kind: item.id,
+                tested: false,
+                error: null,
+                detail: null,
+                models: [],
+                speechModel: "",
+                chatModel: "",
+                baseUrl: item.id === "custom" ? endpoint.baseUrl || "https://openrouter.ai/api/v1" : "",
+              })
+            }
+          >
+            <span className="prov-btn-title">{item.title}</span>
+            <span className="prov-btn-sub">{item.subtitle}</span>
+          </button>
+        ))}
+      </div>
+
+      {endpoint.kind === "custom" && (
+        <div className="form-group">
+          <label className="form-label" htmlFor={`${fieldId}-url`}>
+            Base URL
+          </label>
+          <input
+            id={`${fieldId}-url`}
+            type="text"
+            className="form-input"
+            placeholder="https://openrouter.ai/api/v1"
+            value={endpoint.baseUrl}
+            onChange={(e) =>
+              onChange({ baseUrl: e.target.value, tested: false, error: null, detail: null, models: [], speechModel: "", chatModel: "" })
+            }
+          />
+          <span className="form-hint">OpenRouter and any other OpenAI-compatible API. Change the URL later in Settings.</span>
+        </div>
+      )}
+
+      {endpoint.kind === "cloudflare" && (
+        <div className="form-group">
+          <label className="form-label" htmlFor={`${fieldId}-account`}>
+            Account ID
+          </label>
+          <input
+            id={`${fieldId}-account`}
+            type="text"
+            className="form-input"
+            placeholder="Cloudflare account ID"
+            value={endpoint.accountId}
+            onChange={(e) =>
+              onChange({ accountId: e.target.value, tested: false, error: null, detail: null, models: [], speechModel: "", chatModel: "" })
+            }
+          />
+        </div>
+      )}
+
+      {endpoint.kind !== "ollama" && (
+        <div className="form-group">
+          <label className="form-label" htmlFor={`${fieldId}-key`}>
+            API key
+          </label>
+          <div className="wizard-key-row">
+            <input
+              id={`${fieldId}-key`}
+              type="password"
+              className="form-input"
+              placeholder="Paste the API key"
+              value={endpoint.apiKey}
+              onChange={(e) =>
+                onChange({ apiKey: e.target.value, tested: false, error: null, detail: null, models: [], speechModel: "", chatModel: "" })
+              }
+            />
+            <button type="button" className="btn btn-secondary" onClick={onTest} disabled={endpoint.testing || !canTest(endpoint)}>
+              {endpoint.testing ? "Testing…" : endpoint.tested ? "Test again" : "Test connection"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {endpoint.kind === "ollama" && (
+        <div className="wizard-key-row">
+          <span className="form-hint">Uses http://localhost:11434/v1. No API key.</span>
+          <button type="button" className="btn btn-secondary" onClick={onTest} disabled={endpoint.testing}>
+            {endpoint.testing ? "Testing…" : endpoint.tested ? "Test again" : "Test connection"}
+          </button>
+        </div>
+      )}
+
+      {endpoint.detail && <div className="wizard-fetch-success">{endpoint.detail}</div>}
+      {endpoint.error && (
+        <div className="wizard-fetch-error">
+          {endpoint.error} {SETTINGS_HINT}
+        </div>
+      )}
+
+      {endpoint.tested && speechPicker && (
+        <ModelPicker
+          id={`${fieldId}-speech-model`}
+          label="Speech model"
+          value={endpoint.speechModel}
+          models={endpoint.models}
+          onChange={(speechModel) => onChange({ speechModel })}
+        />
+      )}
+      {endpoint.tested && chatPicker && (
+        <ModelPicker
+          id={`${fieldId}-chat-model`}
+          label="Polish model"
+          value={endpoint.chatModel}
+          models={endpoint.models}
+          onChange={(chatModel) => onChange({ chatModel })}
+        />
+      )}
+    </div>
+  );
 }
 
 export function SetupWizard({
   isOpen,
   onClose,
   onFinish,
+  onStartRecording,
   currentSettings,
-  modelStatus,
   downloadProgress,
   downloadSpeedBps,
   downloadEtaSecs,
@@ -144,219 +425,161 @@ export function SetupWizard({
   onDownloadModel,
   showToast,
 }: SetupWizardProps) {
-  const [step, setStep] = useState<1 | 2 | 3 | 4 | 5>(1);
+  const [step, setStep] = useState<1 | 2 | 3>(1);
   const [specs, setSpecs] = useState<SystemSpecs | null>(null);
   const [isLoadingSpecs, setIsLoadingSpecs] = useState(true);
-
-  // Prerequisites state
   const [prereqs, setPrereqs] = useState<PrerequisiteStatus | null>(null);
-  const [isLoadingPrereqs, setIsLoadingPrereqs] = useState(false);
-  const [activeOsTab, setActiveOsTab] = useState<"linux" | "windows">("linux");
-  const [isSettingUpEngine, setIsSettingUpEngine] = useState(false);
-  const [engineSetupMsg, setEngineSetupMsg] = useState<string | null>(null);
-
-  // Setup path
-  const [setupPath, setSetupPath] = useState<"local" | "cloud">("local");
-
-  // Local ASR model settings
+  const [setupPath, setSetupPath] = useState<SetupPath>("local");
+  const [polishChoice, setPolishChoice] = useState<PolishChoice>("later");
   const [localWhisperSize, setLocalWhisperSize] = useState<LocalModelSize>("base");
-  const [localWhisperEngine, setLocalWhisperEngine] = useState<"whisper_cpu" | "faster_whisper">(
-    currentSettings.local_engine === "faster_whisper" ? "faster_whisper" : "whisper_cpu"
-  );
+  const [speechEndpoint, setSpeechEndpoint] = useState<EndpointDraft>(emptyEndpoint());
+  const [polishEndpoint, setPolishEndpoint] = useState<EndpointDraft>(emptyEndpoint("openai"));
+  const [sameAsSpeech, setSameAsSpeech] = useState(true);
+  const [deferPolish, setDeferPolish] = useState(false);
+  const [preparePhase, setPreparePhase] = useState<PreparePhase>("idle");
+  const [prepareError, setPrepareError] = useState<string | null>(null);
+  const [isFinishing, setIsFinishing] = useState(false);
 
-  // Local LLM (Ollama) settings
-  const [localLlmMode, setLocalLlmMode] = useState<"ollama" | "none">("ollama");
-  const [ollamaAvailable, setOllamaAvailable] = useState<boolean | null>(null);
-  const [ollamaModels, setOllamaModels] = useState<string[]>([]);
-  const [selectedOllamaModel, setSelectedOllamaModel] = useState<string>("llama3.2");
-  const [isCheckingOllama, setIsCheckingOllama] = useState(false);
+  const userChosePath = useRef(false);
+  const userChoseModel = useRef(false);
+  const prepareStarted = useRef<string | null>(null);
+  const onDownloadModelRef = useRef(onDownloadModel);
+  onDownloadModelRef.current = onDownloadModel;
 
-  // Cloud / OpenAPI settings
-  const [cloudCategory, setCloudCategory] = useState<"cloudflare" | "openapi">("openapi");
-  const [openapiTemplate, setOpenapiTemplate] = useState<"groq" | "google" | "openai" | "custom">("groq");
-  const [cloudBaseUrl, setCloudBaseUrl] = useState("https://api.groq.com/openai/v1");
-  const [cloudApiKey, setCloudApiKey] = useState("");
-  const [cloudAccountId, setCloudAccountId] = useState("");
-  const [cloudModel, setCloudModel] = useState("whisper-large-v3-turbo");
-  const [cloudLlmModel, setCloudLlmModel] = useState("llama-3.3-70b-versatile");
-  const [cloudAvailableModels, setCloudAvailableModels] = useState<string[]>([]);
-  const [isFetchingCloudModels, setIsFetchingCloudModels] = useState(false);
-  const [cloudModelFetchSuccess, setCloudModelFetchSuccess] = useState<string | null>(null);
-  const [cloudModelFetchError, setCloudModelFetchError] = useState<string | null>(null);
+  const selectedModel = speechModel(localWhisperSize);
+  const totalRam = specs?.total_ram_gb ?? 8;
+  const suggestedModel = recommendedModel(totalRam);
+  const installing = preparePhase === "runner" || preparePhase === "weights" || isDownloading;
+  const shareSpeechProvider = setupPath === "cloud" && polishChoice === "api" && sameAsSpeech && !deferPolish;
+  const duplicateProvider =
+    !deferPolish &&
+    setupPath === "cloud" &&
+    polishChoice === "api" &&
+    !sameAsSpeech &&
+    speechEndpoint.kind === polishEndpoint.kind &&
+    (speechEndpoint.kind !== "custom" || endpointUrl(speechEndpoint) === endpointUrl(polishEndpoint));
 
-  // Load specs & initial checks on open
   useEffect(() => {
-    if (!isOpen) return;
-    setStep(1);
-    setIsLoadingSpecs(true);
-    if (currentSettings.local_engine) {
-      setLocalWhisperEngine(
-        currentSettings.local_engine === "faster_whisper" ? "faster_whisper" : "whisper_cpu"
-      );
+    if (!isOpen) {
+      prepareStarted.current = null;
+      return;
     }
+    setStep(1);
+    setPolishChoice("later");
+    setSpeechEndpoint(emptyEndpoint());
+    setPolishEndpoint(emptyEndpoint("openai"));
+    setSameAsSpeech(true);
+    setDeferPolish(false);
+    setPreparePhase("idle");
+    setPrepareError(null);
+    userChosePath.current = false;
+    userChoseModel.current = false;
+    setIsLoadingSpecs(true);
 
     invoke<SystemSpecs>("get_system_specs")
       .then((res) => {
         setSpecs(res);
-        if (res.recommended_mode === "cloud") {
-          setSetupPath("cloud");
-        } else {
-          setSetupPath("local");
-        }
-        if (res.recommended_whisper) {
-          setLocalWhisperSize(res.recommended_whisper);
-        }
-        if (res.os && res.os.toLowerCase().includes("win")) {
-          setActiveOsTab("windows");
-        } else {
-          setActiveOsTab("linux");
-        }
+        if (!userChosePath.current) setSetupPath(res.recommended_mode === "cloud" ? "cloud" : "local");
+        if (!userChoseModel.current) setLocalWhisperSize(recommendedModel(res.total_ram_gb));
       })
-      .catch((err) => {
-        console.error("Failed to read system specs:", err);
-      })
-      .finally(() => {
-        setIsLoadingSpecs(false);
-      });
+      .catch((err) => console.error("Failed to read system specs:", err))
+      .finally(() => setIsLoadingSpecs(false));
 
-    checkOllamaStatus();
-    fetchPrereqs();
+    invoke<PrerequisiteStatus>("check_system_prerequisites")
+      .then((status) => setPrereqs(status))
+      .catch((err) => console.warn("Failed to check microphone:", err));
   }, [isOpen]);
 
-  async function fetchPrereqs() {
-    setIsLoadingPrereqs(true);
-    try {
-      const p = await invoke<PrerequisiteStatus>("check_system_prerequisites");
-      setPrereqs(p);
-      if (p.venv_python_found && !currentSettings.local_engine) {
-        setLocalWhisperEngine("faster_whisper");
-      }
-      if (p.os && p.os.toLowerCase().includes("win")) {
-        setActiveOsTab("windows");
-      }
-    } catch (err) {
-      console.warn("Failed to check prerequisites:", err);
-    } finally {
-      setIsLoadingPrereqs(false);
-    }
-  }
+  useEffect(() => {
+    if (!isOpen || step !== 3 || setupPath !== "local") return;
+    if (prepareStarted.current === localWhisperSize) return;
+    prepareStarted.current = localWhisperSize;
+    void runLocalPrepare(localWhisperSize);
+  }, [isOpen, step, setupPath, localWhisperSize]);
 
-  async function checkOllamaStatus() {
-    setIsCheckingOllama(true);
-    try {
-      const models: string[] = await invoke("test_and_fetch_models", {
-        baseUrl: "http://localhost:11434/v1",
-        apiKey: "",
-      });
-      setOllamaAvailable(true);
-      if (models && models.length > 0) {
-        setOllamaModels(models);
-        setSelectedOllamaModel(models[0]);
-      } else {
-        setOllamaModels([]);
-      }
-    } catch {
-      setOllamaAvailable(false);
-      setOllamaModels([]);
-    } finally {
-      setIsCheckingOllama(false);
-    }
-  }
-
-  async function handleSetupRunner() {
-    setIsSettingUpEngine(true);
-    setEngineSetupMsg(null);
-    try {
-      const res = await invoke<string>("prepare_engine", { engine: localWhisperEngine });
-      setEngineSetupMsg(`✓ ${res}`);
-      showToast(res);
-      await fetchPrereqs();
-    } catch (err: any) {
-      const errText = String(err);
-      setEngineSetupMsg(`⚠️ ${errText}`);
-      showToast(`Runner setup error: ${errText}`);
-    } finally {
-      setIsSettingUpEngine(false);
-    }
-  }
-
-  async function handleRemoveWhisperRunner() {
-    setIsSettingUpEngine(true);
-    setEngineSetupMsg(null);
-    try {
-      await invoke("remove_whisper_binary");
-      setEngineSetupMsg("✓ Whisper runner removed from disk");
-      showToast("Whisper runner removed from disk");
-      await fetchPrereqs();
-    } catch (err: any) {
-      const errText = String(err);
-      setEngineSetupMsg(`⚠️ ${errText}`);
-      showToast(`Failed to remove runner: ${errText}`);
-    } finally {
-      setIsSettingUpEngine(false);
-    }
-  }
-
-  function handleSelectOpenApiTemplate(tmpl: "groq" | "google" | "openai" | "custom") {
-    setOpenapiTemplate(tmpl);
-    setCloudModelFetchSuccess(null);
-    setCloudModelFetchError(null);
-    setCloudAvailableModels([]);
-
-    if (tmpl === "groq") {
-      setCloudBaseUrl("https://api.groq.com/openai/v1");
-      setCloudModel("");
-      setCloudLlmModel("");
-    } else if (tmpl === "google") {
-      setCloudBaseUrl("https://generativelanguage.googleapis.com/v1beta/openai");
-      setCloudModel("");
-      setCloudLlmModel("");
-    } else if (tmpl === "openai") {
-      setCloudBaseUrl("https://api.openai.com/v1");
-      setCloudModel("");
-      setCloudLlmModel("");
-    } else {
-      setCloudBaseUrl("https://api.openai.com/v1");
-      setCloudModel("");
-      setCloudLlmModel("");
-    }
-  }
-
-  async function handleFetchCloudModels() {
-    if (!cloudBaseUrl.trim()) {
-      setCloudModelFetchError("Enter an API base URL first");
+  async function testEndpoint(target: "speech" | "polish") {
+    const current = target === "speech" ? speechEndpoint : polishEndpoint;
+    const patch = (next: Partial<EndpointDraft>) => {
+      if (target === "speech") setSpeechEndpoint((prev) => ({ ...prev, ...next }));
+      else setPolishEndpoint((prev) => ({ ...prev, ...next }));
+    };
+    const baseUrl = endpointUrl(current);
+    if (!baseUrl) {
+      patch({ tested: false, error: "Enter the account ID or base URL first." });
       return;
     }
-    setIsFetchingCloudModels(true);
-    setCloudModelFetchError(null);
-    setCloudModelFetchSuccess(null);
-    try {
-      const models: string[] = await invoke("test_and_fetch_models", {
-        baseUrl: cloudBaseUrl.trim(),
-        apiKey: cloudApiKey.trim(),
-      });
-      if (models && models.length > 0) {
-        setCloudAvailableModels(models);
-        setCloudModelFetchSuccess(`✓ Found ${models.length} live models from API`);
-        if (openapiTemplate === "groq") {
-          const llm = models.find((m) => m.includes("llama-3.3") || m.includes("llama-3.1")) || models[0];
-          setCloudLlmModel(llm);
-          const asr = models.find((m) => m.includes("whisper")) || "whisper-large-v3-turbo";
-          setCloudModel(asr);
-        } else if (openapiTemplate === "google") {
-          const gemini = models.find((m) => m.includes("gemini-2.5-flash") || m.includes("gemini-2.0") || m.includes("gemini-1.5")) || models[0];
-          setCloudLlmModel(gemini);
-        } else {
-          setCloudLlmModel(models[0]);
-        }
-      } else {
-        setCloudModelFetchError("No models returned by endpoint");
-      }
-    } catch (err: any) {
-      setCloudModelFetchError(String(err));
-    } finally {
-      setIsFetchingCloudModels(false);
+    if (current.kind !== "ollama" && !current.apiKey.trim()) {
+      patch({ tested: false, error: "Enter an API key first." });
+      return;
     }
+    patch({ testing: true, tested: false, error: null, detail: null, models: [], speechModel: "", chatModel: "" });
+    try {
+      const models = await invoke<string[]>("test_and_fetch_models", {
+        baseUrl,
+        apiKey: current.apiKey.trim(),
+      });
+      if (!models || models.length === 0) {
+        patch({ testing: false, error: "The provider responded, but returned no models." });
+        return;
+      }
+      patch({
+        testing: false,
+        tested: true,
+        detail: `Connected. Choose a model from the ${models.length} returned.`,
+        models,
+      });
+    } catch (err: unknown) {
+      patch({ testing: false, tested: false, error: String(err) });
+    }
+  }
+
+  async function runLocalPrepare(size: LocalModelSize) {
+    prepareStarted.current = size;
+    setPreparePhase("runner");
+    setPrepareError(null);
+    try {
+      await invoke("prepare_engine", { engine: "whisper_cpu" });
+      const status = await invoke<{ installed: boolean }>("get_model_status", {
+        engine: "whisper_cpu",
+        modelSize: size,
+      });
+      if (!status.installed) {
+        setPreparePhase("weights");
+        const err = await onDownloadModelRef.current("whisper_cpu", size);
+        if (err) throw new Error(err);
+      }
+      setPreparePhase("ready");
+    } catch (err: unknown) {
+      setPrepareError(err instanceof Error ? err.message : String(err));
+      setPreparePhase("error");
+      prepareStarted.current = null;
+    }
+  }
+
+  function speechReady(): boolean {
+    if (setupPath !== "cloud") return true;
+    return speechEndpoint.tested && speechEndpoint.speechModel.trim().length > 0;
+  }
+
+  function polishReady(): boolean {
+    if (polishChoice !== "api" || deferPolish) return true;
+    if (shareSpeechProvider) return speechEndpoint.tested && speechEndpoint.chatModel.trim().length > 0;
+    return polishEndpoint.tested && polishEndpoint.chatModel.trim().length > 0;
+  }
+
+  function canContinueSetup(): boolean {
+    return speechReady() && polishReady() && !duplicateProvider;
+  }
+
+  function setupBlockedReason(): string | null {
+    if (duplicateProvider) return "Use the same provider, or pick a different one for AI polish.";
+    if (setupPath === "cloud" && !speechEndpoint.tested) return "Test the speech provider before continuing.";
+    if (setupPath === "cloud" && !speechEndpoint.speechModel) return "Choose a speech model.";
+    if (deferPolish) return null;
+    if (polishChoice === "api" && shareSpeechProvider && !speechEndpoint.chatModel) return "Choose a polish model.";
+    if (polishChoice === "api" && !shareSpeechProvider && !polishEndpoint.tested) return "Test the AI polish provider before continuing.";
+    if (polishChoice === "api" && !shareSpeechProvider && !polishEndpoint.chatModel) return "Choose a polish model.";
+    return null;
   }
 
   async function handleSkip() {
@@ -370,1150 +593,363 @@ export function SetupWizard({
       wizard_completed: true,
     });
     onClose();
-    showToast("Setup skipped. You can configure anytime in Settings.");
+    showToast("Speech isn’t ready yet. Finish setup when you want to dictate.");
   }
 
-  async function handleCompleteSetup() {
-    if (setupPath === "local") {
-      const llmEnabled = localLlmMode === "ollama";
-      await onFinish(
-        {
-          engine_mode: "local",
-          local_engine: localWhisperEngine,
-          local_model_size: localWhisperSize,
-          api_base_url: "https://api.openai.com/v1",
-          api_key: "",
-          model: `whisper-${localWhisperSize}`,
-          wizard_completed: true,
-        },
-        llmEnabled
-          ? {
-              enabled: true,
-              active_provider_id: "OLLAMA_DEFAULT",
-              model: selectedOllamaModel || "llama3.2",
-              provider: {
-                id: "OLLAMA_DEFAULT",
-                name: "Ollama (Local)",
-                provider_type: "ollama",
-                api_key: "",
-                account_id: "",
-                base_url: "http://localhost:11434/v1",
-                model: selectedOllamaModel || "llama3.2",
-              },
-            }
-          : {
-              enabled: false,
-              active_provider_id: "OLLAMA_DEFAULT",
-              model: "llama3.2",
-            }
-      );
-    } else {
-      // Cloud mode
-      if (cloudCategory === "cloudflare") {
-        const acc = cloudAccountId.trim();
-        const base = acc
-          ? `https://api.cloudflare.com/client/v4/accounts/${acc}/ai/v1`
-          : "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1";
-        await onFinish(
-          {
-            engine_mode: "cloud",
-            local_engine: "whisper_cpu",
-            local_model_size: "base",
-            api_base_url: base,
-            api_key: cloudApiKey.trim(),
-            model: "@cf/openai/whisper-large-v3-turbo",
-            provider_id: "CLOUDFLARE_DEFAULT",
+  async function persistSetup() {
+    const speechRecord = setupPath === "cloud" ? providerRecord(speechEndpoint, speechEndpoint.speechModel, "speech") : null;
+    const speechSettings =
+      setupPath === "local"
+        ? {
+            engine_mode: "local" as const,
+            local_engine: "whisper_cpu" as const,
+            local_model_size: localWhisperSize,
+            api_base_url: currentSettings.api_base_url || "https://api.openai.com/v1",
+            api_key: "",
+            model: `whisper-${localWhisperSize}`,
             wizard_completed: true,
-          },
-          {
-            enabled: true,
-            active_provider_id: "CLOUDFLARE_DEFAULT",
-            model: "@cf/meta/llama-3.1-8b-instruct",
-            provider: {
-              id: "CLOUDFLARE_DEFAULT",
-              name: "Cloudflare Workers AI",
-              provider_type: "cloudflare",
-              api_key: cloudApiKey.trim(),
-              account_id: acc,
-              base_url: base,
-              model: "@cf/meta/llama-3.1-8b-instruct",
-            },
+            live_dictation: false,
           }
-        );
-      } else {
-        // OpenAPI / Custom
-        const provId =
-          openapiTemplate === "groq"
-            ? "GROQ_DEFAULT"
-            : openapiTemplate === "google"
-            ? "GOOGLE_CUSTOM"
-            : "OPENAI_CUSTOM";
-        const provName =
-          openapiTemplate === "groq"
-            ? "Groq Cloud"
-            : openapiTemplate === "google"
-            ? "Google AI Studio (Gemini)"
-            : openapiTemplate === "openai"
-            ? "OpenAI"
-            : "Custom OpenAPI";
+        : {
+            engine_mode: "cloud" as const,
+            local_engine: "whisper_cpu" as const,
+            local_model_size: "base" as const,
+            api_base_url: speechRecord?.base_url || "",
+            api_key: speechEndpoint.apiKey.trim(),
+            model: speechEndpoint.speechModel,
+            provider_id: speechRecord?.id,
+            wizard_completed: true,
+            live_dictation: false,
+          };
 
-        await onFinish(
-          {
-            engine_mode: "cloud",
-            local_engine: "whisper_cpu",
-            local_model_size: "base",
-            api_base_url: cloudBaseUrl.trim() || "https://api.openai.com/v1",
-            api_key: cloudApiKey.trim(),
-            model: cloudModel.trim() || "whisper-1",
-            provider_id: provId,
-            wizard_completed: true,
-          },
-          {
-            enabled: true,
-            active_provider_id: provId,
-            model: cloudLlmModel.trim(),
-            provider: {
-              id: provId,
-              name: provName,
-              provider_type: "custom",
-              api_key: cloudApiKey.trim(),
-              account_id: "",
-              base_url: cloudBaseUrl.trim() || "https://api.openai.com/v1",
-              model: cloudLlmModel.trim(),
-            },
-          }
-        );
-      }
+    if (polishChoice !== "api" || deferPolish) {
+      await onFinish(speechSettings, {
+        enabled: false,
+        auto_mode: false,
+        active_provider_id: speechRecord?.id || "",
+        model: "",
+        ...(speechRecord ? { provider: speechRecord } : {}),
+      });
+      return;
     }
 
-    onClose();
-    showToast("✓ Setup complete! Welcome to Lipi.");
+    const polishSource = shareSpeechProvider ? { ...speechEndpoint, chatModel: speechEndpoint.chatModel } : polishEndpoint;
+    const polishRecord = providerRecord(polishSource, polishSource.chatModel, "polish");
+    await onFinish(speechSettings, {
+      enabled: true,
+      auto_mode: true,
+      active_provider_id: polishRecord.id,
+      model: polishRecord.model,
+      provider: polishRecord,
+      ...(speechRecord && speechRecord.id !== polishRecord.id ? { speech_provider: speechRecord } : {}),
+    });
+  }
+
+  async function finishSetup(startRecording: boolean) {
+    if (preparePhase !== "ready" || isFinishing) return;
+    setIsFinishing(true);
+    try {
+      await persistSetup();
+      onClose();
+      if (startRecording) await onStartRecording();
+      else showToast("Setup complete. Press Alt+R to dictate.");
+    } catch (err: unknown) {
+      showToast(String(err));
+    } finally {
+      setIsFinishing(false);
+    }
+  }
+
+  function goToPrepare() {
+    if (!canContinueSetup()) return;
+    if (setupPath === "cloud") setPreparePhase("ready");
+    else if (prepareStarted.current !== localWhisperSize || preparePhase !== "ready") setPreparePhase("idle");
+    setStep(3);
   }
 
   if (!isOpen) return null;
 
-  const totalRam = specs?.total_ram_gb ?? 8.0;
-  const isHighRam = totalRam >= 15.0;
-  const isMediumRam = totalRam >= 7.5;
+  const micReady = !!prereqs?.has_audio_device;
+  const micLabel = micReady ? prereqs?.audio_device_name || "Default microphone" : "No microphone found";
+  const modelTooHeavy = totalRam < selectedModel.ramGb + 1.5;
+  const polishLabel = !polishChoice || polishChoice === "later" || deferPolish
+    ? "Transcript only. Add a provider later in Settings."
+    : shareSpeechProvider
+    ? `${speechEndpoint.kind} · ${speechEndpoint.chatModel}`
+    : `${polishEndpoint.kind} · ${polishEndpoint.chatModel}`;
 
   return (
     <div className="wizard-backdrop">
       <div className="wizard-container" role="dialog" aria-modal="true" aria-labelledby="wizard-title">
-        {/* Wizard Top Header */}
         <div className="wizard-header">
           <div className="wizard-brand">
             <span className="wizard-icon">🎙️</span>
             <div>
-              <h2 id="wizard-title" className="wizard-title">
-                Lipi Setup Wizard
-              </h2>
-              <p className="wizard-subtitle">Private Voice Transcription & AI Assistant</p>
+              <h2 id="wizard-title" className="wizard-title">Lipi Setup</h2>
+              <p className="wizard-subtitle">
+                {isLoadingSpecs ? "Checking this PC…" : `${totalRam} GB RAM · ${specs?.cpu_cores ?? "?"} cores · ${micLabel}`}
+              </p>
             </div>
           </div>
-          <button
-            type="button"
-            className="wizard-btn-skip"
-            onClick={handleSkip}
-            title="Skip wizard and use defaults"
-          >
-            Skip Setup for Now ✕
+          <button type="button" className="wizard-btn-skip" onClick={() => void handleSkip()} title="Leave setup for later">
+            Set up later
           </button>
         </div>
 
-        {/* Wizard Stepper Tabs - 5 Modular Steps */}
         <div className="wizard-stepper">
-          <button
-            type="button"
-            className={`wizard-step-pill ${step === 1 ? "active" : ""} ${step > 1 ? "completed" : ""}`}
-            onClick={() => setStep(1)}
-          >
-            <span className="step-num">1</span> PC Specs
+          <button type="button" className={`wizard-step-pill ${step === 1 ? "active" : ""} ${step > 1 ? "completed" : ""}`} onClick={() => { if (!installing) setStep(1); }}>
+            <span className="step-num">1</span> Choose
           </button>
           <div className="step-divider" />
-          <button
-            type="button"
-            className={`wizard-step-pill ${step === 2 ? "active" : ""} ${step > 2 ? "completed" : ""}`}
-            onClick={() => setStep(2)}
-          >
-            <span className="step-num">2</span> Select Mode
+          <button type="button" className={`wizard-step-pill ${step === 2 ? "active" : ""} ${step > 2 ? "completed" : ""}`} onClick={() => { if (!installing && step > 2) setStep(2); }}>
+            <span className="step-num">2</span> Setup
           </button>
           <div className="step-divider" />
-          <button
-            type="button"
-            className={`wizard-step-pill ${step === 3 ? "active" : ""} ${step > 3 ? "completed" : ""}`}
-            onClick={() => {
-              setStep(3);
-              fetchPrereqs();
-            }}
-          >
-            <span className="step-num">3</span> Prerequisites
-          </button>
-          <div className="step-divider" />
-          <button
-            type="button"
-            className={`wizard-step-pill ${step === 4 ? "active" : ""} ${step > 4 ? "completed" : ""}`}
-            onClick={() => setStep(4)}
-          >
-            <span className="step-num">4</span> ASR &amp; Model
-          </button>
-          <div className="step-divider" />
-          <button
-            type="button"
-            className={`wizard-step-pill ${step === 5 ? "active" : ""}`}
-            onClick={() => setStep(5)}
-          >
-            <span className="step-num">5</span> AI &amp; Ready
+          <button type="button" className={`wizard-step-pill ${step === 3 ? "active" : ""}`} disabled={step < 3}>
+            <span className="step-num">3</span> Prepare
           </button>
         </div>
 
-        {/* Wizard Step Body */}
         <div className="wizard-body">
-          {/* STEP 1: PC Specs */}
           {step === 1 && (
             <div className="wizard-step-content">
-              <h3 className="wizard-step-heading">PC Hardware Specifications</h3>
-              <p className="wizard-step-desc">
-                Lipi inspects your workstation hardware specs to suggest whether an offline local model or cloud API
-                is ideal for your computer.
-              </p>
+              <h3 className="wizard-step-heading">What should Lipi do?</h3>
+              <p className="wizard-step-desc">Pick where speech is transcribed, then whether the text stays as you said it or gets an AI polish.</p>
 
-              {isLoadingSpecs ? (
-                <div className="wizard-loading-card">
-                  <span className="spinner-dot" /> Detecting hardware specs...
-                </div>
-              ) : specs ? (
-                <>
-                  <div className="wizard-specs-grid">
-                    <div className="wizard-spec-card">
-                      <span className="spec-icon" title="System Memory">
-                        <svg className="spec-svg-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                          <path d="M6 19v-3" />
-                          <path d="M10 19v-3" />
-                          <path d="M14 19v-3" />
-                          <path d="M18 19v-3" />
-                          <rect x="2" y="5" width="20" height="11" rx="1" />
-                          <path d="M6 9h.01" />
-                          <path d="M10 9h.01" />
-                          <path d="M14 9h.01" />
-                          <path d="M18 9h.01" />
-                        </svg>
-                      </span>
-                      <div className="spec-label">System RAM</div>
-                      <div className="spec-value">{specs.total_ram_gb} GB</div>
+              <h4 className="wizard-choice-label">Speech</h4>
+              <div className="wizard-path-selector">
+                <label className={`wizard-path-card ${setupPath === "local" ? "selected" : ""}`}>
+                  <input type="radio" name="setup_path" checked={setupPath === "local"} onChange={() => { userChosePath.current = true; setSetupPath("local"); }} />
+                  <div>
+                    <div className="path-title">
+                      <span>On this computer</span>
+                      {specs?.recommended_mode !== "cloud" && <span className="path-pill-rec">Recommended</span>}
                     </div>
-                    <div className="wizard-spec-card">
-                      <span className="spec-icon" title="Processor">
-                        <svg className="spec-svg-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                          <rect x="4" y="4" width="16" height="16" rx="2" />
-                          <rect x="9" y="9" width="6" height="6" />
-                          <path d="M9 1v3" />
-                          <path d="M15 1v3" />
-                          <path d="M9 20v3" />
-                          <path d="M15 20v3" />
-                          <path d="M20 9h3" />
-                          <path d="M20 14h3" />
-                          <path d="M1 9h3" />
-                          <path d="M1 14h3" />
-                        </svg>
-                      </span>
-                      <div className="spec-label">CPU Cores</div>
-                      <div className="spec-value">{specs.cpu_cores} Cores</div>
-                    </div>
-                    <div className="wizard-spec-card">
-                      <span className="spec-icon" title="Platform OS">
-                        <svg className="spec-svg-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                          <rect x="2" y="3" width="20" height="14" rx="2" />
-                          <line x1="8" y1="21" x2="16" y2="21" />
-                          <line x1="12" y1="17" x2="12" y2="21" />
-                        </svg>
-                      </span>
-                      <div className="spec-label">Platform</div>
-                      <div className="spec-value">{specs.os.toUpperCase()}</div>
-                    </div>
+                    <div className="path-desc">Private and offline. Lipi downloads a speech model and runs it here.</div>
                   </div>
+                </label>
+                <label className={`wizard-path-card ${setupPath === "cloud" ? "selected" : ""}`}>
+                  <input type="radio" name="setup_path" checked={setupPath === "cloud"} onChange={() => { userChosePath.current = true; setSetupPath("cloud"); }} />
+                  <div>
+                    <div className="path-title">
+                      <span>In the cloud</span>
+                      {specs?.recommended_mode === "cloud" && <span className="path-pill-rec">Recommended</span>}
+                    </div>
+                    <div className="path-desc">Uses a provider from the same list as Settings. You will test the key next.</div>
+                  </div>
+                </label>
+              </div>
 
-                  <div className={`wizard-recommendation-box ${isHighRam ? "rec-high" : isMediumRam ? "rec-med" : "rec-low"}`}>
-                    <div className="rec-header">
-                      <span className="rec-badge">
-                        {isHighRam ? "🌟 High Performance Machine" : isMediumRam ? "⚡ Balanced Hardware" : "☁️ Cloud Optimized"}
-                      </span>
-                      <span className="rec-suggested-mode">
-                        Recommendation: {specs.recommended_mode === "local" ? "🏠 100% Local Setup" : "☁️ Fast Cloud / Hybrid"}
-                      </span>
-                    </div>
-                    <p className="rec-text">{specs.summary_text}</p>
+              <h4 className="wizard-choice-label">After you speak</h4>
+              <div className="wizard-path-selector stack">
+                <label className={`wizard-path-card ${polishChoice === "later" ? "selected" : ""}`}>
+                  <input type="radio" name="result_mode" checked={polishChoice === "later"} onChange={() => setPolishChoice("later")} />
+                  <div>
+                    <div className="path-title"><span>Transcript only</span></div>
+                    <div className="path-desc">Lipi writes what you said. You can add a provider for AI polish later in Settings.</div>
                   </div>
-                </>
-              ) : (
-                <div className="wizard-loading-card">Standard system specs detected (~8.0 GB RAM)</div>
+                </label>
+                <label className={`wizard-path-card ${polishChoice === "api" ? "selected" : ""}`}>
+                  <input type="radio" name="result_mode" checked={polishChoice === "api"} onChange={() => setPolishChoice("api")} />
+                  <div>
+                    <div className="path-title"><span>Polish with AI</span></div>
+                    <div className="path-desc">Cloudflare, Groq, OpenAI, Ollama, or a custom OpenAPI endpoint rewrites the text. Speech can stay on this computer.</div>
+                  </div>
+                </label>
+              </div>
+
+              {!micReady && prereqs && (
+                <p className="wizard-inline-warn">No microphone was found. You can finish setup, then connect a mic before dictating.</p>
               )}
 
               <div className="wizard-footer-actions">
-                <button type="button" className="btn btn-secondary" onClick={handleSkip}>
-                  Skip Setup
-                </button>
-                <button type="button" className="btn btn-primary" onClick={() => setStep(2)}>
-                  Next: Select Mode →
-                </button>
+                <span />
+                <button type="button" className="btn btn-primary" onClick={() => setStep(2)}>Next</button>
               </div>
             </div>
           )}
 
-          {/* STEP 2: Select Mode */}
           {step === 2 && (
             <div className="wizard-step-content">
-              <h3 className="wizard-step-heading">Select Setup Mode</h3>
+              <h3 className="wizard-step-heading">{setupPath === "local" ? "Choose a speech model" : "Connect speech"}</h3>
               <p className="wizard-step-desc">
-                Choose between running voice models completely offline on your device, or using cloud APIs.
+                {setupPath === "local"
+                  ? "Turbo v3 needs about 2.2 GB of RAM and is recommended for better accuracy. Medium, Small, and Base are for fast, quick transcription."
+                  : "Use the same provider types as Settings. Test the key, then choose the model yourself."}
               </p>
 
-              <div className="wizard-path-selector">
-                <label
-                  className={`wizard-path-card ${setupPath === "local" ? "selected" : ""}`}
-                  onClick={() => setSetupPath("local")}
-                >
-                  <input
-                    type="radio"
-                    name="setup_path"
-                    checked={setupPath === "local"}
-                    onChange={() => setSetupPath("local")}
-                  />
-                  <div>
-                    <div className="path-title">
-                      <span>🏠 100% Local (Private &amp; Offline)</span>
-                      {isMediumRam && <span className="path-pill-rec">Recommended</span>}
-                    </div>
-                    <div className="path-desc">
-                      Zero audio or notes leave your machine. Runs local Whisper ASR and optional local Ollama LLMs completely offline.
-                    </div>
-                  </div>
-                </label>
-
-                <label
-                  className={`wizard-path-card ${setupPath === "cloud" ? "selected" : ""}`}
-                  onClick={() => setSetupPath("cloud")}
-                >
-                  <input
-                    type="radio"
-                    name="setup_path"
-                    checked={setupPath === "cloud"}
-                    onChange={() => setSetupPath("cloud")}
-                  />
-                  <div>
-                    <div className="path-title">
-                      <span>☁️ Cloud / Hybrid (Fast &amp; Free APIs)</span>
-                      {!isMediumRam && <span className="path-pill-rec">Recommended</span>}
-                    </div>
-                    <div className="path-desc">
-                      Uses generous free tiers from Groq, Cloudflare, or Google AI Studio. Lightning-fast response with zero local RAM impact.
-                    </div>
-                  </div>
-                </label>
-              </div>
-
-              <div className="wizard-footer-actions">
-                <button type="button" className="btn btn-secondary" onClick={() => setStep(1)}>
-                  ← Back to Specs
-                </button>
-                <div style={{ display: "flex", gap: "10px" }}>
-                  <button type="button" className="btn btn-secondary" onClick={handleSkip}>
-                    Skip Setup
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    onClick={() => {
-                      setStep(3);
-                      fetchPrereqs();
-                    }}
-                  >
-                    Next: Check Prerequisites →
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* STEP 3: Prerequisites (Models not shown here) */}
-          {step === 3 && (
-            <div className="wizard-step-content">
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "10px" }}>
-                <div>
-                  <h3 className="wizard-step-heading">System Prerequisites</h3>
-                  <p className="wizard-step-desc">
-                    Verifying microphone input, operating system environment, and local services before setting up models.
-                  </p>
-                </div>
-                {/* Windows vs Linux Switcher Tabs */}
-                <div className="wizard-os-toggle-group">
-                  <button
-                    type="button"
-                    className={`wizard-os-pill ${activeOsTab === "linux" ? "active" : ""}`}
-                    onClick={() => setActiveOsTab("linux")}
-                  >
-                    🐧 Linux
-                  </button>
-                  <button
-                    type="button"
-                    className={`wizard-os-pill ${activeOsTab === "windows" ? "active" : ""}`}
-                    onClick={() => setActiveOsTab("windows")}
-                  >
-                    🪟 Windows
-                  </button>
-                </div>
-              </div>
-
-              {/* Prerequisites Checklist Cards - Models omitted per design */}
-              <div className="wizard-prereq-list">
-                {/* 1. Microphone Input Device */}
-                <div className="wizard-prereq-card">
-                  <div className="prereq-left">
-                    <span className="prereq-icon">
-                      {prereqs?.has_audio_device ? "🎙️" : "⚠️"}
-                    </span>
-                    <div>
-                      <div className="prereq-title">
-                        Microphone Audio Input
-                        <span className={`prereq-status-badge ${prereqs?.has_audio_device ? "status-ready" : "status-warn"}`}>
-                          {prereqs?.has_audio_device ? "Ready" : "Not Found"}
-                        </span>
-                      </div>
-                      <div className="prereq-desc">
-                        {prereqs?.has_audio_device
-                          ? `Device: ${prereqs.audio_device_name || "Default System Input"}`
-                          : "No default audio recording device detected. Ensure microphone is connected and permissions granted."}
-                      </div>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={fetchPrereqs}
-                    disabled={isLoadingPrereqs}
-                  >
-                    {isLoadingPrereqs ? "Checking..." : "↻ Re-check"}
-                  </button>
-                </div>
-
-                {/* 2. System OS & Audio Runtime */}
-                <div className="wizard-prereq-card">
-                  <div className="prereq-left">
-                    <span className="prereq-icon">💻</span>
-                    <div>
-                      <div className="prereq-title">
-                        Operating System &amp; Audio Runtime
-                        <span className="prereq-status-badge status-ready">
-                          {specs?.os.toUpperCase() || "Detected"}
-                        </span>
-                      </div>
-                      <div className="prereq-desc">
-                        {specs?.os.toLowerCase().includes("win")
-                          ? "Windows native environment detected. Whisper.cpp binaries and audio device drivers available."
-                          : "Linux environment detected with ALSA / PulseAudio / PipeWire audio backend."}
-                      </div>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={fetchPrereqs}
-                    disabled={isLoadingPrereqs}
-                  >
-                    ↻ Check
-                  </button>
-                </div>
-
-                {/* 3. Local AI Assistant (Ollama) Service */}
-                <div className="wizard-prereq-card">
-                  <div className="prereq-left">
-                    <span className="prereq-icon">🦙</span>
-                    <div>
-                      <div className="prereq-title">
-                        Ollama LLM Service (localhost:11434)
-                        <span
-                          className={`prereq-status-badge ${
-                            ollamaAvailable ? "status-ready" : "status-warn"
-                          }`}
-                        >
-                          {ollamaAvailable ? "Online" : "Offline"}
-                        </span>
-                      </div>
-                      <div className="prereq-desc">
-                        {ollamaAvailable
-                          ? `Connected with ${ollamaModels.length} models installed. Ready for local AI text processing.`
-                          : "Ollama is not running locally (optional for offline AI correction; cloud models can also be used)."}
-                      </div>
-                    </div>
-                  </div>
-
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={checkOllamaStatus}
-                    disabled={isCheckingOllama}
-                  >
-                    {isCheckingOllama ? "Testing..." : "↻ Re-test"}
-                  </button>
-                </div>
-              </div>
-
-              {/* OS Specific Setup Instructions Box */}
-              <div className="wizard-os-guide-box" style={{ marginTop: "14px" }}>
-                <div className="os-guide-header">
-                  <span>💡 {activeOsTab === "linux" ? "Linux Setup Guide (Debian / Ubuntu / Fedora / Arch)" : "Windows Setup Guide (Windows 10 / 11)"}</span>
-                </div>
-                {activeOsTab === "linux" ? (
-                  <div className="os-guide-body">
-                    <p style={{ margin: "0 0 6px 0", fontSize: "12px", color: "var(--text-secondary)" }}>
-                      If audio libraries are missing on Linux, install required packages:
-                    </p>
-                    <code className="os-guide-cmd">
-                      sudo apt update &amp;&amp; sudo apt install -y python3 libasound2-dev curl
-                    </code>
-                  </div>
-                ) : (
-                  <div className="os-guide-body">
-                    <p style={{ margin: "0 0 6px 0", fontSize: "12px", color: "var(--text-secondary)" }}>
-                      On Windows, ensure microphone permissions are enabled under <strong>Windows Settings → Privacy &amp; Security → Microphone</strong>.
-                    </p>
-                    <code className="os-guide-cmd">
-                      winget install Python.Python.3.11 &amp; winget install Ollama.Ollama
-                    </code>
-                  </div>
-                )}
-              </div>
-
-              <div className="wizard-footer-actions">
-                <button type="button" className="btn btn-secondary" onClick={() => setStep(2)}>
-                  ← Back to Mode
-                </button>
-                <div style={{ display: "flex", gap: "10px" }}>
-                  <button type="button" className="btn btn-secondary" onClick={handleSkip}>
-                    Skip Setup
-                  </button>
-                  <button type="button" className="btn btn-primary" onClick={() => setStep(4)}>
-                    Next: ASR Engine &amp; Model →
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* STEP 4: ASR Engine (Auto Install) + Model */}
-          {step === 4 && (
-            <div className="wizard-step-content">
               {setupPath === "local" ? (
                 <>
-                  <h3 className="wizard-step-heading">ASR Engine (Auto Install) &amp; Speech Model</h3>
-                  <p className="wizard-step-desc">
-                    Configure your Automatic Speech Recognition engine runner and download model weights for private offline dictation.
-                  </p>
-
-                  <div className="wizard-subpanel">
-                    {/* ASR Runner Selection & Auto-install */}
-                    <div className="wizard-engine-runner-row" style={{ marginBottom: "14px" }}>
-                      <span className="engine-runner-label">ASR Runner:</span>
-                      <label className="radio-label">
-                        <input
-                          type="radio"
-                          name="whisper_engine"
-                          checked={localWhisperEngine === "whisper_cpu"}
-                          onChange={() => setLocalWhisperEngine("whisper_cpu")}
-                        />
-                        <span>whisper.cpp (Native C++)</span>
-                      </label>
-                      <label className="radio-label">
-                        <input
-                          type="radio"
-                          name="whisper_engine"
-                          checked={localWhisperEngine === "faster_whisper"}
-                          onChange={() => setLocalWhisperEngine("faster_whisper")}
-                        />
-                        <span>faster-whisper (Python)</span>
-                      </label>
-                    </div>
-
-                    {/* Auto-install status banner */}
-                    <div className="wizard-prereq-card" style={{ marginBottom: "16px", background: "var(--bg-primary)" }}>
-                      <div className="prereq-left">
-                        <span className="prereq-icon">
-                          {isSettingUpEngine ? "⏳" : (localWhisperEngine === "whisper_cpu" && prereqs?.whisper_binary_found) || (localWhisperEngine === "faster_whisper" && prereqs?.venv_python_found) ? "✓" : "⚙️"}
-                        </span>
-                        <div>
-                          <div className="prereq-title">
-                            {localWhisperEngine === "whisper_cpu" ? "whisper.cpp Native Runner" : "faster-whisper Python Runner"}
-                            <span
-                              className={`prereq-status-badge ${
-                                (localWhisperEngine === "whisper_cpu" && prereqs?.whisper_binary_found) ||
-                                (localWhisperEngine === "faster_whisper" && prereqs?.venv_python_found)
-                                  ? "status-ready"
-                                  : isSettingUpEngine
-                                  ? "status-warn"
-                                  : "status-action"
-                              }`}
-                            >
-                              {(localWhisperEngine === "whisper_cpu" && prereqs?.whisper_binary_found) ||
-                              (localWhisperEngine === "faster_whisper" && prereqs?.venv_python_found)
-                                ? "Installed"
-                                : isSettingUpEngine
-                                ? "Installing..."
-                                : "Not Installed"}
-                            </span>
-                          </div>
-                          <div className="prereq-desc">
-                            {isSettingUpEngine
-                              ? "Setting up engine runner binary and libraries..."
-                              : localWhisperEngine === "whisper_cpu"
-                              ? prereqs?.whisper_binary_found
-                                ? `whisper-cli executable ready at ${prereqs.whisper_binary_path}`
-                                : "Click Setup below to download native whisper.cpp runner."
-                              : prereqs?.venv_python_found
-                              ? "faster-whisper Python runner ready."
-                              : prereqs?.python_found
-                              ? `Detected existing Python at ${prereqs.python_path}. Click setup to install faster-whisper.`
-                              : "Click setup to prepare faster-whisper Python environment."}
-                          </div>
-                          {engineSetupMsg && (
-                            <div className="form-hint" style={{ marginTop: "4px", color: "var(--accent)" }}>
-                              {engineSetupMsg}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-
-                      <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                        {localWhisperEngine === "whisper_cpu" && prereqs?.whisper_binary_found && (
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            style={{ color: "var(--text-danger, #ef4444)" }}
-                            onClick={handleRemoveWhisperRunner}
-                            disabled={isSettingUpEngine}
-                            title="Remove whisper.cpp binary from disk"
-                          >
-                            🗑️ Remove Runner
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          className="btn btn-secondary btn-sm"
-                          onClick={handleSetupRunner}
-                          disabled={isSettingUpEngine}
-                        >
-                          {isSettingUpEngine
-                            ? "Installing..."
-                            : ((localWhisperEngine === "whisper_cpu" && prereqs?.whisper_binary_found) ||
-                               (localWhisperEngine === "faster_whisper" && prereqs?.venv_python_found))
-                            ? "↻ Re-install"
-                            : "⚡ 1-Click Setup Runner"}
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Model Size Selection */}
-                    <h4 className="wizard-subheading">Model Size &amp; Precision</h4>
-                    <div className="wizard-model-sizes-grid">
-                      <label className={`wizard-size-card ${localWhisperSize === "tiny" ? "active" : ""}`}>
+                  <div className="wizard-model-sizes-grid">
+                    {SPEECH_MODELS.map((model) => (
+                      <label key={model.id} className={`wizard-size-card ${localWhisperSize === model.id ? "active" : ""}`}>
                         <input
                           type="radio"
                           name="whisper_size"
-                          checked={localWhisperSize === "tiny"}
-                          onChange={() => setLocalWhisperSize("tiny")}
-                        />
-                        <div className="size-title">Tiny (~75 MB)</div>
-                        <div className="size-desc">Fastest transcription, minimal RAM (~300 MB). Good for quick voice memos.</div>
-                      </label>
-
-                      <label className={`wizard-size-card ${localWhisperSize === "base" ? "active" : ""}`}>
-                        <input
-                          type="radio"
-                          name="whisper_size"
-                          checked={localWhisperSize === "base"}
-                          onChange={() => setLocalWhisperSize("base")}
+                          checked={localWhisperSize === model.id}
+                          onChange={() => {
+                            userChoseModel.current = true;
+                            setLocalWhisperSize(model.id);
+                          }}
                         />
                         <div className="size-title">
-                          Base (~142 MB) <span className="tag-recommended">Recommended</span>
+                          {model.title}
+                          {model.id === suggestedModel && <span className="tag-recommended">Recommended</span>}
                         </div>
-                        <div className="size-desc">Balanced accuracy and speed (~500 MB RAM). Ideal for everyday dictation.</div>
+                        <div className="size-ram">{model.ram}</div>
+                        <div className="size-desc">{model.summary}</div>
                       </label>
-
-                      <label className={`wizard-size-card ${localWhisperSize === "small" ? "active" : ""}`}>
-                        <input
-                          type="radio"
-                          name="whisper_size"
-                          checked={localWhisperSize === "small"}
-                          onChange={() => setLocalWhisperSize("small")}
-                        />
-                        <div className="size-title">Small (~466 MB)</div>
-                        <div className="size-desc">High accuracy for accents and specialized technical terms (~1 GB RAM).</div>
-                      </label>
-
-                      <label className={`wizard-size-card ${localWhisperSize === "turbo_q8" ? "active" : ""}`}>
-                        <input
-                          type="radio"
-                          name="whisper_size"
-                          checked={localWhisperSize === "turbo_q8"}
-                          onChange={() => setLocalWhisperSize("turbo_q8")}
-                        />
-                        <div className="size-title">
-                          Turbo Q8 (~850 MB) <span className="tag-recommended" style={{ background: "#7c3aed" }}>Near Large-v3</span>
-                        </div>
-                        <div className="size-desc">Whisper Large-v3-Turbo quantized. Near highest accuracy, 8x faster (~2.2 GB RAM).</div>
-                      </label>
-
-                      <label className={`wizard-size-card ${localWhisperSize === "medium" ? "active" : ""}`}>
-                        <input
-                          type="radio"
-                          name="whisper_size"
-                          checked={localWhisperSize === "medium"}
-                          onChange={() => setLocalWhisperSize("medium")}
-                        />
-                        <div className="size-title">Medium (~1.5 GB)</div>
-                        <div className="size-desc">Deep accuracy &amp; nuanced vocabulary for complex dictation (~2.5 GB RAM).</div>
-                      </label>
-                    </div>
-
-                    {(localWhisperSize === "turbo_q8" || localWhisperSize === "medium") && (
-                      <div style={{ marginTop: "10px", padding: "8px 12px", background: "rgba(234, 179, 8, 0.1)", border: "1px solid rgba(234, 179, 8, 0.3)", borderRadius: "6px", fontSize: "12px", color: "var(--text-secondary)" }}>
-                        ⚡ <strong>RAM Notice:</strong> {localWhisperSize === "turbo_q8" ? "Turbo Q8 requires ~2.2 GB RAM (over 2 GB)" : "Medium requires ~2.5 GB RAM"}. Your PC has {specs?.total_ram_gb ?? 8} GB RAM.
-                      </div>
-                    )}
-
-                    {/* Model weights status & download */}
-                    <div className="wizard-download-status-card" style={{ marginTop: "14px" }}>
-                      <div className="status-left">
-                        <span className="status-icon">
-                          {modelStatus?.installed && modelStatus.model_size === localWhisperSize ? "✓" : "⬇️"}
-                        </span>
-                        <div>
-                          <div className="status-main-label">
-                            {modelStatus?.installed && modelStatus.model_size === localWhisperSize
-                              ? `Local weights (${localWhisperSize}) are installed and ready`
-                              : `Local weights (${localWhisperSize}) not downloaded yet`}
-                          </div>
-                          <div className="form-hint">
-                            Official weights are downloaded once from HuggingFace and run completely offline.
-                          </div>
-                        </div>
-                      </div>
-
-                      <div>
-                        {isDownloading ? (
-                          <div className="wizard-downloading-box">
-                            <div className="downloading-info">
-                              <span>Downloading {localWhisperSize} weights... {downloadProgress ?? 0}%</span>
-                              <span className="downloading-stats">
-                                {downloadSpeedBps > 0 && formatSpeed(downloadSpeedBps)}
-                                {downloadEtaSecs > 0 && ` · ${formatEta(downloadEtaSecs)}`}
-                              </span>
-                            </div>
-                            <div className="progress-bar-bg">
-                              <div
-                                className="progress-bar-fill"
-                                style={{ width: `${Math.min(downloadProgress ?? 0, 100)}%` }}
-                              />
-                            </div>
-                          </div>
-                        ) : (
-                          <button
-                            type="button"
-                            className="btn btn-secondary"
-                            onClick={() => onDownloadModel(localWhisperEngine, localWhisperSize)}
-                          >
-                            {modelStatus?.installed && modelStatus.model_size === localWhisperSize
-                              ? "Re-download Weights"
-                              : "Download Weights Now"}
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                </>
-              ) : (
-                /* Cloud ASR Setup */
-                <>
-                  <h3 className="wizard-step-heading">Cloud ASR Configuration</h3>
-                  <p className="wizard-step-desc">
-                    Choose an online provider for fast, cloud-hosted speech transcription.
-                  </p>
-
-                  <div className="wizard-subpanel">
-                    <h4 className="wizard-subheading">Choose Provider</h4>
-                    <div className="wizard-provider-tabs">
-                      <button
-                        type="button"
-                        className={`wizard-prov-btn ${cloudCategory === "openapi" && openapiTemplate === "groq" ? "active" : ""}`}
-                        onClick={() => {
-                          setCloudCategory("openapi");
-                          handleSelectOpenApiTemplate("groq");
-                        }}
-                      >
-                        <span className="prov-btn-title">⚡ Groq Cloud</span>
-                        <span className="prov-btn-sub">Ultra-fast free tier</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        className={`wizard-prov-btn ${cloudCategory === "openapi" && openapiTemplate === "google" ? "active" : ""}`}
-                        onClick={() => {
-                          setCloudCategory("openapi");
-                          handleSelectOpenApiTemplate("google");
-                        }}
-                      >
-                        <span className="prov-btn-title">✨ Google AI Studio</span>
-                        <span className="prov-btn-sub">Generous free tier</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        className={`wizard-prov-btn ${cloudCategory === "cloudflare" ? "active" : ""}`}
-                        onClick={() => setCloudCategory("cloudflare")}
-                      >
-                        <span className="prov-btn-title">🛡️ Cloudflare AI</span>
-                        <span className="prov-btn-sub">10k neurons/day</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        className={`wizard-prov-btn ${cloudCategory === "openapi" && (openapiTemplate === "openai" || openapiTemplate === "custom") ? "active" : ""}`}
-                        onClick={() => {
-                          setCloudCategory("openapi");
-                          handleSelectOpenApiTemplate("custom");
-                        }}
-                      >
-                        <span className="prov-btn-title">🔧 Custom / OpenAI</span>
-                        <span className="prov-btn-sub">OpenAI-compatible</span>
-                      </button>
-                    </div>
-
-                    {cloudCategory === "cloudflare" ? (
-                      <div className="wizard-provider-form">
-                        <div className="form-info-banner">
-                          <span>🛡️ Cloudflare Workers AI offers 10,000 neurons/day free tier.</span>
-                          <a
-                            href="https://dash.cloudflare.com"
-                            target="_blank"
-                            rel="noreferrer"
-                            className="banner-link"
-                          >
-                            Get Account ID &amp; Token ↗
-                          </a>
-                        </div>
-
-                        <div className="form-group">
-                          <label className="form-label">Cloudflare Account ID:</label>
-                          <input
-                            type="text"
-                            className="form-input"
-                            placeholder="e.g. c3a0b12984fe721..."
-                            value={cloudAccountId}
-                            onChange={(e) => setCloudAccountId(e.target.value)}
-                          />
-                        </div>
-
-                        <div className="form-group">
-                          <label className="form-label">Cloudflare API Token:</label>
-                          <input
-                            type="password"
-                            className="form-input"
-                            placeholder="Workers AI API Token"
-                            value={cloudApiKey}
-                            onChange={(e) => setCloudApiKey(e.target.value)}
-                          />
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="wizard-provider-form">
-                        <div className="form-info-banner">
-                          {openapiTemplate === "groq" && (
-                            <>
-                              <span>⚡ Groq offers ultra-fast whisper transcription with generous free rate limits.</span>
-                              <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" className="banner-link">
-                                Get Free Groq Key ↗
-                              </a>
-                            </>
-                          )}
-                          {openapiTemplate === "google" && (
-                            <>
-                              <span>✨ Google AI Studio provides API keys with generous quotas via OpenAI-compatible endpoints.</span>
-                              <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="banner-link">
-                                Get Free Google Key ↗
-                              </a>
-                            </>
-                          )}
-                          {openapiTemplate === "custom" && (
-                            <span>🔧 Standard OpenAPI / OpenAI-compatible endpoint. Defaults to api.openai.com.</span>
-                          )}
-                        </div>
-
-                        <div className="form-group">
-                          <label className="form-label">API Base URL:</label>
-                          <input
-                            type="text"
-                            className="form-input"
-                            value={cloudBaseUrl}
-                            onChange={(e) => setCloudBaseUrl(e.target.value)}
-                          />
-                        </div>
-
-                        <div className="form-group">
-                          <label className="form-label">API Key:</label>
-                          <div style={{ display: "flex", gap: "8px" }}>
-                            <input
-                              type="password"
-                              className="form-input"
-                              placeholder="Enter API key"
-                              value={cloudApiKey}
-                              onChange={(e) => setCloudApiKey(e.target.value)}
-                            />
-                            <button
-                              type="button"
-                              className="btn btn-secondary"
-                              onClick={handleFetchCloudModels}
-                              disabled={isFetchingCloudModels || !cloudApiKey.trim()}
-                            >
-                              {isFetchingCloudModels ? "Testing..." : "Test & Fetch Models"}
-                            </button>
-                          </div>
-                        </div>
-
-                        {cloudModelFetchSuccess && (
-                          <div className="wizard-fetch-success">{cloudModelFetchSuccess}</div>
-                        )}
-                        {cloudModelFetchError && (
-                          <div className="wizard-fetch-error">⚠️ {cloudModelFetchError}</div>
-                        )}
-
-                        <div className="form-group" style={{ marginTop: "12px" }}>
-                          <label className="form-label">ASR Speech Model:</label>
-                          <input
-                            type="text"
-                            className="form-input"
-                            value={cloudModel}
-                            onChange={(e) => setCloudModel(e.target.value)}
-                            list="wizard-cloud-asr-models"
-                          />
-                          <datalist id="wizard-cloud-asr-models">
-                            {cloudAvailableModels.filter((m) => m.toLowerCase().includes("whisper")).map((m) => (
-                              <option key={m} value={m} />
-                            ))}
-                          </datalist>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
-
-              <div className="wizard-footer-actions">
-                <button type="button" className="btn btn-secondary" onClick={() => setStep(3)}>
-                  ← Back to Prerequisites
-                </button>
-                <div style={{ display: "flex", gap: "10px" }}>
-                  <button type="button" className="btn btn-secondary" onClick={handleSkip}>
-                    Skip Setup
-                  </button>
-                  <button type="button" className="btn btn-primary" onClick={() => setStep(5)}>
-                    Next: AI Assistant &amp; Ready →
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* STEP 5: AI Assistant Ready (Info Selected) */}
-          {step === 5 && (
-            <div className="wizard-step-content">
-              <h3 className="wizard-step-heading">AI Assistant &amp; Summary</h3>
-              <p className="wizard-step-desc">
-                Configure optional AI post-processing, review your chosen setup, and start dictating.
-              </p>
-
-              {/* AI Assistant Configuration */}
-              {setupPath === "local" ? (
-                <div className="wizard-subpanel" style={{ marginBottom: "14px" }}>
-                  <h4 className="wizard-subheading" style={{ marginBottom: "8px" }}>Local AI Assistant (LLM)</h4>
-                  <div className="wizard-llm-choice-row">
-                    <label className="radio-label">
-                      <input
-                        type="radio"
-                        name="local_llm_mode"
-                        checked={localLlmMode === "ollama"}
-                        onChange={() => setLocalLlmMode("ollama")}
-                      />
-                      <span>Enable Ollama (Local AI Models)</span>
-                    </label>
-                    <label className="radio-label">
-                      <input
-                        type="radio"
-                        name="local_llm_mode"
-                        checked={localLlmMode === "none"}
-                        onChange={() => setLocalLlmMode("none")}
-                      />
-                      <span>Pure Transcription Only (No AI Edits)</span>
-                    </label>
-                  </div>
-
-                  {localLlmMode === "ollama" && (
-                    <div className="wizard-ollama-box" style={{ marginTop: "12px" }}>
-                      <div className="ollama-status-row">
-                        <span className={`ollama-dot ${ollamaAvailable ? "dot-online" : "dot-offline"}`} />
-                        <span className="ollama-status-label">
-                          {isCheckingOllama
-                            ? "Checking Ollama on localhost:11434..."
-                            : ollamaAvailable
-                            ? `Ollama service connected (${ollamaModels.length} models available)`
-                            : "Ollama not running on localhost:11434 (start Ollama or pick model)"}
-                        </span>
-                        <button
-                          type="button"
-                          className="btn-text-action"
-                          onClick={checkOllamaStatus}
-                          title="Refresh Ollama status"
-                        >
-                          ↻ Check
-                        </button>
-                      </div>
-
-                      <div className="form-group" style={{ marginTop: "10px" }}>
-                        <label className="form-label">Select Ollama Model:</label>
-                        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                          <input
-                            type="text"
-                            className="form-input"
-                            value={selectedOllamaModel}
-                            onChange={(e) => setSelectedOllamaModel(e.target.value)}
-                            placeholder="e.g. llama3.2, mistral, gemma2:2b"
-                            list="wizard-ollama-suggestions"
-                          />
-                          <datalist id="wizard-ollama-suggestions">
-                            {ollamaModels.map((m) => (
-                              <option key={m} value={m} />
-                            ))}
-                          </datalist>
-                        </div>
-
-                        {selectedOllamaModel.trim() && (
-                          <div className="wizard-model-ram-feedback" style={{ marginTop: "6px" }}>
-                            <span className="ram-badge-item">
-                              {getModelRamFeedback(selectedOllamaModel, totalRam).label}
-                            </span>
-                          </div>
-                        )}
-
-                        <div className="wizard-quick-model-pills" style={{ marginTop: "8px" }}>
-                          <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>Models:</span>
-                          {(ollamaModels.length > 0 ? ollamaModels.slice(0, 6) : ["llama3.2", "mistral", "gemma2:2b", "qwen2.5:3b"]).map((m) => (
-                            <button
-                              key={m}
-                              type="button"
-                              className={`model-pill ${selectedOllamaModel === m ? "active" : ""}`}
-                              onClick={() => setSelectedOllamaModel(m)}
-                            >
-                              {m}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                /* Cloud LLM selection */
-                <div className="wizard-subpanel" style={{ marginBottom: "14px" }}>
-                  <h4 className="wizard-subheading" style={{ marginBottom: "8px" }}>Cloud AI Assistant (LLM)</h4>
-                  <div className="form-group">
-                    <label className="form-label">Cloud AI Model:</label>
-                    <input
-                      type="text"
-                      className="form-input"
-                      value={cloudLlmModel}
-                      onChange={(e) => setCloudLlmModel(e.target.value)}
-                      placeholder="e.g. llama-3.3-70b-versatile, gemini-2.5-flash"
-                      list="wizard-cloud-llm-models"
-                    />
-                    <datalist id="wizard-cloud-llm-models">
-                      {cloudAvailableModels.map((m) => (
-                        <option key={m} value={m} />
-                      ))}
-                    </datalist>
-                  </div>
-                  <div className="wizard-quick-model-pills" style={{ marginTop: "8px" }}>
-                    <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>Presets:</span>
-                    {(openapiTemplate === "groq"
-                      ? ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-                      : openapiTemplate === "google"
-                      ? ["gemini-2.5-flash", "gemini-2.0-flash"]
-                      : ["gpt-4o-mini", "llama-3.1-8b-instruct"]
-                    ).map((m) => (
-                      <button
-                        key={m}
-                        type="button"
-                        className={`model-pill ${cloudLlmModel === m ? "active" : ""}`}
-                        onClick={() => setCloudLlmModel(m)}
-                      >
-                        {m}
-                      </button>
                     ))}
                   </div>
+                  {modelTooHeavy && (
+                    <p className="wizard-inline-warn">
+                      {selectedModel.title} wants about {selectedModel.ramGb} GB. This PC has {totalRam} GB, so a smaller model will stay more responsive.
+                    </p>
+                  )}
+                  <p className="wizard-step-note">A different engine or live dictation can be changed later in Settings.</p>
+                </>
+              ) : (
+                <ProviderForm
+                  legend="Speech provider"
+                  endpoint={speechEndpoint}
+                  onChange={(patch) => setSpeechEndpoint((prev) => ({ ...prev, ...patch }))}
+                  onTest={() => void testEndpoint("speech")}
+                  speechPicker
+                  chatPicker={shareSpeechProvider}
+                />
+              )}
+
+              {polishChoice === "later" && (
+                <p className="wizard-step-note">AI polish is off. Add Cloudflare, Groq, OpenAI, Ollama, or a custom endpoint later in Settings.</p>
+              )}
+
+              {polishChoice === "api" && (
+                <div className="wizard-defer-toggle">
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      className="checkbox-input"
+                      checked={deferPolish}
+                      onChange={(e) => setDeferPolish(e.target.checked)}
+                    />
+                    <span>Set up the AI provider later</span>
+                  </label>
+                  <p className="wizard-step-note">
+                    Continue with no key and no model. Add or change Cloudflare, Groq, OpenAI, Ollama, or a custom endpoint later in Settings.
+                  </p>
                 </div>
               )}
 
-              {/* Info Selected Summary Card */}
-              <div className="wizard-summary-card" style={{ marginBottom: "14px" }}>
-                <div className="summary-row">
-                  <span className="summary-label">Selected Mode:</span>
-                  <span className="summary-value">{setupPath === "local" ? "🏠 100% Local (Offline)" : "☁️ Cloud / Hybrid"}</span>
-                </div>
-                <div className="summary-row">
-                  <span className="summary-label">ASR Speech-to-Text:</span>
-                  <span className="summary-value">
-                    {setupPath === "local"
-                      ? `Whisper ${localWhisperSize === "turbo_q8" ? "Turbo Q8" : localWhisperSize.toUpperCase()} (${localWhisperEngine === "whisper_cpu" ? "whisper.cpp" : "faster-whisper"})`
-                      : cloudCategory === "cloudflare"
-                      ? "Cloudflare Workers AI"
-                      : `${cloudModel || "Configured model"} via ${cloudBaseUrl}`}
-                  </span>
-                </div>
-                <div className="summary-row">
-                  <span className="summary-label">AI Assistant:</span>
-                  <span className="summary-value">
-                    {setupPath === "local"
-                      ? localLlmMode === "ollama"
-                        ? `Ollama (${selectedOllamaModel || "Active model"})`
-                        : "Disabled (Transcription Only)"
-                      : cloudCategory === "cloudflare"
-                      ? "Cloudflare Workers AI"
-                      : cloudLlmModel || "Enabled"}
-                  </span>
-                </div>
-                <div className="summary-row">
-                  <span className="summary-label">Microphone &amp; Platform:</span>
-                  <span className="summary-value">
-                    {specs?.os.toUpperCase() || "DESKTOP"} · {prereqs?.audio_device_name ? prereqs.audio_device_name : (prereqs?.has_audio_device ? "Default Mic Ready" : "No Mic Found")}
-                  </span>
-                </div>
-              </div>
+              {setupPath === "cloud" && polishChoice === "api" && !deferPolish && (
+                <label className="checkbox-label" style={{ marginTop: "8px" }}>
+                  <input type="checkbox" className="checkbox-input" checked={sameAsSpeech} onChange={(e) => setSameAsSpeech(e.target.checked)} />
+                  <span>Use this same provider for AI polish</span>
+                </label>
+              )}
 
-              {/* Shortcuts cheatsheet */}
-              <div className="wizard-cheatsheet-box" style={{ marginBottom: "14px" }}>
-                <h4 style={{ margin: "0 0 6px 0", fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>
-                  💡 Helpful Shortcuts:
-                </h4>
-                <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", fontSize: "12px", color: "var(--text-secondary)" }}>
-                  <span><kbd className="key-hint">Alt+R</kbd> System-wide dictation (enable Auto-Paste in Settings)</span>
-                  <span><kbd className="key-hint">Alt+M</kbd> Mini widget</span>
-                  <span><kbd className="key-hint">Esc</kbd> Exit to scratchpad</span>
-                </div>
-              </div>
+              {polishChoice === "api" && !deferPolish && !shareSpeechProvider && (
+                <ProviderForm
+                  legend="AI polish provider"
+                  endpoint={polishEndpoint}
+                  onChange={(patch) => setPolishEndpoint((prev) => ({ ...prev, ...patch }))}
+                  onTest={() => void testEndpoint("polish")}
+                  speechPicker={false}
+                  chatPicker
+                />
+              )}
 
               <div className="wizard-footer-actions">
-                <button type="button" className="btn btn-secondary" onClick={() => setStep(4)}>
-                  ← Back to ASR Engine
-                </button>
-                <button type="button" className="btn btn-primary" onClick={handleCompleteSetup}>
-                  ✓ Complete Setup &amp; Start Dictating
-                </button>
+                <button type="button" className="btn btn-secondary" onClick={() => setStep(1)}>Back</button>
+                <div className="wizard-footer-next">
+                  {setupBlockedReason() && <span className="wizard-step-note">{setupBlockedReason()}</span>}
+                  <button type="button" className="btn btn-primary" disabled={!canContinueSetup()} onClick={goToPrepare}>
+                    Next: Prepare
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {step === 3 && (
+            <div className="wizard-step-content">
+              <h3 className="wizard-step-heading">Prepare</h3>
+              <p className="wizard-step-desc">
+                {setupPath === "local"
+                  ? `Installing ${selectedModel.title} now (${selectedModel.ram}). Dictation starts when this finishes.`
+                  : "The provider key worked. Nothing else needs to download."}
+              </p>
+
+              <div className="wizard-summary-card">
+                <div className="summary-row">
+                  <span className="summary-label">Speech</span>
+                  <span className="summary-value">
+                    {setupPath === "local"
+                      ? `${selectedModel.title} on this computer`
+                      : `${speechEndpoint.kind} · ${speechEndpoint.speechModel}`}
+                  </span>
+                </div>
+                <div className="summary-row">
+                  <span className="summary-label">Result</span>
+                  <span className="summary-value">{polishLabel}</span>
+                </div>
+                <div className="summary-row">
+                  <span className="summary-label">Microphone</span>
+                  <span className="summary-value">{micLabel}</span>
+                </div>
+                <div className="summary-row">
+                  <span className="summary-label">Install</span>
+                  <span className="summary-value">
+                    {setupPath === "cloud"
+                      ? "Provider tested"
+                      : preparePhase === "runner"
+                      ? "Installing the speech engine…"
+                      : preparePhase === "weights" || isDownloading
+                      ? "Downloading the speech model…"
+                      : preparePhase === "ready"
+                      ? "Ready"
+                      : preparePhase === "error"
+                      ? "Could not finish"
+                      : "Starting…"}
+                  </span>
+                </div>
+              </div>
+
+              {setupPath === "local" && (preparePhase === "weights" || isDownloading) && (
+                <div className="wizard-prepare-progress">
+                  <div className="downloading-info">
+                    <span>Downloading {selectedModel.title}{downloadProgress !== null ? `… ${downloadProgress}%` : "…"}</span>
+                    <span className="downloading-stats">
+                      {downloadSpeedBps > 0 && formatSpeed(downloadSpeedBps)}
+                      {downloadEtaSecs > 0 && ` · ${formatEta(downloadEtaSecs)}`}
+                    </span>
+                  </div>
+                  <div className="progress-bar-bg">
+                    <div className="progress-bar-fill" style={{ width: `${Math.min(downloadProgress ?? 0, 100)}%` }} />
+                  </div>
+                </div>
+              )}
+
+              {setupPath === "local" && preparePhase === "runner" && !isDownloading && (
+                <div className="wizard-loading-card"><span className="spinner-dot" /> Installing the speech engine…</div>
+              )}
+              {prepareError && <div className="wizard-fetch-error">{prepareError}</div>}
+              {preparePhase === "ready" && (
+                <p className="wizard-step-note">Press <kbd className="key-hint">Alt+R</kbd> in any app to dictate, or start a recording here.</p>
+              )}
+
+              <div className="wizard-footer-actions">
+                <button type="button" className="btn btn-secondary" disabled={installing || isFinishing} onClick={() => setStep(2)}>Back</button>
+                <div className="wizard-footer-next">
+                  {preparePhase === "error" && (
+                    <button type="button" className="btn btn-secondary" onClick={() => void runLocalPrepare(localWhisperSize)}>Try again</button>
+                  )}
+                  {preparePhase === "ready" && (
+                    <button type="button" className="btn btn-secondary" disabled={isFinishing} onClick={() => void finishSetup(false)}>Not now</button>
+                  )}
+                  <button type="button" className="btn btn-primary" disabled={preparePhase !== "ready" || isFinishing} onClick={() => void finishSetup(true)}>
+                    {isFinishing ? "Starting…" : "Start recording"}
+                  </button>
+                </div>
               </div>
             </div>
           )}

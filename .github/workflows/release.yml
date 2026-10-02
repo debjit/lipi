@@ -29,6 +29,19 @@ jobs:
         with:
           node-version: lts/*
 
+      - name: Read app version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
@@ -57,8 +70,132 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: v__VERSION__
-          releaseName: 'Lipi v__VERSION__'
-          releaseBody: 'See the assets to download Lipi for your platform.'
+          releaseName: ${{ steps.ver.outputs.prerelease == 'true' && format('Lipi v{0} (dev)', steps.ver.outputs.version) || format('Lipi v{0}', steps.ver.outputs.version) }}
+          releaseBody: ${{ steps.ver.outputs.prerelease == 'true' && 'Developer pre-release from the dev branch. Download the installer for your platform from the assets below. This build is not a stable release.' || 'Stable Lipi release. Download the installer for your platform from the assets below.' }}
           releaseDraft: true
-          prerelease: false
+          prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
           args: ${{ matrix.args }}
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: Classify release
+        id: channel
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "stable=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "stable=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish dev prerelease
+        if: steps.channel.outputs.stable != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release edit "${{ steps.channel.outputs.tag }}" \
+            --draft=false \
+            --prerelease \
+            --latest=false \
+            --title "Lipi v${{ steps.channel.outputs.version }} (dev)"
+
+      - name: Publish stable release
+        if: steps.channel.outputs.stable == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.channel.outputs.tag }}"
+          ASSETS="$RUNNER_TEMP/assets"
+          STABLE="$RUNNER_TEMP/stable"
+          mkdir -p "$ASSETS" "$STABLE"
+          gh release download "$TAG" --dir "$ASSETS" --clobber
+          copy_first() {
+            local dest="$1"
+            local pattern="$2"
+            local match
+            match=$(find "$ASSETS" -maxdepth 1 -type f -name "$pattern" ! -name '*.sig' | head -n 1 || true)
+            if [ -n "$match" ]; then
+              cp "$match" "$dest"
+            fi
+          }
+          copy_first "$STABLE/Lipi-windows-setup.exe" '*-setup.exe'
+          copy_first "$STABLE/Lipi-windows.msi" '*.msi'
+          copy_first "$STABLE/Lipi-linux.deb" '*.deb'
+          copy_first "$STABLE/Lipi-linux.AppImage" '*.AppImage'
+          if [ -n "$(ls -A "$STABLE")" ]; then
+            gh release upload "$TAG" "$STABLE"/* --clobber
+          fi
+          gh release edit "$TAG" \
+            --draft=false \
+            --prerelease=false \
+            --latest \
+            --title "Lipi v${{ steps.channel.outputs.version }}"
+
+      - name: Write release manifest
+        if: steps.channel.outputs.stable == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/releases?per_page=30" > "$RUNNER_TEMP/releases.json"
+          node scripts/write-release-meta.mjs "$RUNNER_TEMP/releases.json" "$RUNNER_TEMP/meta" "${{ steps.channel.outputs.tag }}"
+
+      - name: Push release-meta branch
+        if: steps.channel.outputs.stable == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${GH_TOKEN}"
+          META="$RUNNER_TEMP/release-meta-repo"
+          PUBLIC_REMOTE="https://github.com/${GITHUB_REPOSITORY}.git"
+          AUTH_REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads "$PUBLIC_REMOTE" release-meta >/dev/null 2>&1; then
+            git clone --branch release-meta --single-branch "$PUBLIC_REMOTE" "$META"
+          else
+            mkdir -p "$META"
+            git -C "$META" init -b release-meta
+          fi
+          cp "$RUNNER_TEMP/meta/latest.json" "$RUNNER_TEMP/meta/changelog.json" "$META/"
+          git -C "$META" add latest.json changelog.json
+          if git -C "$META" diff --cached --quiet; then
+            echo "Release manifest is unchanged."
+            exit 0
+          fi
+          git -C "$META" \
+            -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "Update release manifest for ${{ steps.channel.outputs.tag }}"
+          git -C "$META" push "$AUTH_REMOTE" HEAD:release-meta
+
+      - name: Notify site
+        if: steps.channel.outputs.stable == 'true'
+        env:
+          LIPI_SITE_DEPLOY_HOOK: ${{ secrets.LIPI_SITE_DEPLOY_HOOK }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LIPI_SITE_DEPLOY_HOOK}" ]; then
+            echo "LIPI_SITE_DEPLOY_HOOK is not set; skipping site deploy."
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary @"$RUNNER_TEMP/meta/latest.json" \
+            "$LIPI_SITE_DEPLOY_HOOK"

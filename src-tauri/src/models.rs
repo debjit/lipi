@@ -28,6 +28,19 @@ pub(crate) fn apply_no_window(cmd: &mut std::process::Command) {
     }
 }
 
+fn download_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent("lipi")
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))
+}
+
+fn remove_part(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
 fn is_windows_store_stub(path: &Path) -> bool {
     let s = path.to_string_lossy();
     s.contains(r"\WindowsApps\") || s.contains("/WindowsApps/")
@@ -194,7 +207,7 @@ pub fn find_whisper_binary(app_data_dir: &Path) -> Option<PathBuf> {
     }
 
     // Check system PATH
-    for name in &["whisper-cli", "whisper-cli.exe", "whisper", "main", "main.exe"] {
+    for name in &["whisper-cli", "whisper-cli.exe"] {
         if let Ok(path) = which::which(name) {
             return Some(path);
         }
@@ -441,7 +454,7 @@ pub async fn ensure_whisper_cli_binary(app_data_dir: &Path) -> Result<PathBuf, S
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         let tar_url = "https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-ubuntu-x64.tar.gz";
-        let client = reqwest::Client::new();
+        let client = download_client()?;
         let resp = client
             .get(tar_url)
             .header("User-Agent", "lipi")
@@ -492,7 +505,7 @@ pub async fn ensure_whisper_cli_binary(app_data_dir: &Path) -> Result<PathBuf, S
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
         let zip_url = "https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-x64.zip";
-        let client = reqwest::Client::new();
+        let client = download_client()?;
         let resp = client
             .get(zip_url)
             .header("User-Agent", "lipi")
@@ -585,7 +598,7 @@ pub async fn ensure_whisper_vulkan_backend(app_data_dir: &Path) -> Result<PathBu
         all(target_os = "linux", target_arch = "x86_64")
     ))]
     {
-        let client = reqwest::Client::new();
+        let client = download_client()?;
         let resp = client
             .get(archive_url)
             .header("User-Agent", "lipi")
@@ -681,7 +694,7 @@ async fn download_faster_whisper_weights(
     let model_folder = models_dir.join(format!("faster-whisper-{}", size));
     fs::create_dir_all(&model_folder).map_err(|e| format!("Failed to create model folder: {}", e))?;
 
-    let client = reqwest::Client::new();
+    let client = download_client()?;
 
     // 1. Download smaller metadata files
     let meta_files = ["config.json", "tokenizer.json", "vocabulary.txt"];
@@ -742,10 +755,15 @@ async fn download_faster_whisper_weights(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| format!("Failed reading chunk: {}", e))?
+        .map_err(|e| {
+            remove_part(&temp_bin);
+            format!("Failed reading chunk: {}", e)
+        })?
     {
-        file.write_all(&chunk)
-            .map_err(|e| format!("Failed writing chunk: {}", e))?;
+        file.write_all(&chunk).map_err(|e| {
+            remove_part(&temp_bin);
+            format!("Failed writing chunk: {}", e)
+        })?;
         downloaded += chunk.len() as u64;
 
         let percent = if total_size > 0 {
@@ -827,7 +845,7 @@ pub async fn download_model_weights(
     let target_path = models_dir.join(&filename);
     let temp_path = models_dir.join(format!("{}.part", filename));
 
-    let client = reqwest::Client::new();
+    let client = download_client()?;
     let mut response = client
         .get(url)
         .header("User-Agent", "lipi")
@@ -850,10 +868,15 @@ pub async fn download_model_weights(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| format!("Failed reading chunk: {}", e))?
+        .map_err(|e| {
+            remove_part(&temp_path);
+            format!("Failed reading chunk: {}", e)
+        })?
     {
-        file.write_all(&chunk)
-            .map_err(|e| format!("Failed writing chunk: {}", e))?;
+        file.write_all(&chunk).map_err(|e| {
+            remove_part(&temp_path);
+            format!("Failed writing chunk: {}", e)
+        })?;
         downloaded += chunk.len() as u64;
 
         let percent = if total_size > 0 {
@@ -934,6 +957,84 @@ pub fn delete_model(
         fs::remove_dir_all(&target_path).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+pub fn vad_model_path(app_data_dir: &Path, custom_dir: Option<&str>) -> PathBuf {
+    resolve_models_dir(app_data_dir, custom_dir).join("silero_vad.onnx")
+}
+
+pub fn vad_installed(app_data_dir: &Path, custom_dir: Option<&str>) -> bool {
+    fs::metadata(vad_model_path(app_data_dir, custom_dir))
+        .map(|m| m.len() > 1000)
+        .unwrap_or(false)
+}
+
+pub async fn download_vad_model(
+    app_handle: &tauri::AppHandle,
+    app_data_dir: &Path,
+    custom_dir: Option<&str>,
+) -> Result<String, String> {
+    let models_dir = resolve_models_dir(app_data_dir, custom_dir);
+    fs::create_dir_all(&models_dir).map_err(|e| format!("Failed to create models dir: {}", e))?;
+    let target_path = models_dir.join("silero_vad.onnx");
+    if vad_installed(app_data_dir, custom_dir) {
+        return Ok(target_path.to_string_lossy().to_string());
+    }
+
+    let url = "https://github.com/snakers4/silero-vad/raw/v5.1.2/src/silero_vad/data/silero_vad.onnx";
+    let temp_path = models_dir.join("silero_vad.onnx.part");
+    let client = download_client()?;
+    let mut response = client
+        .get(url)
+        .header("User-Agent", "lipi")
+        .send()
+        .await
+        .map_err(|e| format!("VAD download failed: {}", e))?;
+    if !response.status().is_success() {
+        return Err(format!("VAD download failed with status: {}", response.status()));
+    }
+
+    let total_size = response.content_length().unwrap_or(0);
+    let mut file = File::create(&temp_path).map_err(|e| format!("Failed to create VAD file: {}", e))?;
+    let mut downloaded: u64 = 0;
+    let mut last_emit_percent: i64 = -1;
+    let start_time = std::time::Instant::now();
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        remove_part(&temp_path);
+        format!("Failed reading VAD chunk: {}", e)
+    })? {
+        file.write_all(&chunk).map_err(|e| {
+            remove_part(&temp_path);
+            format!("Failed writing VAD chunk: {}", e)
+        })?;
+        downloaded += chunk.len() as u64;
+        let percent = if total_size > 0 { (downloaded as f64 / total_size as f64 * 100.0) as i64 } else { 0 };
+        if percent != last_emit_percent {
+            last_emit_percent = percent;
+            let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+            let speed = downloaded as f64 / elapsed;
+            let eta = if total_size > downloaded { (total_size - downloaded) as f64 / speed } else { 0.0 };
+            let _ = app_handle.emit(
+                "model-download-progress",
+                serde_json::json!({
+                    "engine": "vad",
+                    "model_size": "silero",
+                    "downloaded": downloaded,
+                    "total": total_size,
+                    "percentage": percent,
+                    "speed_bps": speed,
+                    "eta_secs": eta
+                }),
+            );
+        }
+    }
+    file.flush().map_err(|e| e.to_string())?;
+    drop(file);
+    if target_path.exists() {
+        let _ = fs::remove_file(&target_path);
+    }
+    fs::rename(&temp_path, &target_path).map_err(|e| format!("Failed to save VAD model: {}", e))?;
+    Ok(target_path.to_string_lossy().to_string())
 }
 
 pub fn delete_whisper_binary(app_data_dir: &Path) -> Result<(), String> {

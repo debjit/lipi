@@ -210,19 +210,37 @@ pub fn load_presets(app_data_dir: &Path) -> Vec<PromptPreset> {
 pub fn save_preset_file(app_data_dir: &Path, preset: &PromptPreset) -> Result<(), String> {
     let _ = ensure_presets_dir(app_data_dir);
     let dir = presets_dir(app_data_dir);
-    let safe_id = preset.id.trim().replace(['/', '\\', ' '], "_");
-    let file_path = dir.join(format!("{}.md", safe_id));
+    let file_path = dir.join(format!("{}.md", sanitize_preset_filename(&preset.id)));
     fs::write(&file_path, serialize_preset(preset)).map_err(|e| e.to_string())
 }
 
 pub fn delete_preset_file(app_data_dir: &Path, id: &str) -> Result<(), String> {
     let dir = presets_dir(app_data_dir);
-    let safe_id = id.trim().replace(['/', '\\', ' '], "_");
-    let file_path = dir.join(format!("{}.md", safe_id));
+    let file_path = dir.join(format!("{}.md", sanitize_preset_filename(id)));
     if file_path.exists() {
         fs::remove_file(&file_path).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+fn sanitize_preset_filename(id: &str) -> String {
+    let s: String = id
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = s.trim_matches('_');
+    if trimmed.is_empty() {
+        "preset".into()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 pub fn restore_default_presets(app_data_dir: &Path) -> Result<Vec<PromptPreset>, String> {
@@ -310,5 +328,12 @@ Line two of prompt."#;
         assert!(!presets_after.iter().any(|p| p.id == "1"));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sanitize_preset_filename() {
+        assert_eq!(sanitize_preset_filename("grammar_fix"), "grammar_fix");
+        assert_eq!(sanitize_preset_filename("a:b*c?d\"e<f>g|h"), "a_b_c_d_e_f_g_h");
+        assert_eq!(sanitize_preset_filename(":::"), "preset");
     }
 }

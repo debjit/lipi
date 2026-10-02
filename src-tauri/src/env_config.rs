@@ -3,6 +3,31 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+/// Speech endpoint used for a recording. Providers tab and ASR settings are stored apart;
+/// prefer the selected provider, then a URL match, then the provider the user just tested.
+pub fn resolve_asr_endpoint(settings: &crate::db::AppSettings, llm: &LlmSettings) -> (String, String) {
+    let by_id = settings
+        .provider_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .and_then(|id| llm.providers.iter().find(|p| p.id == id));
+    let stored = settings.api_base_url.trim().trim_end_matches('/');
+    let by_url = if stored.is_empty() {
+        None
+    } else {
+        llm.providers.iter().find(|p| {
+            let base = p.base_url.trim().trim_end_matches('/');
+            base == stored || p.resolved_base_url() == stored
+        })
+    };
+    let by_active = llm.providers.iter().find(|p| p.id == llm.active_provider_id);
+    if let Some(p) = by_id.or(by_url).or(by_active) {
+        (p.resolved_base_url(), p.api_key.clone())
+    } else {
+        (settings.api_base_url.clone(), settings.api_key.clone())
+    }
+}
+
 pub fn sanitize_id(id: &str) -> String {
     let s: String = id
         .trim()
@@ -62,7 +87,25 @@ pub fn escape_env_val(s: &str) -> String {
 }
 
 pub fn unescape_env_val(s: &str) -> String {
-    s.replace("\\n", "\n").replace("\\\"", "\"").replace("\\\\", "\\")
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn default_request_timeout_secs() -> u32 {
@@ -457,6 +500,31 @@ mod tests {
         assert!(!env_content_removed.contains("CUSTOM_OLLAMA"));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_asr_prefers_tested_cloudflare_over_openai_default() {
+        let mut settings = crate::db::AppSettings::default();
+        settings.engine_mode = "cloud".into();
+        settings.api_base_url = "https://api.openai.com/v1".into();
+        settings.api_key = "sk-wrong".into();
+        settings.provider_id = None;
+
+        let mut llm = LlmSettings::default();
+        llm.active_provider_id = "CLOUDFLARE_DEFAULT".into();
+        llm.providers[0].api_key = "cf-token".into();
+        llm.providers[0].base_url = "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1".into();
+
+        let (url, key) = resolve_asr_endpoint(&settings, &llm);
+        assert_eq!(url, "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1");
+        assert_eq!(key, "cf-token");
+    }
+
+    #[test]
+    fn test_unescape_windows_path() {
+        assert_eq!(unescape_env_val(r"C:\\new\\models"), r"C:\new\models");
+        assert_eq!(unescape_env_val(r"line1\nline2"), "line1\nline2");
+        assert_eq!(unescape_env_val(r#"say \"hi\""#), r#"say "hi""#);
     }
 
     #[test]

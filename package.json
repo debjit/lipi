@@ -1,14 +1,25 @@
 {
   "name": "lipi",
   "private": true,
-  "version": "0.1.4",
+  "version": "0.1.5-4",
+  "description": "Local-first voice dictation and notes",
+  "author": "Debjit Biswas <debjit012@gmail.com>",
   "license": "AGPL-3.0-only",
+  "homepage": "https://lipi.debjit.in",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/debjit/lipi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/debjit/lipi/issues"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

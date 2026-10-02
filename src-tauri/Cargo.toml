@@ -1,9 +1,14 @@
 [package]
 name = "lipi"
-version = "0.1.4"
+version = "0.1.5-4"
 description = "Lipi - Local voice transcription and notes"
 authors = ["Debjit Biswas <debjit012@gmail.com>"]
 license = "AGPL-3.0-only"
+homepage = "https://lipi.debjit.in"
+repository = "https://github.com/debjit/lipi"
+readme = "../README.md"
+keywords = ["dictation", "speech-to-text", "whisper", "tauri"]
+categories = ["gui", "multimedia::audio"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -31,13 +36,17 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 rusqlite = { version = "0.33", features = ["bundled"] }
 arboard = "3"
 enigo = "0.2"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "ndarray"] }
+ndarray = "0.16"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
+gio = "0.18"
+glib = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 rfd = "0.15"
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading", "Win32_Graphics_Dwm"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

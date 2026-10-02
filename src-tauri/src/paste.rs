@@ -1,10 +1,49 @@
+use std::sync::mpsc;
+use std::thread;
+
 #[cfg(target_os = "windows")]
 use std::time::Duration;
+
+pub struct ClipboardService {
+    tx: mpsc::Sender<(String, mpsc::Sender<Result<(), String>>)>,
+}
+
+impl ClipboardService {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<(String, mpsc::Sender<Result<(), String>>)>();
+        thread::spawn(move || {
+            let mut clipboard = arboard::Clipboard::new().ok();
+            while let Ok((text, done)) = rx.recv() {
+                if clipboard.is_none() {
+                    clipboard = arboard::Clipboard::new().ok();
+                }
+                let res = match clipboard.as_mut() {
+                    Some(cb) => cb.set_text(&text).map_err(|e| e.to_string()),
+                    None => Err("Clipboard unavailable".into()),
+                };
+                let _ = done.send(res);
+            }
+        });
+        Self { tx }
+    }
+
+    pub fn set_text(&self, text: &str) -> Result<(), String> {
+        let (done_tx, done_rx) = mpsc::channel();
+        self.tx
+            .send((text.to_string(), done_tx))
+            .map_err(|e| format!("Clipboard thread closed: {e}"))?;
+        done_rx
+            .recv()
+            .map_err(|e| format!("Clipboard thread stalled: {e}"))?
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct PasteTarget {
     #[cfg(target_os = "linux")]
     pub x11_window: Option<u32>,
+    #[cfg(target_os = "linux")]
+    pub wayland_inject: bool,
     #[cfg(target_os = "windows")]
     pub hwnd: Option<isize>,
 }
@@ -12,8 +51,10 @@ pub struct PasteTarget {
 impl PasteTarget {
     pub fn has_target(&self) -> bool {
         #[cfg(target_os = "linux")]
-        if self.x11_window.is_some() {
-            return true;
+        {
+            if self.wayland_inject || self.x11_window.is_some() {
+                return true;
+            }
         }
         #[cfg(target_os = "windows")]
         if self.hwnd.is_some() {
@@ -23,24 +64,40 @@ impl PasteTarget {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn is_wayland_session() -> bool {
+    std::env::var("XDG_SESSION_TYPE")
+        .map(|s| s.eq_ignore_ascii_case("wayland"))
+        .unwrap_or(false)
+        || std::env::var("WAYLAND_DISPLAY").map(|s| !s.is_empty()).unwrap_or(false)
+}
+
 /// Snapshot the currently focused window.
 /// If Lipi's main window is active (allow_fallback = false), returns no target so dictation stays in Lipi editor.
 /// If Lipi is in mini floating widget mode (allow_fallback = true), falls back to the window right underneath.
-pub fn capture_paste_target(allow_fallback: bool) -> PasteTarget {
+pub fn capture_paste_target(allow_fallback: bool, lipi_focused: bool) -> PasteTarget {
     let mut target = PasteTarget::default();
 
     #[cfg(target_os = "linux")]
     {
-        if let Ok(win) = capture_x11_target(allow_fallback) {
+        if is_wayland_session() {
+            target.wayland_inject = allow_fallback || !lipi_focused;
+        } else if let Ok(win) = capture_x11_target(allow_fallback) {
             target.x11_window = Some(win);
         }
     }
 
     #[cfg(target_os = "windows")]
     {
+        let _ = lipi_focused;
         if let Some(hwnd) = capture_windows_target(allow_fallback) {
             target.hwnd = Some(hwnd);
         }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (allow_fallback, lipi_focused);
     }
 
     target
@@ -150,8 +207,35 @@ fn capture_windows_target(allow_fallback: bool) -> Option<isize> {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindow, GetWindowThreadProcessId, GW_HWNDNEXT,
+        GetAncestor, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
+        IsWindowVisible, GA_ROOTOWNER, GWL_EXSTYLE, GW_HWNDNEXT, WS_EX_TOOLWINDOW,
     };
+
+    unsafe fn is_pasteable(hwnd: HWND) -> bool {
+        if hwnd.is_null() || IsWindowVisible(hwnd) == 0 {
+            return false;
+        }
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        if ex & WS_EX_TOOLWINDOW != 0 {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Graphics::Dwm::DwmGetWindowAttribute;
+            const DWMWA_CLOAKED: u32 = 14;
+            let mut cloaked: u32 = 0;
+            let _ = DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                &mut cloaked as *mut u32 as *mut _,
+                std::mem::size_of::<u32>() as u32,
+            );
+            if cloaked != 0 {
+                return false;
+            }
+        }
+        true
+    }
 
     unsafe {
         let current_pid = GetCurrentProcessId();
@@ -159,10 +243,14 @@ fn capture_windows_target(allow_fallback: bool) -> Option<isize> {
         if foreground.is_null() {
             return None;
         }
+        foreground = GetAncestor(foreground, GA_ROOTOWNER);
+        if foreground.is_null() {
+            foreground = GetForegroundWindow();
+        }
 
         let mut pid = 0u32;
         GetWindowThreadProcessId(foreground, &mut pid);
-        if pid != current_pid {
+        if pid != current_pid && is_pasteable(foreground) {
             return Some(foreground as isize);
         }
 
@@ -170,13 +258,14 @@ fn capture_windows_target(allow_fallback: bool) -> Option<isize> {
             return None;
         }
 
-        // Mini mode: search window underneath
         foreground = GetWindow(foreground, GW_HWNDNEXT);
         while !foreground.is_null() {
+            let top = GetAncestor(foreground, GA_ROOTOWNER);
+            let candidate = if top.is_null() { foreground } else { top };
             let mut next_pid = 0u32;
-            GetWindowThreadProcessId(foreground, &mut next_pid);
-            if next_pid != current_pid {
-                return Some(foreground as isize);
+            GetWindowThreadProcessId(candidate, &mut next_pid);
+            if next_pid != current_pid && is_pasteable(candidate) {
+                return Some(candidate as isize);
             }
             foreground = GetWindow(foreground, GW_HWNDNEXT);
         }
@@ -185,46 +274,55 @@ fn capture_windows_target(allow_fallback: bool) -> Option<isize> {
 }
 
 /// Restore the captured target window, wait briefly, and simulate Ctrl+V.
-pub fn paste_into_previous_app(target: Option<PasteTarget>, text: &str) -> Result<(), String> {
-    // Step 1: Always copy to system clipboard first
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("Clipboard error: {}", e))?;
-    clipboard
-        .set_text(text.to_string())
-        .map_err(|e| format!("Clipboard write error: {}", e))?;
+pub fn paste_into_previous_app(
+    clipboard: &ClipboardService,
+    target: Option<PasteTarget>,
+    text: &str,
+) -> Result<(), String> {
+    clipboard.set_text(text)?;
 
-    // Step 2 & 3 & 4: Restore target window and simulate Ctrl+V
     #[cfg(target_os = "linux")]
     {
         let win_opt = target.as_ref().and_then(|t| t.x11_window);
+        let wayland_inject = target.as_ref().map(|t| t.wayland_inject).unwrap_or(false);
         if let Some(win) = win_opt {
             let _ = xdo_linux::activate_x11(win);
         }
 
-        // Driver / daemon level simulation if installed
         if is_command_available("ydotool") {
-            let _ = std::process::Command::new("ydotool")
+            if let Ok(status) = std::process::Command::new("ydotool")
                 .args(["key", "29:1", "47:1", "47:0", "29:0"])
-                .status();
-            return Ok(());
+                .status()
+            {
+                if status.success() {
+                    return Ok(());
+                }
+            }
         }
-        if is_command_available("wtype") {
-            let _ = std::process::Command::new("wtype")
+        if is_wayland_session() && is_command_available("wtype") {
+            if let Ok(status) = std::process::Command::new("wtype")
                 .args(["-M", "ctrl", "v", "-m", "ctrl"])
-                .status();
-            return Ok(());
+                .status()
+            {
+                if status.success() {
+                    return Ok(());
+                }
+            }
         }
 
-        // Standard simulation (X11 / Xwayland via libxdo with portal approval on GNOME Wayland)
         if let Some(win) = win_opt {
             return xdo_linux::paste_x11(win);
         }
 
+        if wayland_inject {
+            return Err("Could not inject Ctrl+V on Wayland. Install ydotool (with ydotoold) or wtype, or copy then paste manually.".into());
+        }
         return Err("No target window found".into());
     }
 
     #[cfg(target_os = "windows")]
     {
-        restore_windows_window(target.as_ref().and_then(|t| t.hwnd))?;
+        restore_windows_window(target.as_ref().and_then(|t| t.hwnd));
         std::thread::sleep(Duration::from_millis(150));
         send_windows_ctrl_v()?;
         Ok(())
@@ -312,19 +410,20 @@ mod xdo_linux {
 }
 
 #[cfg(target_os = "windows")]
-fn restore_windows_window(hwnd: Option<isize>) -> Result<(), String> {
+fn restore_windows_window(hwnd: Option<isize>) {
     use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
 
-    if let Some(h) = hwnd {
-        unsafe {
-            let success = SetForegroundWindow(h as HWND);
-            if success != 0 {
-                return Ok(());
-            }
+    let Some(h) = hwnd else {
+        return;
+    };
+    unsafe {
+        let current = GetForegroundWindow();
+        if current as isize == h {
+            return;
         }
+        let _ = SetForegroundWindow(h as HWND);
     }
-    Err("Failed to restore target window".into())
 }
 
 #[cfg(target_os = "windows")]
@@ -335,7 +434,7 @@ fn send_windows_ctrl_v() -> Result<(), String> {
         .key(Key::Control, Direction::Press)
         .map_err(|e| format!("Key press error: {:?}", e))?;
     enigo
-        .key(Key::Unicode('v'), Direction::Click)
+        .key(Key::Other(0x56), Direction::Click)
         .map_err(|e| format!("Key click error: {:?}", e))?;
     enigo
         .key(Key::Control, Direction::Release)
@@ -358,8 +457,8 @@ mod tests {
 
     #[test]
     fn test_capture_paste_target() {
-        let _ = capture_paste_target(false);
-        let _ = capture_paste_target(true);
+        let _ = capture_paste_target(false, true);
+        let _ = capture_paste_target(true, false);
     }
 }
 
