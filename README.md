@@ -19,7 +19,8 @@ Press **`Alt + R`** in any app, speak, and press it again. Lipi transcribes your
   <a href="#quick-start">Quick start</a> ·
   <a href="#configuration">Configuration</a> ·
   <a href="#faq">FAQ</a> ·
-  <a href="#building-from-source">Build from source</a>
+  <a href="#building-from-source">Build from source</a> ·
+  <a href="RELEASE.md"><b>Releasing</b></a>
 </p>
 
 ---
@@ -218,11 +219,7 @@ lipi/
 
 ## Releasing
 
-`npm run release -- patch` bumps the version, commits, tags `vX.Y.Z`, and pushes. `minor`, `major`, or an explicit version such as `0.2.0` work the same way. `patch`, `minor`, and `major` always produce a stable version. From `0.1.5-2`, `patch` becomes `0.1.6`.
-
-A version with a hyphen, such as `npm run release -- 0.1.5-3`, is a dev prerelease. It is published on GitHub Releases and does not update the website or the in-app update notice.
-
-A version without a hyphen is stable. After the Windows and Linux builds both finish, CI publishes the release, copies the installers to stable filenames, writes `latest.json` and `changelog.json` on the `release-meta` branch, and POSTs that manifest to the `LIPI_SITE_DEPLOY_HOOK` repository secret so the site can redeploy. If the secret is unset, the release still publishes.
+`npm run release -- patch` bumps the version, commits, tags `vX.Y.Z`, and pushes. A version with a hyphen is a dev prerelease. A version without one is stable and updates the site. The full flow is in [RELEASE.md](RELEASE.md).
 
 ## License
 
