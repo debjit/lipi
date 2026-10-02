@@ -5,4 +5,5 @@ Codename: stable
 Architectures: amd64
 Components: main
 Description: Lipi voice dictation for Debian and Ubuntu
+DebOverride: override
 SignWith: SIGNING_KEY
