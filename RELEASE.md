@@ -30,6 +30,7 @@ A version with a hyphen is a dev prerelease. `0.1.5-2` is dev. `0.2.0` is stable
 | Installers | Versioned Tauri filenames only | Versioned files, plus stable names below |
 | `release-meta` | Unchanged | `latest.json` and `changelog.json` updated |
 | Site webhook | Not called | POST of `latest.json` |
+| Apt repository | Unchanged | Signed archive on GitHub Pages updated |
 | In-app notice | Does not notify | Notifies installed copies of an older version |
 
 CI builds Windows and Linux, uploads the installers to a draft, and publishes that draft only after both builds succeed. If either build fails, the draft stays unpublished.
@@ -79,6 +80,34 @@ Download URLs come from the assets GitHub actually uploaded. A missing installer
 After `release-meta` is updated, CI POSTs `latest.json` to the GitHub Actions secret `LIPI_SITE_DEPLOY_HOOK`. Point that secret at the site host's deploy hook. The other site can use the JSON body for its download buttons and then redeploy.
 
 `GITHUB_TOKEN` cannot start a workflow in another repository, so the hook URL is the credential. Dev releases do not call it. If the secret is empty, CI logs that and the release still publishes.
+
+## Apt repository
+
+A published stable release starts [`.github/workflows/apt-repo.yml`](.github/workflows/apt-repo.yml). That workflow collects every stable `lipi_*_amd64.deb` (not the renamed `Lipi-linux.deb` copy), signs them with `reprepro`, and deploys the archive to GitHub Pages at `https://debjit.github.io/lipi`. Debian 12 and Ubuntu 22.04 or newer can then `sudo apt install lipi`. Dev prereleases are left out.
+
+Do this once before the first stable publish:
+
+1. Create a signing key with an empty passphrase. The private key stays out of git.
+
+   ```bash
+   gpg --batch --gen-key <<'EOF'
+   %no-protection
+   Key-Type: RSA
+   Key-Length: 4096
+   Name-Real: Lipi apt archive
+   Name-Email: lipi@debjit.in
+   Expire-Date: 0
+   %commit
+   EOF
+   gpg --armor --export-secret-keys "lipi@debjit.in"
+   ```
+
+   `%no-protection` is required. A key that asks for a passphrase cannot sign from GitHub Actions.
+
+2. In the GitHub repo, add the armored private key as the Actions secret `APT_SIGNING_KEY` (Settings, Secrets and variables, Actions).
+3. Set Settings, Pages, Source to GitHub Actions. Leave the site on `https://debjit.github.io/lipi`. The website at lipi.debjit.in is a different repository, and a custom domain on this repo would change the apt URL.
+
+After that, publishing a stable release updates the archive. If a stable release already exists and you add the secret later, run the **Apt repository** workflow by hand from the Actions tab. `sudo apt install lipi` works only after that job succeeds and Pages is serving the archive.
 
 ## Update notice in the app
 

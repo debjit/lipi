@@ -1,0 +1,8 @@
+Origin: Lipi
+Label: Lipi
+Suite: stable
+Codename: stable
+Architectures: amd64
+Components: main
+Description: Lipi voice dictation for Debian and Ubuntu
+SignWith: SIGNING_KEY

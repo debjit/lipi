@@ -1,0 +1,100 @@
+name: Apt repository
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install reprepro
+        run: sudo apt-get update && sudo apt-get install -y reprepro
+
+      - name: Import signing key
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APT_SIGNING_KEY}" ]; then
+            echo "Add the armored private key as the APT_SIGNING_KEY Actions secret."
+            exit 1
+          fi
+          install -d -m 700 "$HOME/.gnupg"
+          printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --import
+          KEYID=$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^fpr:/ { print $10; exit }')
+          if [ -z "$KEYID" ]; then
+            echo "The imported key has no secret fingerprint."
+            exit 1
+          fi
+          echo "Signing with ${KEYID}"
+
+      - name: Download stable debs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          INCOMING="$RUNNER_TEMP/debs"
+          mkdir -p "$INCOMING"
+          mapfile -t TAGS < <(gh release list --limit 200 --exclude-drafts --exclude-pre-releases --json tagName --jq '.[].tagName')
+          for tag in "${TAGS[@]}"; do
+            dest="$INCOMING/$tag"
+            mkdir -p "$dest"
+            if ! gh release download "$tag" --pattern 'lipi_*_amd64.deb' --dir "$dest"; then
+              echo "No lipi_*_amd64.deb on ${tag}; skipping."
+              rm -rf "$dest"
+            fi
+          done
+          mapfile -t DEBS < <(find "$INCOMING" -type f -name 'lipi_*_amd64.deb' | sort)
+          if [ "${#DEBS[@]}" -eq 0 ]; then
+            echo "No stable amd64 debs found. Publish a stable release first."
+            exit 1
+          fi
+          printf '%s\n' "${DEBS[@]}" > "$RUNNER_TEMP/deb-list"
+          printf 'Including:\n'
+          printf '  %s\n' "${DEBS[@]}"
+
+      - name: Build signed archive
+        run: |
+          set -euo pipefail
+          KEYID=$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^fpr:/ { print $10; exit }')
+          ROOT="$RUNNER_TEMP/apt"
+          mkdir -p "$ROOT"
+          cp -a apt/conf "$ROOT/conf"
+          sed -i "s/SIGNING_KEY/${KEYID}/" "$ROOT/conf/distributions"
+          mapfile -t DEBS < "$RUNNER_TEMP/deb-list"
+          reprepro -b "$ROOT" includedeb stable "${DEBS[@]}"
+          gpg --batch --export --output "$ROOT/lipi-archive-keyring.gpg" "$KEYID"
+          touch "$ROOT/.nojekyll"
+          rm -rf "$ROOT/conf" "$ROOT/db"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/apt
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

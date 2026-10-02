@@ -41,9 +41,26 @@ Stable installers, after the first stable release:
 | Platform | Download |
 | :--- | :--- |
 | Windows | [Setup](https://github.com/debjit/lipi/releases/latest/download/Lipi-windows-setup.exe), [MSI](https://github.com/debjit/lipi/releases/latest/download/Lipi-windows.msi) |
-| Linux (x86_64) | [deb](https://github.com/debjit/lipi/releases/latest/download/Lipi-linux.deb), [AppImage](https://github.com/debjit/lipi/releases/latest/download/Lipi-linux.AppImage) |
+| Linux (x86_64) | [deb](https://github.com/debjit/lipi/releases/latest/download/Lipi-linux.deb), [AppImage](https://github.com/debjit/lipi/releases/latest/download/Lipi-linux.AppImage), or `sudo apt install lipi` |
 
-Dev builds stay on the **[GitHub Releases](https://github.com/debjit/lipi/releases)** page and are not linked as the latest download. The site at [lipi.debjit.in](https://lipi.debjit.in) reads [`latest.json`](https://raw.githubusercontent.com/debjit/lipi/release-meta/latest.json) on the `release-meta` branch.
+On Debian 12 and Ubuntu 22.04 or newer (x86_64), add the archive once, then install and upgrade with apt:
+
+```bash
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://debjit.github.io/lipi/lipi-archive-keyring.gpg | sudo tee /etc/apt/keyrings/lipi.gpg >/dev/null
+sudo tee /etc/apt/sources.list.d/lipi.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://debjit.github.io/lipi
+Suites: stable
+Components: main
+Signed-By: /etc/apt/keyrings/lipi.gpg
+Architectures: amd64
+EOF
+sudo apt update
+sudo apt install lipi
+```
+
+Later versions are `sudo apt update && sudo apt upgrade`. The archive lists stable releases only. Dev builds stay on the **[GitHub Releases](https://github.com/debjit/lipi/releases)** page and are not linked as the latest download. The site at [lipi.debjit.in](https://lipi.debjit.in) reads [`latest.json`](https://raw.githubusercontent.com/debjit/lipi/release-meta/latest.json) on the `release-meta` branch.
 
 ## Quick start
 
