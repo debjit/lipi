@@ -1,0 +1,13 @@
+{
+  "version": "0.1.6",
+  "tag": "v0.1.6",
+  "prerelease": false,
+  "published_at": "2026-10-02T17:27:51Z",
+  "notes": "Stable Lipi release. Download the installer for your platform from the assets below.",
+  "downloads": {
+    "windows_setup": "https://github.com/debjit/lipi/releases/download/v0.1.6/Lipi-windows-setup.exe",
+    "windows_msi": "https://github.com/debjit/lipi/releases/download/v0.1.6/Lipi-windows.msi",
+    "linux_deb": "https://github.com/debjit/lipi/releases/download/v0.1.6/Lipi-linux.deb",
+    "linux_appimage": "https://github.com/debjit/lipi/releases/download/v0.1.6/Lipi-linux.AppImage"
+  }
+}
