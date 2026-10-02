@@ -44,7 +44,9 @@
     ],
     "linux": {
       "deb": {
-        "depends": ["libxdo3"]
+        "depends": ["libxdo3"],
+        "section": "utils",
+        "priority": "optional"
       },
       "rpm": {
         "depends": ["libXdo"]
