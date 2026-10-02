@@ -28,6 +28,13 @@
     "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "Debjit Biswas",
+    "homepage": "https://lipi.debjit.in",
+    "copyright": "Copyright © 2026 Debjit Biswas",
+    "category": "Productivity",
+    "shortDescription": "Local voice dictation and notes",
+    "longDescription": "Lipi is a local-first voice dictation app. Press Alt+R, speak, and paste the transcript into any window.",
+    "licenseFile": "../LICENSE",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

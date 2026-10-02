@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 import { SetupWizard } from "./SetupWizard";
 
@@ -221,6 +222,33 @@ interface LogEntry {
 
 const COMPACT_SIDEBAR_WIDTH = 800;
 
+interface UpdateNotice {
+  latest: string;
+  notes: string;
+  download_url: string;
+}
+
+function UpdateNoticePill({
+  notice,
+  onOpen,
+  onDismiss,
+}: {
+  notice: UpdateNotice;
+  onOpen: () => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <span className="update-pill">
+      <button type="button" className="update-pill-open" onClick={onOpen} title={`Lipi v${notice.latest} is available`}>
+        Update v{notice.latest}
+      </button>
+      <button type="button" className="update-pill-dismiss" onClick={onDismiss} title="Dismiss update notice">
+        ×
+      </button>
+    </span>
+  );
+}
+
 export default function App() {
   const [notes, setNotes] = useState<Note[]>([]);
   const [activeNoteId, setActiveNoteId] = useState<number | null>(null);
@@ -236,6 +264,7 @@ export default function App() {
   const [activeView, setActiveView] = useState<"notes" | "settings">("notes");
   const [miniMode, setMiniMode] = useState(false);
   const [appVersion, setAppVersion] = useState("");
+  const [updateNotice, setUpdateNotice] = useState<UpdateNotice | null>(null);
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [memoryStatus, setMemoryStatus] = useState<ModelMemoryStatus | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
@@ -555,6 +584,15 @@ export default function App() {
     loadLlmSettings();
     loadCfUsage();
     getVersion().then(setAppVersion).catch(() => {});
+    let cancelled = false;
+    invoke<UpdateNotice | null>("check_for_update")
+      .then((notice) => {
+        if (!cancelled && notice?.download_url) setUpdateNotice(notice);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -1415,6 +1453,15 @@ export default function App() {
     setTimeout(() => setCopiedNotification(null), 2500);
   }
 
+  async function openUpdateDownload() {
+    if (!updateNotice?.download_url) return;
+    try {
+      await openUrl(updateNotice.download_url);
+    } catch (err) {
+      showToast(`Could not open the download: ${err}`);
+    }
+  }
+
   useEffect(() => {
     const unlistenChunk = listenForever<{ seq: number; text: string }>("transcript_chunk", (event) => {
       if (!liveActiveRef.current) return;
@@ -2218,6 +2265,13 @@ export default function App() {
                 )
               )}
               {appVersion && <span className="app-version">v{appVersion}</span>}
+              {updateNotice && (
+                <UpdateNoticePill
+                  notice={updateNotice}
+                  onOpen={openUpdateDownload}
+                  onDismiss={() => setUpdateNotice(null)}
+                />
+              )}
             </div>
           </aside>
 
@@ -4189,6 +4243,13 @@ export default function App() {
               </button>
               <span className="brand-name">Lipi</span>
               {appVersion && <span className="app-version">v{appVersion}</span>}
+              {updateNotice && (
+                <UpdateNoticePill
+                  notice={updateNotice}
+                  onOpen={openUpdateDownload}
+                  onDismiss={() => setUpdateNotice(null)}
+                />
+              )}
 
               {activityPhase === "recording" && (
                 <div className="badge-status badge-recording">

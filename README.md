@@ -13,12 +13,14 @@ Press **`Alt + R`** in any app, speak, and press it again. Lipi transcribes your
 </p>
 
 <p align="center">
+  <a href="https://lipi.debjit.in"><b>Website</b></a> ·
   <a href="https://github.com/debjit/lipi/releases"><b>Download</b></a> ·
   <a href="#features">Features</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#configuration">Configuration</a> ·
   <a href="#faq">FAQ</a> ·
-  <a href="#building-from-source">Build from source</a>
+  <a href="#building-from-source">Build from source</a> ·
+  <a href="RELEASE.md"><b>Releasing</b></a>
 </p>
 
 ---
@@ -34,12 +36,14 @@ Press **`Alt + R`** in any app, speak, and press it again. Lipi transcribes your
 
 ## Download
 
-Pre-release builds are available on the **[GitHub Releases](https://github.com/debjit/lipi/releases)** page.
+Stable installers, after the first stable release:
 
-| Platform | Formats |
+| Platform | Download |
 | :--- | :--- |
-| Windows | `.msi`, `setup.exe` (NSIS) |
-| Linux (x86_64) | `.deb`, `.AppImage` |
+| Windows | [Setup](https://github.com/debjit/lipi/releases/latest/download/Lipi-windows-setup.exe), [MSI](https://github.com/debjit/lipi/releases/latest/download/Lipi-windows.msi) |
+| Linux (x86_64) | [deb](https://github.com/debjit/lipi/releases/latest/download/Lipi-linux.deb), [AppImage](https://github.com/debjit/lipi/releases/latest/download/Lipi-linux.AppImage) |
+
+Dev builds stay on the **[GitHub Releases](https://github.com/debjit/lipi/releases)** page and are not linked as the latest download. The site at [lipi.debjit.in](https://lipi.debjit.in) reads [`latest.json`](https://raw.githubusercontent.com/debjit/lipi/release-meta/latest.json) on the `release-meta` branch.
 
 ## Quick start
 
@@ -212,6 +216,10 @@ lipi/
 │   └── tauri.conf.json
 └── package.json
 ```
+
+## Releasing
+
+`npm run release -- patch` bumps the version, commits, tags `vX.Y.Z`, and pushes. A version with a hyphen is a dev prerelease. A version without one is stable and updates the site. The full flow is in [RELEASE.md](RELEASE.md).
 
 ## License
 

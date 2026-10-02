@@ -4,6 +4,11 @@ version = "0.1.5-2"
 description = "Lipi - Local voice transcription and notes"
 authors = ["Debjit Biswas <debjit012@gmail.com>"]
 license = "AGPL-3.0-only"
+homepage = "https://lipi.debjit.in"
+repository = "https://github.com/debjit/lipi"
+readme = "../README.md"
+keywords = ["dictation", "speech-to-text", "whisper", "tauri"]
+categories = ["gui", "multimedia::audio"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
