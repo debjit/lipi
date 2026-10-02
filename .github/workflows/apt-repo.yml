@@ -77,7 +77,7 @@ jobs:
           cp -a apt/conf "$ROOT/conf"
           sed -i "s/SIGNING_KEY/${KEYID}/" "$ROOT/conf/distributions"
           mapfile -t DEBS < "$RUNNER_TEMP/deb-list"
-          reprepro -b "$ROOT" includedeb stable "${DEBS[@]}"
+          reprepro -b "$ROOT" -S utils -P optional includedeb stable "${DEBS[@]}"
           gpg --batch --export --output "$ROOT/lipi-archive-keyring.gpg" "$KEYID"
           touch "$ROOT/.nojekyll"
           rm -rf "$ROOT/conf" "$ROOT/db"
