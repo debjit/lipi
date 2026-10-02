@@ -463,6 +463,12 @@ export default function App() {
   const [revealAccountId, setRevealAccountId] = useState<boolean>(false);
   const [focusedAccountId, setFocusedAccountId] = useState<string | null>(null);
 
+  const speechReady =
+    settings.engine_mode === "cloud"
+      ? settings.api_key.trim().length > 0 && !settings.api_base_url.includes("<account_id>")
+      : !!(modelStatus?.installed && modelStatus.binary_available);
+  const showSetupBanner = settings.wizard_completed && !wizardOpen && modelStatus !== null && !speechReady;
+
   const currentAsrProvider = (llmSettings.providers || []).find((p) => p.id === (settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id)));
   const isCloudflareAsr = settings.engine_mode === "cloud" && (settings.api_base_url.includes("api.cloudflare.com") || currentAsrProvider?.provider_type === "cloudflare");
   const activeLlmProvider = (llmSettings.providers || []).find((p) => p.id === llmSettings.active_provider_id);
@@ -650,7 +656,7 @@ export default function App() {
     }
   }
 
-  async function handleDownloadModel() {
+  async function handleDownloadModel(): Promise<string | null> {
     setIsDownloading(true);
     setDownloadProgress(0);
     setErrorMsg(null);
@@ -671,8 +677,11 @@ export default function App() {
       });
       await refreshModelStatus();
       showToast("✓ Model weights ready!");
+      return null;
     } catch (err: any) {
-      setErrorMsg(String(err));
+      const message = String(err);
+      setErrorMsg(message);
+      return message;
     } finally {
       setIsDownloading(false);
     }
@@ -1371,27 +1380,25 @@ export default function App() {
   ) {
     await updateAndSaveSettings(settingsPatch);
     if (llmPatch) {
-      if (llmPatch.provider) {
-        const existing = llmSettingsRef.current.providers || [];
-        const provIdx = existing.findIndex((p) => p.id === llmPatch.provider.id);
-        const updatedProviders =
+      const existing = llmSettingsRef.current.providers || [];
+      const upserts = [llmPatch.speech_provider, llmPatch.provider].filter(Boolean);
+      let updatedProviders = existing;
+      for (const incoming of upserts) {
+        const provIdx = updatedProviders.findIndex((p: LlmProvider) => p.id === incoming.id);
+        updatedProviders =
           provIdx >= 0
-            ? existing.map((p, i) => (i === provIdx ? { ...p, ...llmPatch.provider } : p))
-            : [...existing, llmPatch.provider];
-        await updateAndSaveLlmSettings({
-          enabled: llmPatch.enabled,
-          active_provider_id: llmPatch.active_provider_id,
-          model: llmPatch.model,
-          providers: updatedProviders,
-        });
-      } else {
-        await updateAndSaveLlmSettings({
-          enabled: llmPatch.enabled,
-          active_provider_id: llmPatch.active_provider_id,
-          model: llmPatch.model,
-        });
+            ? updatedProviders.map((p, i) => (i === provIdx ? { ...p, ...incoming } : p))
+            : [...updatedProviders, incoming];
       }
+      await updateAndSaveLlmSettings({
+        enabled: llmPatch.enabled,
+        ...(llmPatch.auto_mode !== undefined ? { auto_mode: llmPatch.auto_mode } : {}),
+        ...(llmPatch.active_provider_id ? { active_provider_id: llmPatch.active_provider_id } : {}),
+        ...(llmPatch.model ? { model: llmPatch.model } : {}),
+        ...(upserts.length > 0 ? { providers: updatedProviders } : {}),
+      });
     }
+    await refreshModelStatus(settingsPatch.local_engine, settingsPatch.local_model_size);
   }
 
   async function updateAndSaveSettings(patch: Partial<AppSettings>) {
@@ -3967,7 +3974,7 @@ export default function App() {
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px" }}>
                     <div>
                       <div style={{ fontWeight: 600, fontSize: "14px", color: "var(--text-primary)" }}>🚀 First-Time Setup Wizard</div>
-                      <div className="form-hint" style={{ marginTop: "2px" }}>Inspect machine specs, check RAM recommendations, or reconfigure local/cloud modes.</div>
+                      <div className="form-hint" style={{ marginTop: "2px" }}>Choose local or cloud speech, then test a provider if you want AI polish.</div>
                     </div>
                     <button type="button" className="btn btn-secondary" onClick={() => setWizardOpen(true)}>
                       Launch Wizard
@@ -4230,6 +4237,14 @@ export default function App() {
       </div>
     ) : (
         <main className="main-view">
+          {showSetupBanner && (
+            <div className="setup-banner">
+              <span>Speech isn’t ready yet. Finish setup to start dictating.</span>
+              <button type="button" className="btn btn-secondary" onClick={() => setWizardOpen(true)}>
+                Finish setup
+              </button>
+            </div>
+          )}
           {/* Navbar */}
           <header className={`navbar ${isStackedNav ? "compact-stacked" : ""}`}>
             <div className="navbar-left">
@@ -4789,21 +4804,17 @@ export default function App() {
         isOpen={wizardOpen}
         onClose={() => setWizardOpen(false)}
         onFinish={handleFinishWizard}
+        onStartRecording={() => toggleRecording("manual")}
         currentSettings={settings}
-        modelStatus={modelStatus}
         downloadProgress={downloadProgress}
         downloadSpeedBps={downloadSpeedBps}
         downloadEtaSecs={downloadEtaSecs}
         isDownloading={isDownloading}
         onDownloadModel={async (engine, size) => {
           await updateAndSaveSettings({ local_engine: engine, local_model_size: size });
-          await handleDownloadModel();
+          return handleDownloadModel();
         }}
         showToast={showToast}
-        requestConfirm={askEnableLiveDictation}
-        vadInstalled={vadInstalled}
-        vadDownloadProgress={vadDownloadProgress}
-        downloadVadModel={downloadVadModel}
       />
 
       {/* Confirmation Modal */}
