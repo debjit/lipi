@@ -54,12 +54,12 @@ jobs:
           for tag in "${TAGS[@]}"; do
             dest="$INCOMING/$tag"
             mkdir -p "$dest"
-            if ! gh release download "$tag" --pattern 'lipi_*_amd64.deb' --dir "$dest"; then
-              echo "No lipi_*_amd64.deb on ${tag}; skipping."
+            if ! gh release download "$tag" --pattern 'Lipi_*_amd64.deb' --dir "$dest"; then
+              echo "No Lipi_*_amd64.deb on ${tag}; skipping."
               rm -rf "$dest"
             fi
           done
-          mapfile -t DEBS < <(find "$INCOMING" -type f -name 'lipi_*_amd64.deb' | sort)
+          mapfile -t DEBS < <(find "$INCOMING" -type f -name 'Lipi_*_amd64.deb' | sort)
           if [ "${#DEBS[@]}" -eq 0 ]; then
             echo "No stable amd64 debs found. Publish a stable release first."
             exit 1

@@ -83,7 +83,7 @@ After `release-meta` is updated, CI POSTs `latest.json` to the GitHub Actions se
 
 ## Apt repository
 
-A published stable release starts [`.github/workflows/apt-repo.yml`](.github/workflows/apt-repo.yml). That workflow collects every stable `lipi_*_amd64.deb` (not the renamed `Lipi-linux.deb` copy), signs them with `reprepro`, and deploys the archive to GitHub Pages at `https://debjit.github.io/lipi`. Debian 12 and Ubuntu 22.04 or newer can then `sudo apt install lipi`. Dev prereleases are left out.
+A published stable release starts [`.github/workflows/apt-repo.yml`](.github/workflows/apt-repo.yml). That workflow collects every stable `Lipi_*_amd64.deb` (not the renamed `Lipi-linux.deb` copy), signs them with `reprepro`, and deploys the archive to GitHub Pages at `https://debjit.github.io/lipi`. Debian 12 and Ubuntu 22.04 or newer can then `sudo apt install lipi`. Dev prereleases are left out.
 
 Do this once before the first stable publish:
 
