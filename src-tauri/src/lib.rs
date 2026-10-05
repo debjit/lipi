@@ -1164,6 +1164,197 @@ fn download_url_for_platform(assets: &[GithubAsset]) -> Option<String> {
     asset_url(assets, exact, suffix).or_else(|| asset_url(assets, fallback_exact, fallback_suffix))
 }
 
+fn allowed_setup_download(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "The update link is not a valid URL.".to_string())?;
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("The update link is not a GitHub release.".into());
+    }
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    if host != "github.com" {
+        return Err("The update link is not a GitHub release.".into());
+    }
+    let mut segments = parsed
+        .path_segments()
+        .ok_or_else(|| "The update link is not a Lipi setup installer.".to_string())?;
+    let owner = segments.next().unwrap_or("");
+    let repo = segments.next().unwrap_or("");
+    let releases = segments.next().unwrap_or("");
+    let download = segments.next().unwrap_or("");
+    let tag = segments.next().unwrap_or("");
+    let name = segments.next().unwrap_or("");
+    if segments.next().is_some()
+        || owner != "debjit"
+        || repo != "lipi"
+        || releases != "releases"
+        || download != "download"
+        || tag.is_empty()
+        || !name.ends_with("-setup.exe")
+    {
+        return Err("The update link is not a Lipi setup installer.".into());
+    }
+    Ok(())
+}
+
+fn github_release_host(host: &str) -> bool {
+    matches!(
+        host,
+        "github.com"
+            | "release-assets.githubusercontent.com"
+            | "objects.githubusercontent.com"
+            | "github-releases.githubusercontent.com"
+    )
+}
+
+fn emit_update_progress(app: &tauri::AppHandle, percentage: Option<i64>, speed_bps: f64) {
+    let _ = app.emit(
+        "update-download-progress",
+        serde_json::json!({
+            "percentage": percentage,
+            "speed_bps": speed_bps,
+        }),
+    );
+}
+
+fn replace_setup_file(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
+    if to.exists() {
+        std::fs::remove_file(to).map_err(|e| format!("Could not replace the previous setup file: {e}"))?;
+    }
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            std::fs::copy(from, to).map_err(|e| format!("Could not save the setup file: {e}"))?;
+            let _ = std::fs::remove_file(from);
+            Ok(())
+        }
+    }
+}
+
+fn finalize_setup_file(partial: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let dir = partial
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let preferred = dir.join("Lipi-setup.exe");
+    if replace_setup_file(partial, &preferred).is_ok() {
+        return Ok(preferred);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let alternate = dir.join(format!("Lipi-setup-{stamp}.exe"));
+    replace_setup_file(partial, &alternate)?;
+    Ok(alternate)
+}
+
+fn launch_setup(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Could not start the installer: {e}"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        Err("The setup installer runs on Windows.".into())
+    }
+}
+
+async fn download_setup(app: &tauri::AppHandle, url: &str) -> Result<std::path::PathBuf, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("lipi")
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(15 * 60))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let host = attempt.url().host_str().unwrap_or("").to_ascii_lowercase();
+            if github_release_host(&host) && attempt.previous().len() < 8 {
+                attempt.follow()
+            } else {
+                attempt.error("The update download left GitHub.")
+            }
+        }))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Update download failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("GitHub returned {}", response.status()));
+    }
+
+    let total_size = response.content_length().unwrap_or(0);
+    let partial = std::env::temp_dir().join("Lipi-setup.exe.part");
+    let mut file = std::fs::File::create(&partial).map_err(|e| format!("Could not save the setup file: {e}"))?;
+    let mut downloaded: u64 = 0;
+    let mut last_percent: i64 = -1;
+    let mut last_emit = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    let started = std::time::Instant::now();
+    use std::io::Write;
+
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(&partial);
+                return Err(format!("Update download failed: {e}"));
+            }
+        };
+        if let Err(e) = file.write_all(&chunk) {
+            drop(file);
+            let _ = std::fs::remove_file(&partial);
+            return Err(format!("Could not save the setup file: {e}"));
+        }
+        downloaded += chunk.len() as u64;
+
+        let percent = if total_size > 0 {
+            Some((((downloaded as f64 / total_size as f64) * 100.0) as i64).min(99))
+        } else {
+            None
+        };
+        let percent_changed = match percent {
+            Some(value) => value != last_percent,
+            None => false,
+        };
+        let due = last_emit.elapsed() >= std::time::Duration::from_millis(250);
+        if percent_changed || (percent.is_none() && due) {
+            if let Some(value) = percent {
+                last_percent = value;
+            }
+            last_emit = std::time::Instant::now();
+            let elapsed = started.elapsed().as_secs_f64();
+            let speed_bps = if total_size > 0 && elapsed > 0.4 {
+                downloaded as f64 / elapsed
+            } else {
+                0.0
+            };
+            emit_update_progress(app, percent, speed_bps);
+        }
+    }
+
+    if let Err(e) = file.flush() {
+        drop(file);
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!("Could not save the setup file: {e}"));
+    }
+    drop(file);
+    if downloaded == 0 {
+        let _ = std::fs::remove_file(&partial);
+        return Err("The setup download was empty.".into());
+    }
+
+    let path = finalize_setup_file(&partial)?;
+    emit_update_progress(app, Some(100), 0.0);
+    Ok(path)
+}
+
 #[tauri::command]
 async fn check_for_update() -> Result<Option<UpdateNotice>, String> {
     let current = env!("CARGO_PKG_VERSION");
@@ -1200,6 +1391,16 @@ async fn check_for_update() -> Result<Option<UpdateNotice>, String> {
         notes: release.body.unwrap_or_default(),
         download_url,
     }))
+}
+
+#[tauri::command]
+async fn download_and_launch_update(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    allowed_setup_download(&url)?;
+    if !cfg!(target_os = "windows") {
+        return Err("The setup installer runs on Windows.".into());
+    }
+    let path = download_setup(&app, &url).await?;
+    launch_setup(&path)
 }
 
 
@@ -1428,7 +1629,8 @@ pub fn run() {
             get_system_specs,
             check_system_prerequisites,
             test_and_fetch_models,
-            check_for_update
+            check_for_update,
+            download_and_launch_update
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1443,7 +1645,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod update_tests {
-    use super::{asset_url, is_newer_release, GithubAsset};
+    use super::{allowed_setup_download, asset_url, github_release_host, is_newer_release, GithubAsset};
 
     #[test]
     fn stable_release_is_newer_than_the_dev_build() {
@@ -1470,5 +1672,43 @@ mod update_tests {
             asset_url(&assets, "Lipi-windows-setup.exe", "-setup.exe").as_deref(),
             Some("https://example.com/stable.exe")
         );
+    }
+
+    #[test]
+    fn setup_url_must_be_the_github_release_asset() {
+        assert!(allowed_setup_download(
+            "https://github.com/debjit/lipi/releases/download/v0.2.0/Lipi-windows-setup.exe"
+        )
+        .is_ok());
+        assert!(allowed_setup_download(
+            "https://github.com/debjit/lipi/releases/download/v0.2.0/Lipi_0.2.0_x64-setup.exe"
+        )
+        .is_ok());
+        assert!(allowed_setup_download(
+            "http://github.com/debjit/lipi/releases/download/v0.2.0/Lipi-windows-setup.exe"
+        )
+        .is_err());
+        assert!(allowed_setup_download(
+            "https://github.com/debjit/lipi/releases/download/v0.2.0/Lipi-windows.msi"
+        )
+        .is_err());
+        assert!(allowed_setup_download(
+            "https://github.com/other/lipi/releases/download/v0.2.0/Lipi-windows-setup.exe"
+        )
+        .is_err());
+        assert!(allowed_setup_download("https://example.com/Lipi-windows-setup.exe").is_err());
+        assert!(allowed_setup_download(
+            "https://github.com/debjit/lipi/releases/latest/download/Lipi-windows-setup.exe"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn setup_download_follows_github_asset_hosts_only() {
+        assert!(github_release_host("github.com"));
+        assert!(github_release_host("release-assets.githubusercontent.com"));
+        assert!(github_release_host("objects.githubusercontent.com"));
+        assert!(!github_release_host("evil.example"));
+        assert!(!github_release_host("githubusercontent.com.evil.test"));
     }
 }
