@@ -245,6 +245,12 @@ body, html, #root {
   opacity: 0.8;
 }
 
+.update-pill-open:disabled,
+.update-pill-dismiss:disabled {
+  cursor: default;
+  opacity: 0.9;
+}
+
 .badge-status {
   display: inline-flex;
   align-items: center;

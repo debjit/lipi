@@ -43,7 +43,15 @@ Stable installers, after the first stable release:
 | Windows | [Setup](https://github.com/debjit/lipi/releases/latest/download/Lipi-windows-setup.exe), [MSI](https://github.com/debjit/lipi/releases/latest/download/Lipi-windows.msi) |
 | Linux (x86_64) | [deb](https://github.com/debjit/lipi/releases/latest/download/Lipi-linux.deb), [AppImage](https://github.com/debjit/lipi/releases/latest/download/Lipi-linux.AppImage), or `sudo apt install lipi` |
 
-On Debian 12 and Ubuntu 22.04 or newer (x86_64), add the archive once, then install and upgrade with apt:
+On Debian 12 and Ubuntu 22.04 or newer (x86_64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/debjit/lipi/main/install.sh | bash
+```
+
+The script adds the archive key and source, then installs Lipi. Later upgrades are `sudo apt update && sudo apt upgrade`.
+
+To add the archive by hand:
 
 ```bash
 sudo mkdir -p /etc/apt/keyrings

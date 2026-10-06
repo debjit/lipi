@@ -85,6 +85,8 @@ After `release-meta` is updated, CI POSTs `latest.json` to the GitHub Actions se
 
 A published stable release starts [`.github/workflows/apt-repo.yml`](.github/workflows/apt-repo.yml). That workflow collects every stable `Lipi_*_amd64.deb` (not the renamed `Lipi-linux.deb` copy), signs them with `reprepro`, and deploys the archive to GitHub Pages at `https://debjit.github.io/lipi`. Debian 12 and Ubuntu 22.04 or newer can then `sudo apt install lipi`. Dev prereleases are left out.
 
+[`install.sh`](install.sh) writes the same keyring (`/etc/apt/keyrings/lipi.gpg`) and `lipi.sources` entry as the commands in the README, then runs `apt-get install lipi`. The release workflow does not rewrite that script.
+
 Do this once before the first stable publish:
 
 1. Create a signing key with an empty passphrase. The private key stays out of git.
@@ -111,4 +113,4 @@ After that, publishing a stable release updates the archive. If a stable release
 
 ## Update notice in the app
 
-Lipi does not install updates itself. On startup it reads `https://api.github.com/repos/debjit/lipi/releases/latest`, which ignores prereleases. If that version is newer than the running app, the navbar and the settings footer show an **Update** notice. Opening it downloads the installer for this operating system: the Windows setup, or the Linux deb. If GitHub cannot be reached, nothing is shown.
+Lipi does not install updates in the background. On startup it reads `https://api.github.com/repos/debjit/lipi/releases/latest`, which ignores prereleases. If that version is newer than the running app, the navbar and the settings footer show an **Update** notice. On Windows, opening it downloads the setup into the temp folder and opens the installer wizard, which you finish by hand. The download does not start while a recording is in progress. If that download fails, Lipi opens the setup link instead. On Linux, opening the notice opens the deb download. If GitHub cannot be reached, nothing is shown. Installing with WinGet is left for a later change.

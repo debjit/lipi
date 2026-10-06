@@ -232,17 +232,34 @@ function UpdateNoticePill({
   notice,
   onOpen,
   onDismiss,
+  downloading,
+  percent,
 }: {
   notice: UpdateNotice;
   onOpen: () => void;
   onDismiss: () => void;
+  downloading: boolean;
+  percent: number | null;
 }) {
+  const label = downloading ? (percent === null ? "Downloading…" : `${percent}%`) : `Update v${notice.latest}`;
   return (
     <span className="update-pill">
-      <button type="button" className="update-pill-open" onClick={onOpen} title={`Lipi v${notice.latest} is available`}>
-        Update v{notice.latest}
+      <button
+        type="button"
+        className="update-pill-open"
+        onClick={onOpen}
+        disabled={downloading}
+        title={downloading ? "Downloading the Lipi setup" : `Lipi v${notice.latest} is available`}
+      >
+        {label}
       </button>
-      <button type="button" className="update-pill-dismiss" onClick={onDismiss} title="Dismiss update notice">
+      <button
+        type="button"
+        className="update-pill-dismiss"
+        onClick={onDismiss}
+        disabled={downloading}
+        title="Dismiss update notice"
+      >
         ×
       </button>
     </span>
@@ -265,6 +282,9 @@ export default function App() {
   const [miniMode, setMiniMode] = useState(false);
   const [appVersion, setAppVersion] = useState("");
   const [updateNotice, setUpdateNotice] = useState<UpdateNotice | null>(null);
+  const [updateDownloading, setUpdateDownloading] = useState(false);
+  const [updatePercent, setUpdatePercent] = useState<number | null>(null);
+  const updateDownloadActiveRef = useRef(false);
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [memoryStatus, setMemoryStatus] = useState<ModelMemoryStatus | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
@@ -599,6 +619,14 @@ export default function App() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    return listenForever<{ percentage: number | null; speed_bps?: number }>("update-download-progress", (event) => {
+      if (!updateDownloadActiveRef.current) return;
+      const percentage = event.payload?.percentage;
+      if (typeof percentage === "number") setUpdatePercent(percentage);
+    });
   }, []);
 
   useEffect(() => {
@@ -1460,12 +1488,47 @@ export default function App() {
     setTimeout(() => setCopiedNotification(null), 2500);
   }
 
-  async function openUpdateDownload() {
-    if (!updateNotice?.download_url) return;
+  function isWindowsSetupUrl(url: string) {
     try {
-      await openUrl(updateNotice.download_url);
+      const parsed = new URL(url);
+      return parsed.protocol === "https:" && parsed.pathname.endsWith("-setup.exe");
+    } catch {
+      return false;
+    }
+  }
+
+  async function openBrowserDownload(url: string) {
+    try {
+      await openUrl(url);
     } catch (err) {
       showToast(`Could not open the download: ${err}`);
+    }
+  }
+
+  async function openUpdateDownload() {
+    if (!updateNotice?.download_url || updateDownloadActiveRef.current) return;
+    const url = updateNotice.download_url;
+    if (!isWindowsSetupUrl(url)) {
+      await openBrowserDownload(url);
+      return;
+    }
+    if (isRecordingRef.current) {
+      showToast("Stop recording before updating.");
+      return;
+    }
+    updateDownloadActiveRef.current = true;
+    setUpdateDownloading(true);
+    setUpdatePercent(null);
+    try {
+      await invoke("download_and_launch_update", { url });
+    } catch (err) {
+      console.error("Could not start the Lipi setup:", err);
+      showToast("Could not start the installer. Opening the download instead.");
+      await openBrowserDownload(url);
+    } finally {
+      updateDownloadActiveRef.current = false;
+      setUpdateDownloading(false);
+      setUpdatePercent(null);
     }
   }
 
@@ -2276,7 +2339,11 @@ export default function App() {
                 <UpdateNoticePill
                   notice={updateNotice}
                   onOpen={openUpdateDownload}
-                  onDismiss={() => setUpdateNotice(null)}
+                  onDismiss={() => {
+                    if (!updateDownloadActiveRef.current) setUpdateNotice(null);
+                  }}
+                  downloading={updateDownloading}
+                  percent={updatePercent}
                 />
               )}
             </div>
@@ -4262,7 +4329,11 @@ export default function App() {
                 <UpdateNoticePill
                   notice={updateNotice}
                   onOpen={openUpdateDownload}
-                  onDismiss={() => setUpdateNotice(null)}
+                  onDismiss={() => {
+                    if (!updateDownloadActiveRef.current) setUpdateNotice(null);
+                  }}
+                  downloading={updateDownloading}
+                  percent={updatePercent}
                 />
               )}
 
