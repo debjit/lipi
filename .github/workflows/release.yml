@@ -18,6 +18,8 @@ jobs:
             args: ''
           - platform: 'windows-latest'
             args: ''
+          - platform: 'macos-latest'
+            args: ''
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -139,6 +141,7 @@ jobs:
           copy_first "$STABLE/Lipi-windows.msi" '*.msi'
           copy_first "$STABLE/Lipi-linux.deb" '*.deb'
           copy_first "$STABLE/Lipi-linux.AppImage" '*.AppImage'
+          copy_first "$STABLE/Lipi-macos.dmg" '*.dmg'
           if [ -n "$(ls -A "$STABLE")" ]; then
             gh release upload "$TAG" "$STABLE"/* --clobber
           fi

@@ -1,7 +1,7 @@
 use std::sync::mpsc;
 use std::thread;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::time::Duration;
 
 pub struct ClipboardService {
@@ -46,6 +46,8 @@ pub struct PasteTarget {
     pub wayland_inject: bool,
     #[cfg(target_os = "windows")]
     pub hwnd: Option<isize>,
+    #[cfg(target_os = "macos")]
+    pub pid: Option<i32>,
 }
 
 impl PasteTarget {
@@ -58,6 +60,10 @@ impl PasteTarget {
         }
         #[cfg(target_os = "windows")]
         if self.hwnd.is_some() {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        if self.pid.is_some() {
             return true;
         }
         false
@@ -95,7 +101,15 @@ pub fn capture_paste_target(allow_fallback: bool, lipi_focused: bool) -> PasteTa
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = lipi_focused;
+        if let Some(pid) = capture_macos_target(allow_fallback) {
+            target.pid = Some(pid);
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         let _ = (allow_fallback, lipi_focused);
     }
@@ -328,7 +342,18 @@ pub fn paste_into_previous_app(
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        let pid = target.as_ref().and_then(|t| t.pid);
+        if let Some(pid) = pid {
+            activate_macos_pid(pid)?;
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        send_macos_command_v()?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     Err("Auto-paste not supported on this platform".into())
 }
 
@@ -442,6 +467,107 @@ fn send_windows_ctrl_v() -> Result<(), String> {
     Ok(())
 }
 
+/// Pick the app that should receive the paste.
+/// `apps` is `(pid, frontmost)`. Lipi's own pid is skipped. When Lipi is frontmost,
+/// another app is used only in mini-widget mode (`allow_fallback`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn choose_paste_pid(apps: &[(i32, bool)], current_pid: i32, allow_fallback: bool) -> Option<i32> {
+    if let Some((pid, _)) = apps.iter().find(|(_, frontmost)| *frontmost) {
+        if *pid != current_pid {
+            return Some(*pid);
+        }
+    }
+    if !allow_fallback {
+        return None;
+    }
+    apps.iter()
+        .find(|(pid, _)| *pid != current_pid)
+        .map(|(pid, _)| *pid)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_process_list(text: &str) -> Vec<(i32, bool)> {
+    let mut apps = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split('\t');
+        let Some(pid) = parts.next().and_then(|part| part.trim().parse::<i32>().ok()) else {
+            continue;
+        };
+        let frontmost = parts
+            .next()
+            .map(|part| part.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        apps.push((pid, frontmost));
+    }
+    apps
+}
+
+#[cfg(target_os = "macos")]
+fn visible_macos_apps() -> Result<Vec<(i32, bool)>, String> {
+    let script = r#"tell application "System Events"
+set out to ""
+repeat with p in (every application process whose background only is false)
+set out to out & (unix id of p as text) & tab & (frontmost of p as text) & linefeed
+end repeat
+return out
+end tell"#;
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|e| format!("Could not read the frontmost app: {e}"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Allow Lipi in System Settings > Privacy & Security > Accessibility, and allow it to control System Events. {}",
+            err.trim()
+        ));
+    }
+    Ok(parse_process_list(&String::from_utf8_lossy(&output.stdout)))
+}
+
+#[cfg(target_os = "macos")]
+fn capture_macos_target(allow_fallback: bool) -> Option<i32> {
+    let apps = visible_macos_apps().ok()?;
+    choose_paste_pid(&apps, std::process::id() as i32, allow_fallback)
+}
+
+#[cfg(target_os = "macos")]
+fn activate_macos_pid(pid: i32) -> Result<(), String> {
+    let script = format!(
+        "tell application \"System Events\" to set frontmost of (first application process whose unix id is {pid}) to true"
+    );
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| format!("Could not focus the previous app: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "Allow Lipi in System Settings > Privacy & Security > Accessibility, and allow it to control System Events. {}",
+        err.trim()
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn send_macos_command_v() -> Result<(), String> {
+    use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| format!("Enigo init error: {e:?}"))?;
+    enigo
+        .key(Key::Meta, Direction::Press)
+        .map_err(|e| format!("Key press error: {e:?}"))?;
+    enigo
+        .key(Key::Unicode('v'), Direction::Click)
+        .map_err(|e| format!("Key click error: {e:?}"))?;
+    enigo
+        .key(Key::Meta, Direction::Release)
+        .map_err(|e| format!("Key release error: {e:?}"))?;
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn is_command_available(cmd: &str) -> bool {
     std::process::Command::new("which")
@@ -459,6 +585,14 @@ mod tests {
     fn test_capture_paste_target() {
         let _ = capture_paste_target(false, true);
         let _ = capture_paste_target(true, false);
+    }
+
+    #[test]
+    fn paste_pid_skips_lipi_unless_mini_mode() {
+        let apps = [(10, true), (20, false), (30, false)];
+        assert_eq!(choose_paste_pid(&apps, 10, false), None);
+        assert_eq!(choose_paste_pid(&apps, 10, true), Some(20));
+        assert_eq!(choose_paste_pid(&apps, 99, false), Some(10));
     }
 }
 

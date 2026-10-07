@@ -852,7 +852,7 @@ async fn pick_directory() -> Result<Option<String>, String> {
         }
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         let folder = tauri::async_runtime::spawn_blocking(|| {
             rfd::FileDialog::new()
@@ -864,7 +864,7 @@ async fn pick_directory() -> Result<Option<String>, String> {
         return Ok(folder.map(|p| p.to_string_lossy().into_owned()));
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     Ok(None)
 }
 
@@ -1153,14 +1153,26 @@ fn asset_url(assets: &[GithubAsset], exact: &str, suffix: &str) -> Option<String
         .map(|asset| asset.browser_download_url.clone())
 }
 
+fn installer_names(os: &str) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+    match os {
+        "windows" => Some(("Lipi-windows-setup.exe", "-setup.exe", "Lipi-windows.msi", ".msi")),
+        "linux" => Some(("Lipi-linux.deb", ".deb", "Lipi-linux.AppImage", ".AppImage")),
+        "macos" => Some(("Lipi-macos.dmg", ".dmg", "Lipi-macos.dmg", ".dmg")),
+        _ => None,
+    }
+}
+
 fn download_url_for_platform(assets: &[GithubAsset]) -> Option<String> {
-    let (exact, suffix, fallback_exact, fallback_suffix) = if cfg!(target_os = "windows") {
-        ("Lipi-windows-setup.exe", "-setup.exe", "Lipi-windows.msi", ".msi")
+    let os = if cfg!(target_os = "windows") {
+        "windows"
     } else if cfg!(target_os = "linux") {
-        ("Lipi-linux.deb", ".deb", "Lipi-linux.AppImage", ".AppImage")
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
     } else {
         return None;
     };
+    let (exact, suffix, fallback_exact, fallback_suffix) = installer_names(os)?;
     asset_url(assets, exact, suffix).or_else(|| asset_url(assets, fallback_exact, fallback_suffix))
 }
 
@@ -1645,7 +1657,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod update_tests {
-    use super::{allowed_setup_download, asset_url, github_release_host, is_newer_release, GithubAsset};
+    use super::{
+        allowed_setup_download, asset_url, github_release_host, installer_names, is_newer_release,
+        GithubAsset,
+    };
 
     #[test]
     fn stable_release_is_newer_than_the_dev_build() {
@@ -1671,6 +1686,33 @@ mod update_tests {
         assert_eq!(
             asset_url(&assets, "Lipi-windows-setup.exe", "-setup.exe").as_deref(),
             Some("https://example.com/stable.exe")
+        );
+    }
+
+    #[test]
+    fn macos_update_uses_the_dmg() {
+        let (exact, suffix, _, fallback_suffix) = installer_names("macos").unwrap();
+        let assets = vec![
+            GithubAsset {
+                name: "Lipi_0.2.0_aarch64.dmg".into(),
+                browser_download_url: "https://example.com/versioned.dmg".into(),
+            },
+            GithubAsset {
+                name: "Lipi-macos.dmg".into(),
+                browser_download_url: "https://example.com/stable.dmg".into(),
+            },
+        ];
+        assert_eq!(
+            asset_url(&assets, exact, suffix).as_deref(),
+            Some("https://example.com/stable.dmg")
+        );
+        let versioned = vec![GithubAsset {
+            name: "Lipi_0.2.0_aarch64.dmg".into(),
+            browser_download_url: "https://example.com/versioned.dmg".into(),
+        }];
+        assert_eq!(
+            asset_url(&versioned, exact, fallback_suffix).as_deref(),
+            Some("https://example.com/versioned.dmg")
         );
     }
 

@@ -48,6 +48,7 @@ function toManifest(release) {
       windows_msi: pick(assets, ["Lipi-windows.msi"], [".msi"]),
       linux_deb: pick(assets, ["Lipi-linux.deb"], [".deb"]),
       linux_appimage: pick(assets, ["Lipi-linux.AppImage"], [".AppImage"]),
+      macos_dmg: pick(assets, ["Lipi-macos.dmg"], [".dmg"]),
     },
   };
 }

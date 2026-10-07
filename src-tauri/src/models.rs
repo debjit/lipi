@@ -213,7 +213,7 @@ pub fn find_whisper_binary(app_data_dir: &Path) -> Option<PathBuf> {
         }
     }
 
-    None
+    macos_homebrew_binary("whisper-cli")
 }
 
 pub fn find_whisper_server_binary(app_data_dir: &Path) -> Option<PathBuf> {
@@ -238,6 +238,20 @@ pub fn find_whisper_server_binary(app_data_dir: &Path) -> Option<PathBuf> {
         }
     }
 
+    macos_homebrew_binary("whisper-server")
+}
+
+/// A `.app` does not inherit a shell PATH, so Homebrew's usual prefixes are checked directly.
+#[cfg(target_os = "macos")]
+fn macos_homebrew_binary(name: &str) -> Option<PathBuf> {
+    ["/opt/homebrew/bin", "/usr/local/bin"]
+        .into_iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_homebrew_binary(_name: &str) -> Option<PathBuf> {
     None
 }
 
@@ -320,6 +334,8 @@ pub fn install_faster_whisper_deps(app_data_dir: &Path) -> Result<String, String
     let py_path = find_working_python_cmd().ok_or_else(|| {
         if cfg!(windows) {
             "Python 3 is not found on your system PATH. Please install Python from https://python.org or run 'winget install Python.Python.3.11' (check 'Add Python to PATH').".to_string()
+        } else if cfg!(target_os = "macos") {
+            "Python 3 is not found. Install it with `brew install python`, or from https://python.org.".to_string()
         } else {
             "Python 3 is not found on your system. Please install python3 (e.g. 'sudo apt install python3-pip').".to_string()
         }
@@ -566,6 +582,14 @@ pub async fn ensure_whisper_cli_binary(app_data_dir: &Path) -> Result<PathBuf, S
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        return Err(
+            "whisper-cli was not found. Install it with `brew install whisper-cpp`, or switch to the faster-whisper engine."
+                .into(),
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
     Err("whisper-cli binary not found. Please install whisper-cli or ensure it is in PATH.".into())
 }
 

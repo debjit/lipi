@@ -73,7 +73,17 @@ fn configure_binary_env_and_flags(cmd: &mut Command, binary_path: &Path) {
             };
             cmd.env("PATH", new_path);
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            let current_ld = std::env::var("DYLD_LIBRARY_PATH").unwrap_or_default();
+            let new_ld = if current_ld.is_empty() {
+                parent_str
+            } else {
+                format!("{parent_str}:{current_ld}")
+            };
+            cmd.env("DYLD_LIBRARY_PATH", new_ld);
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let current_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
             let new_ld = if current_ld.is_empty() {

@@ -33,7 +33,7 @@ A version with a hyphen is a dev prerelease. `0.1.5-2` is dev. `0.2.0` is stable
 | Apt repository | Unchanged | Signed archive on GitHub Pages updated |
 | In-app notice | Does not notify | Notifies installed copies of an older version |
 
-CI builds Windows and Linux, uploads the installers to a draft, and publishes that draft only after both builds succeed. If either build fails, the draft stays unpublished.
+CI builds Windows, Linux, and macOS, uploads the installers to a draft, and publishes that draft only after every build succeeds. If any build fails, the draft stays unpublished.
 
 ## Stable download names
 
@@ -45,6 +45,7 @@ After a stable release, these files sit next to the versioned Tauri installers:
 | Windows MSI | `Lipi-windows.msi` |
 | Linux deb | `Lipi-linux.deb` |
 | Linux AppImage | `Lipi-linux.AppImage` |
+| macOS dmg (Apple Silicon) | `Lipi-macos.dmg` |
 
 The README links to them through `/releases/latest/download/`. Those links work only after the first stable release. GitHub's "latest" URL ignores prereleases, so a dev tag never replaces them.
 
@@ -68,7 +69,8 @@ A stable publish writes two files and pushes them to the `release-meta` branch:
     "windows_setup": "https://github.com/debjit/lipi/releases/download/v0.2.0/Lipi-windows-setup.exe",
     "windows_msi": "https://github.com/debjit/lipi/releases/download/v0.2.0/Lipi-windows.msi",
     "linux_deb": "https://github.com/debjit/lipi/releases/download/v0.2.0/Lipi-linux.deb",
-    "linux_appimage": "https://github.com/debjit/lipi/releases/download/v0.2.0/Lipi-linux.AppImage"
+    "linux_appimage": "https://github.com/debjit/lipi/releases/download/v0.2.0/Lipi-linux.AppImage",
+    "macos_dmg": "https://github.com/debjit/lipi/releases/download/v0.2.0/Lipi-macos.dmg"
   }
 }
 ```
@@ -113,4 +115,4 @@ After that, publishing a stable release updates the archive. If a stable release
 
 ## Update notice in the app
 
-Lipi does not install updates in the background. On startup it reads `https://api.github.com/repos/debjit/lipi/releases/latest`, which ignores prereleases. If that version is newer than the running app, the navbar and the settings footer show an **Update** notice. On Windows, opening it downloads the setup into the temp folder and opens the installer wizard, which you finish by hand. The download does not start while a recording is in progress. If that download fails, Lipi opens the setup link instead. On Linux, opening the notice opens the deb download. If GitHub cannot be reached, nothing is shown. Installing with WinGet is left for a later change.
+Lipi does not install updates in the background. On startup it reads `https://api.github.com/repos/debjit/lipi/releases/latest`, which ignores prereleases. If that version is newer than the running app, the navbar and the settings footer show an **Update** notice. On Windows, opening it downloads the setup into the temp folder and opens the installer wizard, which you finish by hand. The download does not start while a recording is in progress. If that download fails, Lipi opens the setup link instead. On Linux, opening the notice opens the deb download. On macOS, opening the notice opens the dmg download. If GitHub cannot be reached, nothing is shown. Installing with WinGet is left for a later change.

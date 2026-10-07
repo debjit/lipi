@@ -42,6 +42,7 @@ Stable installers, after the first stable release:
 | :--- | :--- |
 | Windows | [Setup](https://github.com/debjit/lipi/releases/latest/download/Lipi-windows-setup.exe), [MSI](https://github.com/debjit/lipi/releases/latest/download/Lipi-windows.msi) |
 | Linux (x86_64) | [deb](https://github.com/debjit/lipi/releases/latest/download/Lipi-linux.deb), [AppImage](https://github.com/debjit/lipi/releases/latest/download/Lipi-linux.AppImage), or `sudo apt install lipi` |
+| macOS (Apple Silicon) | [dmg](https://github.com/debjit/lipi/releases/latest/download/Lipi-macos.dmg) |
 
 On Debian 12 and Ubuntu 22.04 or newer (x86_64):
 
@@ -50,6 +51,8 @@ curl -fsSL https://raw.githubusercontent.com/debjit/lipi/main/install.sh | bash
 ```
 
 The script adds the archive key and source, then installs Lipi. Later upgrades are `sudo apt update && sudo apt upgrade`.
+
+On macOS, open the dmg and drag Lipi into Applications. This build is not notarized. The first time you open it, right-click Lipi and choose **Open**.
 
 To add the archive by hand:
 
@@ -99,7 +102,7 @@ All settings live in the **Settings** page, which has four tabs.
 
 - **Engine**
   - **Remote API:** presets for Groq, Cloudflare Workers AI, OpenAI, a local/self-hosted server, or a custom endpoint.
-  - **Local engine:** `whisper_cpu`, `whisper_vulkan` (GPU), or `faster_whisper`. Each runner can be set up with one click; `faster_whisper` is installed into its own Python virtual environment.
+  - **Local engine:** `whisper_cpu`, `whisper_vulkan` (GPU), or `faster_whisper`. Each runner can be set up with one click; `faster_whisper` is installed into its own Python virtual environment. On macOS, `whisper_cpu` is not downloaded for you: install it with `brew install whisper-cpp`. If Python is missing, `faster_whisper` needs `brew install python`. `whisper_vulkan` is not available on macOS.
 - **Models:** download `tiny`, `base`, `small`, `medium`, or `turbo_q8` with live progress, and store them in any folder, including an external drive.
 - **Memory:** local models are unloaded after a period of inactivity (2, 5, 10 (default), or 30 minutes, or never). The tab shows current RAM usage and has a button to unload the model now.
 - **Request timeout:** 3 minutes by default (also the minimum), with quick options for 5 and 10 minutes or a custom value in seconds.
@@ -126,7 +129,7 @@ Live dictation is **off by default** and only works with local engines. Cloud an
 | :--- | :--- |
 | Language code | ISO-639-1 code such as `en`, `bn`, `es`, or `hi`. Leave empty to auto-detect. |
 | Auto-copy | Copy the transcript to the clipboard when recording finishes. |
-| Paste into previous application | Bring back the window you were using and paste with `Ctrl + V`. |
+| Paste into previous application | Bring back the window you were using and paste with `Ctrl + V` (`Command + V` on macOS). |
 | Always on top | Keep Lipi above other windows. |
 | Start on system startup | Launch Lipi when you log in. |
 | `Alt + R` recording behavior | Create a new note for each recording (default), or append to the open note. |
@@ -143,6 +146,7 @@ A live log of transcription attempts, errors, endpoints, and models. **Copy All 
 | Windows | Works out of the box. |
 | Linux (X11) | Works out of the box. |
 | Linux (Wayland) | GNOME shows a **Remote Desktop** permission prompt the first time Lipi pastes. Click **Allow**, or install `ydotool` to skip the prompt. |
+| macOS | The first paste asks for **Accessibility**, and to control **System Events**. Allow both in **System Settings > Privacy & Security**. Lipi then sends `Command + V`. The global shortcut is `Option + R`. |
 
 Wayland stops apps from sending keystrokes to other windows unless you allow it, so Lipi sends `Ctrl + V` through the desktop portal, which asks for permission. If you'd rather paste silently in the background, install `ydotool`; Lipi uses it automatically when it is available:
 
@@ -158,6 +162,7 @@ Notes, transcripts, and settings are kept in a local SQLite database:
 
 - Linux: `~/.local/share/com.lipi.app/lipi.db`
 - Windows: `%LOCALAPPDATA%\com.lipi.app\lipi.db`
+- macOS: `~/Library/Application Support/com.lipi.app/lipi.db`
 
 Nothing leaves your machine unless you configure a cloud speech or LLM provider.
 
@@ -176,6 +181,7 @@ Your choice. Change it under **Settings > Preferences > `Alt + R` recording beha
 
 - [Node.js](https://nodejs.org/) 18 or later
 - The Rust toolchain, installed with [rustup](https://rustup.rs/)
+- On macOS, the Xcode Command Line Tools: `xcode-select --install`
 - On Debian or Ubuntu, these system packages:
 
   ```bash

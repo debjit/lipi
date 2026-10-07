@@ -37,6 +37,10 @@ interface AppSettings {
   live_dictation?: boolean;
 }
 
+function pasteShortcutLabel() {
+  return /Mac OS X/.test(navigator.userAgent) ? "Command+V" : "Ctrl+V";
+}
+
 function listenForever<T>(event: string, handler: (event: { payload: T }) => void) {
   const p = listen<T>(event, handler);
   return () => {
@@ -2027,7 +2031,7 @@ export default function App() {
       } catch (err: any) {
         console.warn("Auto-paste failed, falling back to copy:", err);
         await copyText(text);
-        showToast("Copied to clipboard. Press Ctrl+V to paste.");
+        showToast(`Copied to clipboard. Press ${pasteShortcutLabel()} to paste.`);
       }
     } else if (settingsRef.current.auto_copy) {
       await copyText(text);
@@ -4079,7 +4083,7 @@ export default function App() {
                     <span>Paste into the previous application</span>
                   </label>
                   <span className="form-hint" style={{ marginLeft: "26px" }}>
-                    Restores target app and sends Ctrl+V after dictation or auto-transformation. Alt+R works system-wide. Works best with mini widget or Lipi in tray (an always-on-top window can cover target).
+                    Restores target app and sends {pasteShortcutLabel()} after dictation or auto-transformation. Alt+R works system-wide. Works best with mini widget or Lipi in tray (an always-on-top window can cover target).
                   </span>
                 </div>
 
