@@ -1,22 +1,32 @@
 use crate::vad::{SileroVad, SpeechSegmenter};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
-use std::io::Cursor;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{Cursor, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+const MEETING_MAX_SAMPLES: u64 = 16_000 * 60 * 120;
+
 enum Job {
     Batch(JoinHandle<Result<Vec<u8>, String>>),
     Live(JoinHandle<()>),
+    Meeting(JoinHandle<()>),
+}
+
+pub enum MeetingAudio {
+    Chunk { pcm: Vec<f32>, start_ms: u64, end_ms: u64 },
+    Limit,
 }
 
 pub struct AudioRecorder {
     stop_tx: Arc<Mutex<Option<Sender<bool>>>>,
     job: Arc<Mutex<Option<Job>>>,
     live: Arc<Mutex<bool>>,
+    meeting: Arc<Mutex<bool>>,
 }
 
 impl AudioRecorder {
@@ -25,6 +35,7 @@ impl AudioRecorder {
             stop_tx: Arc::new(Mutex::new(None)),
             job: Arc::new(Mutex::new(None)),
             live: Arc::new(Mutex::new(false)),
+            meeting: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -37,6 +48,10 @@ impl AudioRecorder {
 
     pub fn is_live(&self) -> bool {
         self.live.lock().map(|g| *g).unwrap_or(false)
+    }
+
+    pub fn is_meeting(&self) -> bool {
+        self.meeting.lock().map(|g| *g).unwrap_or(false)
     }
 
     pub fn start(&self) -> Result<(), String> {
@@ -63,7 +78,7 @@ impl AudioRecorder {
             pcm_f32_to_wav(&resampled)
         });
 
-        self.store_job(stop_sender, Job::Batch(handle), false)?;
+        self.store_job(stop_sender, Job::Batch(handle), false, false)?;
         Ok(())
     }
 
@@ -111,7 +126,7 @@ impl AudioRecorder {
 
         match ready_rx.recv() {
             Ok(Ok(())) => {
-                self.store_job(stop_sender, Job::Live(handle), true)?;
+                self.store_job(stop_sender, Job::Live(handle), true, false)?;
                 Ok(seg_rx)
             }
             Ok(Err(e)) => {
@@ -136,6 +151,10 @@ impl AudioRecorder {
                 let _ = handle.join();
                 Err("Stop was called on a live dictation session".into())
             }
+            Job::Meeting(handle) => {
+                let _ = handle.join();
+                Err("Stop was called on a meeting recording".into())
+            }
         }
     }
 
@@ -151,6 +170,109 @@ impl AudioRecorder {
                 let _ = handle.join();
                 Err("end_live was called without a live session".into())
             }
+            Job::Meeting(handle) => {
+                let _ = handle.join();
+                Err("end_live was called on a meeting recording".into())
+            }
+        }
+    }
+
+    pub fn start_meeting(&self, wav_path: PathBuf, vad_path: PathBuf) -> Result<Receiver<MeetingAudio>, String> {
+        self.ensure_idle()?;
+        let (stop_sender, stop_receiver) = mpsc::channel::<bool>();
+        let (seg_tx, seg_rx) = mpsc::channel::<MeetingAudio>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+        let (device, config) = input_device()?;
+        let sample_rate = config.sample_rate().0;
+        let channels = config.channels();
+        let sample_format = config.sample_format();
+
+        let handle = thread::spawn(move || {
+            let mut ready = Some(ready_tx);
+            let report = |ready: &mut Option<Sender<Result<(), String>>>, res: Result<(), String>| {
+                if let Some(tx) = ready.take() {
+                    let _ = tx.send(res);
+                }
+            };
+            let mut vad = match SileroVad::open(&vad_path) {
+                Ok(vad) => vad,
+                Err(e) => {
+                    report(&mut ready, Err(e));
+                    return;
+                }
+            };
+            let sink = match WavSink::create(&wav_path) {
+                Ok(sink) => sink,
+                Err(e) => {
+                    report(&mut ready, Err(e));
+                    return;
+                }
+            };
+            let recorded = Arc::new(Mutex::new(Vec::<f32>::new()));
+            let samples = Arc::clone(&recorded);
+            let stream = match build_stream(device, config, sample_format, channels, samples) {
+                Ok(stream) => stream,
+                Err(e) => {
+                    report(&mut ready, Err(e));
+                    return;
+                }
+            };
+            if let Err(e) = stream.play() {
+                report(&mut ready, Err(format!("Failed to start recording: {}", e)));
+                return;
+            }
+            report(&mut ready, Ok(()));
+            let _ = meeting_loop(
+                recorded,
+                channels,
+                sample_rate,
+                &mut vad,
+                sink,
+                &seg_tx,
+                stop_receiver,
+            );
+            drop(stream);
+        });
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => {
+                self.store_job(stop_sender, Job::Meeting(handle), false, true)?;
+                Ok(seg_rx)
+            }
+            Ok(Err(e)) => {
+                let _ = handle.join();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = handle.join();
+                Err("Meeting capture thread exited before the microphone opened".into())
+            }
+        }
+    }
+
+    /// `flush` keeps the open utterance. Cancel passes false and drops it.
+    pub fn end_meeting(&self, flush: bool) -> Result<(), String> {
+        if self
+            .stop_tx
+            .lock()
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            self.signal(flush)?;
+        } else if let Ok(mut meeting) = self.meeting.lock() {
+            *meeting = false;
+        }
+        let job = self.job.lock().map_err(|e| e.to_string())?.take();
+        match job {
+            Some(Job::Meeting(handle)) => {
+                let _ = handle.join();
+                Ok(())
+            }
+            Some(other) => {
+                *self.job.lock().map_err(|e| e.to_string())? = Some(other);
+                Err("end_meeting was called without a meeting".into())
+            }
+            None => Ok(()),
         }
     }
 
@@ -162,10 +284,11 @@ impl AudioRecorder {
         Ok(())
     }
 
-    fn store_job(&self, stop_sender: Sender<bool>, job: Job, live: bool) -> Result<(), String> {
+    fn store_job(&self, stop_sender: Sender<bool>, job: Job, live: bool, meeting: bool) -> Result<(), String> {
         *self.stop_tx.lock().map_err(|e| e.to_string())? = Some(stop_sender);
         *self.job.lock().map_err(|e| e.to_string())? = Some(job);
         *self.live.lock().map_err(|e| e.to_string())? = live;
+        *self.meeting.lock().map_err(|e| e.to_string())? = meeting;
         Ok(())
     }
 
@@ -179,6 +302,9 @@ impl AudioRecorder {
         let _ = sender.send(flush);
         if let Ok(mut live) = self.live.lock() {
             *live = false;
+        }
+        if let Ok(mut meeting) = self.meeting.lock() {
+            *meeting = false;
         }
         Ok(())
     }
@@ -327,6 +453,152 @@ fn live_loop(
     Ok(())
 }
 
+fn meeting_loop(
+    recorded: Arc<Mutex<Vec<f32>>>,
+    channels: u16,
+    sample_rate: u32,
+    vad: &mut SileroVad,
+    mut sink: WavSink,
+    seg_tx: &Sender<MeetingAudio>,
+    stop_receiver: Receiver<bool>,
+) -> Result<(), String> {
+    let mut resampler = StreamResampler::new(sample_rate);
+    let mut pending = Vec::<f32>::new();
+    let mut segmenter = SpeechSegmenter::new();
+    let mut fed: u64 = 0;
+    let mut written: u64 = 0;
+
+    let send_seg = |tx: &Sender<MeetingAudio>, seg: Vec<f32>, fed: u64| {
+        if seg.is_empty() {
+            return;
+        }
+        let end_ms = fed * 1000 / 16_000;
+        let start_ms = end_ms.saturating_sub(seg.len() as u64 * 1000 / 16_000);
+        let _ = tx.send(MeetingAudio::Chunk { pcm: seg, start_ms, end_ms });
+    };
+
+    loop {
+        let stop = match stop_receiver.recv_timeout(Duration::from_millis(20)) {
+            Ok(flush) => Some(flush),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Some(false),
+        };
+        let raw = {
+            let mut lock = recorded.lock().map_err(|e| e.to_string())?;
+            std::mem::take(&mut *lock)
+        };
+        if !raw.is_empty() {
+            let mono = downmix(&raw, channels);
+            let samples = resampler.push(&mono);
+            if !samples.is_empty() {
+                sink.write_f32(&samples)?;
+                written += samples.len() as u64;
+                pending.extend(samples);
+            }
+        }
+        while pending.len() >= 512 {
+            let frame: Vec<f32> = pending.drain(..512).collect();
+            fed += frame.len() as u64;
+            let speech = vad.probability(&frame).unwrap_or(0.0) >= 0.5;
+            if let Some(seg) = segmenter.push(&frame, speech) {
+                send_seg(seg_tx, seg, fed);
+            }
+        }
+        let limit = written >= MEETING_MAX_SAMPLES;
+        if limit || stop.is_some() {
+            let flush = limit || stop == Some(true);
+            if flush && !pending.is_empty() {
+                let tail = std::mem::take(&mut pending);
+                fed += tail.len() as u64;
+                segmenter.push_tail(&tail);
+            }
+            if flush {
+                if let Some(seg) = segmenter.flush() {
+                    send_seg(seg_tx, seg, fed);
+                }
+            }
+            if limit {
+                let _ = seg_tx.send(MeetingAudio::Limit);
+            }
+            break;
+        }
+    }
+    sink.finish()?;
+    Ok(())
+}
+
+struct WavSink {
+    file: File,
+    data_bytes: u32,
+    closed: bool,
+}
+
+impl WavSink {
+    fn create(path: &Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create session folder: {}", e))?;
+        }
+        let mut file = File::create(path).map_err(|e| format!("Failed to create recording file: {}", e))?;
+        write_wav_header(&mut file, 0)?;
+        Ok(Self {
+            file,
+            data_bytes: 0,
+            closed: false,
+        })
+    }
+
+    fn write_f32(&mut self, samples: &[f32]) -> Result<(), String> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let mut buf = Vec::with_capacity(samples.len() * 2);
+        for sample in samples {
+            let pcm = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+            buf.extend_from_slice(&pcm.to_le_bytes());
+        }
+        self.file
+            .write_all(&buf)
+            .map_err(|e| format!("Failed to write audio: {}", e))?;
+        self.data_bytes = self.data_bytes.saturating_add(buf.len() as u32);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.file.flush().map_err(|e| e.to_string())?;
+        self.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        write_wav_header(&mut self.file, self.data_bytes)
+    }
+}
+
+impl Drop for WavSink {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+fn write_wav_header(file: &mut File, data_bytes: u32) -> Result<(), String> {
+    let mut header = Vec::with_capacity(44);
+    header.extend_from_slice(b"RIFF");
+    header.extend_from_slice(&(36u32.saturating_add(data_bytes)).to_le_bytes());
+    header.extend_from_slice(b"WAVE");
+    header.extend_from_slice(b"fmt ");
+    header.extend_from_slice(&16u32.to_le_bytes());
+    header.extend_from_slice(&1u16.to_le_bytes());
+    header.extend_from_slice(&1u16.to_le_bytes());
+    header.extend_from_slice(&16_000u32.to_le_bytes());
+    header.extend_from_slice(&32_000u32.to_le_bytes());
+    header.extend_from_slice(&2u16.to_le_bytes());
+    header.extend_from_slice(&16u16.to_le_bytes());
+    header.extend_from_slice(b"data");
+    header.extend_from_slice(&data_bytes.to_le_bytes());
+    file.write_all(&header).map_err(|e| format!("Failed to write wav header: {}", e))?;
+    Ok(())
+}
+
 fn downmix(raw: &[f32], channels: u16) -> Vec<f32> {
     if channels > 1 {
         let ch = channels as usize;
@@ -434,5 +706,24 @@ mod tests {
         let resampled_long = resample_linear(&input_long, 48000, 16000);
         assert_eq!(resampled_long.len(), 16000);
         assert!((resampled_long[0] - 0.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn wav_sink_writes_a_readable_file() {
+        let path = std::env::temp_dir().join(format!("lipi_wav_sink_{}.wav", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut sink = WavSink::create(&path).unwrap();
+            sink.write_f32(&[0.0, 0.5, -0.5, 1.0]).unwrap();
+            sink.finish().unwrap();
+        }
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().sample_rate, 16_000);
+        let samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
+        assert_eq!(samples.len(), 4);
+        assert!(samples[1] > 0);
+        assert!(samples[2] < 0);
+        let _ = std::fs::remove_file(&path);
     }
 }

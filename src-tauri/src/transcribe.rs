@@ -62,6 +62,31 @@ pub fn requires_cloudflare_json(model: &str) -> bool {
     lower.contains("large-v3") || lower.contains("turbo") || lower.contains("whisper-large")
 }
 
+pub fn describe_api_error(status: u16, body_text: &str) -> String {
+    let err_summary = if let Ok(json) = serde_json::from_str::<Value>(body_text) {
+        if let Some(msg) = json
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|obj| obj.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            format!("Cloudflare API error: {}", msg)
+        } else if let Some(msg) = json
+            .get("error")
+            .and_then(|e| e.get("message").or(Some(e)))
+            .and_then(|m| m.as_str())
+        {
+            format!("API error: {}", msg)
+        } else {
+            format!("API error (HTTP {}): {}", status, body_text)
+        }
+    } else {
+        format!("API error (HTTP {}): {}", status, body_text)
+    };
+    err_summary
+}
+
 pub async fn transcribe_audio(
     wav_bytes: Vec<u8>,
     base_url: &str,
@@ -69,6 +94,8 @@ pub async fn transcribe_audio(
     model: &str,
     language: Option<&str>,
     timeout_secs: u64,
+    file_name: &str,
+    mime: &str,
 ) -> Result<String, String> {
     let trimmed_base = base_url.trim();
     if trimmed_base.is_empty() {
@@ -138,9 +165,14 @@ pub async fn transcribe_audio(
         (st, txt)
     } else {
         // OpenAI-compatible multipart form
+        let owned_name = if file_name.trim().is_empty() {
+            "recording.wav".to_string()
+        } else {
+            file_name.to_string()
+        };
         let file_part = Part::bytes(wav_bytes)
-            .file_name("recording.wav")
-            .mime_str("audio/wav")
+            .file_name(owned_name)
+            .mime_str(if mime.trim().is_empty() { "audio/wav" } else { mime })
             .map_err(|e| format!("Failed to create audio part: {}", e))?;
 
         let mut form = Form::new()
@@ -178,27 +210,7 @@ pub async fn transcribe_audio(
     };
 
     if !status.is_success() {
-        let err_summary = if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
-            if let Some(msg) = json
-                .get("errors")
-                .and_then(|e| e.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|obj| obj.get("message"))
-                .and_then(|m| m.as_str())
-            {
-                format!("Cloudflare API error: {}", msg)
-            } else if let Some(msg) = json
-                .get("error")
-                .and_then(|e| e.get("message").or(Some(e)))
-                .and_then(|m| m.as_str())
-            {
-                format!("API error: {}", msg)
-            } else {
-                format!("API error (HTTP {}): {}", status.as_u16(), body_text)
-            }
-        } else {
-            format!("API error (HTTP {}): {}", status.as_u16(), body_text)
-        };
+        let err_summary = describe_api_error(status.as_u16(), &body_text);
 
         eprintln!(
             "[Transcribe Failed]\n  Summary: {}\n  URL: {}\n  Model: {}\n  Raw: {}",
@@ -258,6 +270,14 @@ pub async fn transcribe_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_error_keeps_the_provider_size_message() {
+        let body = r#"{"error":{"message":"Maximum content size limit (26214400) exceeded","type":"invalid_request_error"}}"#;
+        let msg = describe_api_error(413, body);
+        assert!(msg.contains("Maximum content size limit (26214400) exceeded"));
+        assert!(!msg.contains("invalid_request_error"));
+    }
 
     #[test]
     fn test_target_url_resolution() {

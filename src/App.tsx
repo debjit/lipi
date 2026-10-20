@@ -7,6 +7,8 @@ import { enable as enableAutostart, disable as disableAutostart, isEnabled as is
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 import { SetupWizard } from "./SetupWizard";
+import { LanguagePicker } from "./LanguagePicker";
+import { Meetings } from "./Meetings";
 
 interface Note {
   id: number;
@@ -122,6 +124,14 @@ interface OperationResult {
   cf_cost?: number | null;
 }
 
+interface AudioCapture {
+  id: number;
+  name: string;
+  bytes: number;
+  error: string;
+  created_at: string;
+}
+
 interface CloudflareUsageSummary {
   today: CloudflareUsagePeriod;
   current_month: CloudflareUsagePeriod;
@@ -135,6 +145,12 @@ function formatNeurons(n: number): string {
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   if (n % 1 !== 0) return n.toFixed(1);
   return Math.round(n).toString();
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
 }
 
 function formatCostUsd(c: number): string {
@@ -277,8 +293,9 @@ export default function App() {
   const [copiedNotification, setCopiedNotification] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [captures, setCaptures] = useState<AudioCapture[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [activeView, setActiveView] = useState<"notes" | "settings">("notes");
+  const [activeView, setActiveView] = useState<"notes" | "settings" | "meetings">("notes");
   const [miniMode, setMiniMode] = useState(false);
   const [appVersion, setAppVersion] = useState("");
   const [updateNotice, setUpdateNotice] = useState<UpdateNotice | null>(null);
@@ -605,7 +622,14 @@ export default function App() {
   const lastToggleTimeRef = useRef(0);
 
   useEffect(() => {
+    return listenForever("meeting_error", () => {
+      void loadCaptures();
+    });
+  }, []);
+
+  useEffect(() => {
     loadNotes();
+    loadCaptures();
     loadSettings();
     loadLlmSettings();
     loadCfUsage();
@@ -931,6 +955,15 @@ export default function App() {
       setNotes(list);
     } catch (e) {
       console.error("Failed to load notes:", e);
+    }
+  }
+
+  async function loadCaptures() {
+    try {
+      const list: AudioCapture[] = await invoke("list_audio_captures");
+      setCaptures(list);
+    } catch (e) {
+      console.error("Failed to load saved audio:", e);
     }
   }
 
@@ -1588,6 +1621,135 @@ export default function App() {
   }
   discardRecordingRef.current = () => { void discardRecording(); };
 
+  async function commitTranscript(
+    transcript: string,
+    itemNeurons: number | null,
+    itemCost: number | null,
+    mode: { createNew: boolean; wasLive: boolean; liveBase: string; liveNoteId: number | null },
+  ) {
+    const spoken = transcript.trim();
+    if (!spoken) return;
+    const shouldCreateNewNote = mode.createNew;
+    const wasLive = mode.wasLive;
+    const liveBase = mode.liveBase;
+    const liveNoteId = mode.liveNoteId;
+    await loadCfUsage();
+
+    const isCfAsr = settingsRef.current.engine_mode === "cloud" && (settingsRef.current.api_base_url || "").includes("api.cloudflare.com");
+    const isLocalAsr = settingsRef.current.engine_mode === "local";
+    const isTinyEn = isCfAsr && (settingsRef.current.model || "").includes("tiny");
+
+    let asrMsg = `Transcribed ${spoken.split(/\s+/).filter(Boolean).length} words.`;
+    if (isTinyEn) {
+      asrMsg += ` (whisper-tiny-en · Beta)`;
+    } else if (isCfAsr) {
+      if (itemNeurons !== null && itemNeurons !== undefined) {
+        asrMsg += ` Consumed: ${formatNeurons(itemNeurons)} Ⓝ (${formatCostUsd(itemCost || 0)})`;
+      }
+    } else if (isLocalAsr) {
+      asrMsg += ` (Local engine - zero cost)`;
+    }
+
+    let asrDetails = `Result: "${spoken.slice(0, 200)}${spoken.length > 200 ? "..." : ""}"`;
+    if (isTinyEn) {
+      asrDetails += `\n\nCloudflare Workers AI (whisper-tiny-en Beta · Fast) - zero neuron billing.`;
+    } else if (isCfAsr) {
+      if (itemNeurons !== null && itemNeurons !== undefined) {
+        asrDetails += `\n\nCloudflare ASR Consumed: ${formatNeurons(itemNeurons)} Neurons (~${formatCostUsd(itemCost || 0)})`;
+      }
+    } else if (isLocalAsr) {
+      asrDetails += `\n\nLocal engine (${settingsRef.current.local_engine}) - 100% offline, zero cloud cost.`;
+    }
+
+    if (llmSettingsRef.current.enabled) {
+      let nextRaw: string;
+      let targetNoteId: number | null;
+
+      if (shouldCreateNewNote) {
+        nextRaw = spoken;
+        targetNoteId = wasLive ? liveNoteId : null;
+        setLlmResult("");
+      } else if (wasLive) {
+        const base = liveBase.trim();
+        nextRaw = base ? `${base} ${spoken}` : spoken;
+        targetNoteId = liveNoteId;
+      } else {
+        const currentRaw = rawTranscriptRef.current;
+        nextRaw = currentRaw ? `${currentRaw.trim()} ${spoken}` : spoken;
+        targetNoteId = activeIdRef.current;
+      }
+
+      setRawTranscript(nextRaw);
+      rawTranscriptRef.current = nextRaw;
+      setContent(nextRaw);
+      await persistNote(nextRaw, targetNoteId);
+
+      addLog({
+        level: "success",
+        title: "Transcription Successful",
+        engine: settingsRef.current.engine_mode === "cloud" ? (isCfAsr ? "Cloudflare Workers AI" : "Remote API") : `Local (${settingsRef.current.local_engine})`,
+        model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
+        endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
+        message: asrMsg,
+        details: asrDetails,
+      });
+
+      if (llmSettingsRef.current.auto_mode) {
+        await handleTransform(nextRaw, true);
+      } else {
+        await deliverTranscript(spoken, "✓ Transcribed to raw buffer!");
+      }
+    } else {
+      let nextContent: string;
+      let targetNoteId: number | null;
+
+      if (shouldCreateNewNote) {
+        nextContent = spoken;
+        targetNoteId = wasLive ? liveNoteId : null;
+        setLlmResult("");
+      } else if (wasLive) {
+        const base = liveBase.trim();
+        nextContent = base ? `${base} ${spoken}` : spoken;
+        targetNoteId = liveNoteId;
+      } else {
+        const current = activeContentRef.current;
+        nextContent = current ? `${current.trim()} ${spoken}` : spoken;
+        targetNoteId = activeIdRef.current;
+      }
+
+      setContent(nextContent);
+      setRawTranscript(nextContent);
+      rawTranscriptRef.current = nextContent;
+      await persistNote(nextContent, targetNoteId);
+
+      addLog({
+        level: "success",
+        title: "Transcription Successful",
+        engine: settingsRef.current.engine_mode === "cloud" ? (isCfAsr ? "Cloudflare Workers AI" : "Remote API") : `Local (${settingsRef.current.local_engine})`,
+        model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
+        endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
+        message: asrMsg,
+        details: asrDetails,
+      });
+
+      await deliverTranscript(spoken, "✓ Transcribed!");
+    }
+  }
+
+  function reportTranscribeError(errStr: string) {
+    setErrorMsg(errStr);
+    addLog({
+      level: "error",
+      title: "Transcription Failed",
+      engine: settingsRef.current.engine_mode === "cloud" ? "Remote API" : `Local (${settingsRef.current.local_engine})`,
+      model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
+      endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
+      message: errStr,
+      details: `Timestamp: ${new Date().toISOString()}\nEngine Mode: ${settingsRef.current.engine_mode}${settingsRef.current.engine_mode === "local" ? ` (${settingsRef.current.local_engine})` : ""}\nModel: ${settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : (settingsRef.current.local_model_size || "(default)")}\nEndpoint: ${settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.api_base_url || "(default)") : "(local)"}\nError:\n${errStr}`,
+    });
+    void loadCaptures();
+  }
+
   async function toggleRecording(source: "shortcut" | "manual" = "manual") {
     const now = Date.now();
     if (now - lastToggleTimeRef.current < 350) return;
@@ -1672,122 +1834,15 @@ export default function App() {
           const shouldCreateNewNote =
             (isMini && (settingsRef.current.mini_record_mode !== "append")) ||
             (isShortcut && (settingsRef.current.shortcut_record_mode !== "append"));
-          await loadCfUsage();
-
-          const isCfAsr = settingsRef.current.engine_mode === "cloud" && (settingsRef.current.api_base_url || "").includes("api.cloudflare.com");
-          const isLocalAsr = settingsRef.current.engine_mode === "local";
-          const isTinyEn = isCfAsr && (settingsRef.current.model || "").includes("tiny");
-
-          let asrMsg = `Transcribed ${transcript.trim().split(/\s+/).filter(Boolean).length} words.`;
-          if (isTinyEn) {
-            asrMsg += ` (whisper-tiny-en · Beta)`;
-          } else if (isCfAsr) {
-            if (itemNeurons !== null && itemNeurons !== undefined) {
-              asrMsg += ` Consumed: ${formatNeurons(itemNeurons)} Ⓝ (${formatCostUsd(itemCost || 0)})`;
-            }
-          } else if (isLocalAsr) {
-            asrMsg += ` (Local engine - zero cost)`;
-          }
-
-          let asrDetails = `Result: "${transcript.slice(0, 200)}${transcript.length > 200 ? "..." : ""}"`;
-          if (isTinyEn) {
-            asrDetails += `\n\nCloudflare Workers AI (whisper-tiny-en Beta · Fast) - zero neuron billing.`;
-          } else if (isCfAsr) {
-            if (itemNeurons !== null && itemNeurons !== undefined) {
-              asrDetails += `\n\nCloudflare ASR Consumed: ${formatNeurons(itemNeurons)} Neurons (~${formatCostUsd(itemCost || 0)})`;
-            }
-          } else if (isLocalAsr) {
-            asrDetails += `\n\nLocal engine (${settingsRef.current.local_engine}) - 100% offline, zero cloud cost.`;
-          }
-
-          if (llmSettingsRef.current.enabled) {
-            // Dual-field multi-clip accumulation or fresh item
-            let nextRaw: string;
-            let targetNoteId: number | null;
-
-            if (shouldCreateNewNote) {
-              nextRaw = transcript;
-              targetNoteId = wasLive ? liveNoteId : null;
-              setLlmResult("");
-            } else if (wasLive) {
-              const base = liveBase.trim();
-              nextRaw = base ? `${base} ${transcript}` : transcript;
-              targetNoteId = liveNoteId;
-            } else {
-              const currentRaw = rawTranscriptRef.current;
-              nextRaw = currentRaw ? `${currentRaw.trim()} ${transcript}` : transcript;
-              targetNoteId = activeIdRef.current;
-            }
-
-            setRawTranscript(nextRaw);
-            rawTranscriptRef.current = nextRaw;
-            setContent(nextRaw);
-            await persistNote(nextRaw, targetNoteId);
-
-            addLog({
-              level: "success",
-              title: "Transcription Successful",
-              engine: settingsRef.current.engine_mode === "cloud" ? (isCfAsr ? "Cloudflare Workers AI" : "Remote API") : `Local (${settingsRef.current.local_engine})`,
-              model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
-              endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
-              message: asrMsg,
-              details: asrDetails,
-            });
-
-            if (llmSettingsRef.current.auto_mode) {
-              await handleTransform(nextRaw, true);
-            } else {
-              await deliverTranscript(transcript, "✓ Transcribed to raw buffer!");
-            }
-          } else {
-            // Standard scratchpad behavior or fresh item
-            let nextContent: string;
-            let targetNoteId: number | null;
-
-            if (shouldCreateNewNote) {
-              nextContent = transcript;
-              targetNoteId = wasLive ? liveNoteId : null;
-              setLlmResult("");
-            } else if (wasLive) {
-              const base = liveBase.trim();
-              nextContent = base ? `${base} ${transcript}` : transcript;
-              targetNoteId = liveNoteId;
-            } else {
-              const current = activeContentRef.current;
-              nextContent = current ? `${current.trim()} ${transcript}` : transcript;
-              targetNoteId = activeIdRef.current;
-            }
-
-            setContent(nextContent);
-            setRawTranscript(nextContent);
-            rawTranscriptRef.current = nextContent;
-            await persistNote(nextContent, targetNoteId);
-
-            addLog({
-              level: "success",
-              title: "Transcription Successful",
-              engine: settingsRef.current.engine_mode === "cloud" ? (isCfAsr ? "Cloudflare Workers AI" : "Remote API") : `Local (${settingsRef.current.local_engine})`,
-              model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
-              endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
-              message: asrMsg,
-              details: asrDetails,
-            });
-
-            await deliverTranscript(transcript, "✓ Transcribed!");
-          }
+          await commitTranscript(transcript, itemNeurons, itemCost, {
+            createNew: shouldCreateNewNote,
+            wasLive,
+            liveBase,
+            liveNoteId,
+          });
         }
       } catch (err: any) {
-        const errStr = String(err);
-        setErrorMsg(errStr);
-        addLog({
-          level: "error",
-          title: "Transcription Failed",
-          engine: settingsRef.current.engine_mode === "cloud" ? "Remote API" : `Local (${settingsRef.current.local_engine})`,
-          model: settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : settingsRef.current.local_model_size,
-          endpoint: settingsRef.current.engine_mode === "cloud" ? settingsRef.current.api_base_url : undefined,
-          message: errStr,
-          details: `Timestamp: ${new Date().toISOString()}\nEngine Mode: ${settingsRef.current.engine_mode}${settingsRef.current.engine_mode === "local" ? ` (${settingsRef.current.local_engine})` : ""}\nModel: ${settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.model || "(default)") : (settingsRef.current.local_model_size || "(default)")}\nEndpoint: ${settingsRef.current.engine_mode === "cloud" ? (settingsRef.current.api_base_url || "(default)") : "(local)"}\nError:\n${errStr}`,
-        });
+        reportTranscribeError(String(err));
       } finally {
         recordingOpInFlightRef.current = false;
         setIsTranscribing(false);
@@ -1804,11 +1859,74 @@ export default function App() {
     void toggleRecording(source);
   };
 
+  async function applySavedTranscript(res: OperationResult) {
+    const transcript = (res?.text || "").trim();
+    if (!transcript) {
+      reportTranscribeError("The provider returned an empty transcript.");
+      return;
+    }
+    await commitTranscript(transcript, res.cf_neurons ?? null, res.cf_cost ?? null, {
+      createNew: false,
+      wasLive: false,
+      liveBase: "",
+      liveNoteId: null,
+    });
+  }
+
+  async function uploadAudio() {
+    if (isRecordingRef.current || isTranscribingRef.current) return;
+    setErrorMsg(null);
+    let path: string | null = null;
+    try {
+      path = await invoke<string | null>("pick_audio_path");
+    } catch (err: any) {
+      reportTranscribeError(String(err));
+      return;
+    }
+    if (!path) return;
+    setIsTranscribing(true);
+    try {
+      const res = await invoke<OperationResult>("transcribe_upload", { path });
+      await applySavedTranscript(res);
+      await loadCaptures();
+    } catch (err: any) {
+      reportTranscribeError(String(err));
+    } finally {
+      setIsTranscribing(false);
+      refreshMemoryStatus();
+    }
+  }
+
+  async function retryCapture(id: number) {
+    if (isRecordingRef.current || isTranscribingRef.current) return;
+    setErrorMsg(null);
+    setIsTranscribing(true);
+    try {
+      const res = await invoke<OperationResult>("retry_audio_capture", { id });
+      await applySavedTranscript(res);
+      await loadCaptures();
+    } catch (err: any) {
+      reportTranscribeError(String(err));
+    } finally {
+      setIsTranscribing(false);
+      refreshMemoryStatus();
+    }
+  }
+
+  async function discardCapture(id: number) {
+    try {
+      await invoke("delete_audio_capture", { id });
+      setCaptures((current) => current.filter((item) => item.id !== id));
+    } catch (err: any) {
+      setErrorMsg(String(err));
+    }
+  }
+
   async function toggleMiniMode(enable: boolean) {
     try {
       await invoke("set_mini_mode", { mini: enable });
       setMiniMode(enable);
-      setErrorMsg(null);
+      if (enable) setErrorMsg(null);
     } catch (e: any) {
       console.error("Failed to toggle mini mode:", e);
     }
@@ -1911,6 +2029,18 @@ export default function App() {
     setLlmResult("");
     llmResultRef.current = "";
     setErrorMsg(null);
+  }
+
+  async function openMeetingNote(id: number) {
+    try {
+      const list: Note[] = await invoke("get_notes");
+      setNotes(list);
+      const note = list.find((item) => item.id === id);
+      if (note) handleSelectNote(note);
+      setActiveView("notes");
+    } catch (err) {
+      setErrorMsg(String(err));
+    }
   }
 
   function handleSelectNote(note: Note) {
@@ -2131,6 +2261,12 @@ export default function App() {
           </span>
         )}
 
+        {errorMsg && !isRecording && !isTranscribing && !isTransforming && (
+          <span className="mini-error-mark" title={errorMsg} onMouseDown={(e) => e.stopPropagation()}>
+            !
+          </span>
+        )}
+
         {isRecording && (
           <button
             type="button"
@@ -2157,6 +2293,20 @@ export default function App() {
         >
           ⛶
         </button>
+      </div>
+    );
+  }
+
+  if (activeView === "meetings") {
+    return (
+      <div className="app-container">
+        <Meetings
+          onBack={() => setActiveView("notes")}
+          onOpenNote={(id) => {
+            void openMeetingNote(id);
+          }}
+          onOpenPreferences={() => openSettings("preferences")}
+        />
       </div>
     );
   }
@@ -3354,103 +3504,12 @@ export default function App() {
                 <span>Speech Recognition Language</span>
               </div>
 
-              <div className="form-group">
-                <label className="form-label">Spoken Language</label>
-                <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
-                  <select
-                    className="form-input form-select"
-                    style={{ maxWidth: "260px" }}
-                    value={
-                      [
-                        "",
-                        "en",
-                        "bn",
-                        "hi",
-                        "es",
-                        "fr",
-                        "de",
-                        "zh",
-                        "ja",
-                        "ar",
-                        "pt",
-                        "ru",
-                        "it",
-                        "ko",
-                      ].includes(settings.language || "")
-                        ? settings.language || ""
-                        : "custom"
-                    }
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      if (val !== "custom") {
-                        setSettings({ ...settings, language: val });
-                        updateAndSaveSettings({ language: val });
-                      }
-                    }}
-                  >
-                    <option value="">🌐 Auto-Detect (Multilingual)</option>
-                    <option value="en">🇺🇸 English (en)</option>
-                    <option value="bn">🇧🇩 Bengali / বাংলা (bn)</option>
-                    <option value="hi">🇮🇳 Hindi / हिन्दी (hi)</option>
-                    <option value="es">🇪🇸 Spanish / Español (es)</option>
-                    <option value="fr">🇫🇷 French / Français (fr)</option>
-                    <option value="de">🇩🇪 German / Deutsch (de)</option>
-                    <option value="zh">🇨🇳 Chinese / 中文 (zh)</option>
-                    <option value="ja">🇯🇵 Japanese / 日本語 (ja)</option>
-                    <option value="ar">🇸🇦 Arabic / العربية (ar)</option>
-                    <option value="pt">🇵🇹 Portuguese / Português (pt)</option>
-                    <option value="ru">🇷🇺 Russian / Русский (ru)</option>
-                    <option value="it">🇮🇹 Italian / Italiano (it)</option>
-                    <option value="ko">🇰🇷 Korean / 한국어 (ko)</option>
-                    <option value="custom">🛠 Custom ISO Code...</option>
-                  </select>
-
-                  <input
-                    type="text"
-                    className="form-input"
-                    style={{ maxWidth: "160px" }}
-                    placeholder="ISO code (e.g. en, bn)"
-                    value={settings.language || ""}
-                    onChange={(e) =>
-                      setSettings({ ...settings, language: e.target.value })
-                    }
-                    onBlur={() => updateAndSaveSettings({ language: settings.language })}
-                  />
-                </div>
-                <span className="form-hint">
-                  Explicitly choosing your spoken language avoids Whisper's automatic language detection step, reducing latency and avoiding mistaken language detection on short utterances.
-                </span>
-              </div>
-
-              <div className="language-quick-chips">
-                {[
-                  { code: "", label: "Auto-detect" },
-                  { code: "en", label: "English" },
-                  { code: "bn", label: "Bengali (বাংলা)" },
-                  { code: "hi", label: "Hindi (हिन्दी)" },
-                  { code: "es", label: "Spanish" },
-                  { code: "fr", label: "French" },
-                  { code: "de", label: "German" },
-                  { code: "zh", label: "Chinese" },
-                  { code: "ja", label: "Japanese" },
-                ].map((lang) => {
-                  const isSel = (settings.language || "") === lang.code;
-                  return (
-                    <button
-                      key={lang.code || "auto"}
-                      type="button"
-                      className={`provider-chip ${isSel ? "active" : ""}`}
-                      style={{ fontSize: "11px", padding: "3px 8px" }}
-                      onClick={() => {
-                        setSettings({ ...settings, language: lang.code });
-                        updateAndSaveSettings({ language: lang.code });
-                      }}
-                    >
-                      {lang.label}
-                    </button>
-                  );
-                })}
-              </div>
+              <LanguagePicker
+                value={settings.language || ""}
+                engineMode={settings.engine_mode}
+                modelId={settings.engine_mode === "local" ? settings.local_model_size : settings.model || ""}
+                onChange={(code) => updateAndSaveSettings({ language: code })}
+              />
             </div>
           </>
         )}
@@ -4395,6 +4454,14 @@ export default function App() {
             <div className="navbar-right">
               <button
                 type="button"
+                className="btn btn-secondary"
+                onClick={() => setActiveView("meetings")}
+                title="Record a meeting and save notes"
+              >
+                Meetings
+              </button>
+              <button
+                type="button"
                 className="btn btn-secondary nav-btn-mini"
                 onClick={() => toggleMiniMode(true)}
                 title="Switch to compact floating wizard (Alt+M)"
@@ -4543,6 +4610,46 @@ export default function App() {
                   🔍 View Logs in Settings
                 </button>
               </div>
+            </div>
+          )}
+
+          {captures.length > 0 && (
+            <div className="saved-audio">
+              <div className="saved-audio-title">Saved audio</div>
+              <p className="saved-audio-hint">
+                These recordings stayed on this computer after transcription failed. Switch provider in Settings, then retry.
+              </p>
+              <ul className="saved-audio-list">
+                {captures.map((item) => (
+                  <li key={item.id} className="saved-audio-item">
+                    <div className="saved-audio-meta">
+                      <span className="saved-audio-name" title={item.name}>{item.name}</span>
+                      <span className="saved-audio-size">{formatBytes(item.bytes)}</span>
+                    </div>
+                    {item.error && (
+                      <div className="saved-audio-error" title={item.error}>{item.error}</div>
+                    )}
+                    <div className="saved-audio-actions">
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-compact"
+                        onClick={() => retryCapture(item.id)}
+                        disabled={isRecording || isTranscribing || isTransforming}
+                      >
+                        Retry
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-compact"
+                        onClick={() => discardCapture(item.id)}
+                        disabled={isTranscribing}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
 
@@ -4794,6 +4901,14 @@ export default function App() {
                 title="Copy current note to clipboard"
               >
                 <span>📋</span> <span className="btn-label-text">Copy Note</span>
+              </button>
+              <button
+                className="btn btn-secondary"
+                onClick={() => uploadAudio()}
+                disabled={isRecording || isTranscribing || isTransforming}
+                title="Transcribe a WAV, MP3, M4A, OGG, WebM, or FLAC file"
+              >
+                <span>⤴</span> <span className="btn-label-text">Upload</span>
               </button>
             </div>
 
