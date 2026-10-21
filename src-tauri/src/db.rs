@@ -24,6 +24,8 @@ pub struct MeetingSession {
     pub summary: String,
     pub decisions: String,
     pub note_id: Option<i64>,
+    pub style_id: String,
+    pub style_prefix: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -54,6 +56,8 @@ pub struct AudioCapture {
     pub bytes: i64,
     pub error: String,
     pub created_at: String,
+    pub session_id: Option<i64>,
+    pub start_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -166,6 +170,13 @@ pub fn cf_llm_neurons(model: &str, prompt_tokens: u32, completion_tokens: u32) -
 }
 
 
+fn session_link_from_name(name: &str) -> Option<(i64, i64)> {
+    let stem = Path::new(name).file_stem()?.to_str()?;
+    let rest = stem.strip_prefix("meeting-")?;
+    let (id, ms) = rest.rsplit_once('-')?;
+    Some((id.parse().ok()?, ms.parse().ok()?))
+}
+
 pub struct Database {
     conn: std::sync::Mutex<Connection>,
 }
@@ -237,7 +248,11 @@ impl Database {
                 status TEXT NOT NULL DEFAULT 'recording',
                 summary TEXT NOT NULL DEFAULT '',
                 decisions TEXT NOT NULL DEFAULT '[]',
-                note_id INTEGER
+                note_id INTEGER,
+                voice_preset TEXT NOT NULL DEFAULT '',
+                custom_prompt TEXT NOT NULL DEFAULT '',
+                style_id TEXT NOT NULL DEFAULT '',
+                style_prefix TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS segments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -264,10 +279,34 @@ impl Database {
                 path TEXT NOT NULL,
                 bytes INTEGER NOT NULL,
                 error TEXT NOT NULL DEFAULT '',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                session_id INTEGER,
+                start_ms INTEGER
             );
             ",
         )?;
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN voice_preset TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN custom_prompt TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN style_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN style_prefix TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE audio_captures ADD COLUMN session_id INTEGER", []);
+        let _ = conn.execute("ALTER TABLE audio_captures ADD COLUMN start_ms INTEGER", []);
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_captures_session ON audio_captures(session_id)",
+            [],
+        );
 
         // A previous run may have stopped while the mic or the summary was still open.
         let _ = conn.execute(
@@ -575,11 +614,17 @@ impl Database {
         Ok(())
     }
 
-    pub fn create_session(&self, language: &str, started_epoch: i64) -> Result<MeetingSession, String> {
+    pub fn create_session(
+        &self,
+        language: &str,
+        started_epoch: i64,
+        style_id: &str,
+        style_prefix: &str,
+    ) -> Result<MeetingSession, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
-            "INSERT INTO sessions (title, language, started_epoch, status) VALUES ('Meeting', ?1, ?2, 'recording')",
-            params![language, started_epoch],
+            "INSERT INTO sessions (title, language, started_epoch, status, style_id, style_prefix) VALUES ('Meeting', ?1, ?2, 'recording', ?3, ?4)",
+            params![language, started_epoch, style_id, style_prefix],
         )
         .map_err(|e| e.to_string())?;
         let id = conn.last_insert_rowid();
@@ -617,12 +662,42 @@ impl Database {
         Ok(())
     }
 
+    /// Rewrites the summary fields and leaves the original end time in place.
+    pub fn update_session_summary(
+        &self,
+        id: i64,
+        title: &str,
+        summary: &str,
+        decisions: &str,
+        note_id: Option<i64>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE sessions SET title = ?1, summary = ?2, decisions = ?3, note_id = ?4, status = 'ready' WHERE id = ?5",
+            params![title, summary, decisions, note_id, id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// Moves a session into summarizing. Returns false when another caller already claimed it.
     pub fn claim_session_summary(&self, id: i64) -> Result<bool, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let changed = conn
             .execute(
                 "UPDATE sessions SET status = 'summarizing' WHERE id = ?1 AND status IN ('recording', 'interrupted')",
+                params![id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(changed == 1)
+    }
+
+    /// Claims a finished or interrupted meeting so its note can be written again.
+    pub fn claim_session_rewrite(&self, id: i64) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let changed = conn
+            .execute(
+                "UPDATE sessions SET status = 'summarizing' WHERE id = ?1 AND status IN ('ready', 'interrupted')",
                 params![id],
             )
             .map_err(|e| e.to_string())?;
@@ -660,11 +735,13 @@ impl Database {
             summary: row.get(8)?,
             decisions: row.get(9)?,
             note_id: row.get(10)?,
+            style_id: row.get(11)?,
+            style_prefix: row.get(12)?,
         })
     }
 
     const SESSION_COLS: &'static str =
-        "id, title, language, started_at, started_epoch, ended_at, audio_path, status, summary, decisions, note_id";
+        "id, title, language, started_at, started_epoch, ended_at, audio_path, status, summary, decisions, note_id, style_id, style_prefix";
 
     pub fn get_session(&self, id: i64) -> Result<MeetingSession, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
@@ -852,17 +929,41 @@ impl Database {
         Ok(session)
     }
 
+    fn map_capture(row: &rusqlite::Row<'_>) -> rusqlite::Result<AudioCapture> {
+        let name: String = row.get(1)?;
+        let mut session_id: Option<i64> = row.get(6)?;
+        let mut start_ms: Option<i64> = row.get(7)?;
+        if session_id.is_none() {
+            if let Some((id, ms)) = session_link_from_name(&name) {
+                session_id = Some(id);
+                start_ms = Some(ms);
+            }
+        }
+        Ok(AudioCapture {
+            id: row.get(0)?,
+            name,
+            path: row.get(2)?,
+            bytes: row.get(3)?,
+            error: row.get(4)?,
+            created_at: row.get(5)?,
+            session_id,
+            start_ms,
+        })
+    }
+
     pub fn insert_audio_capture(
         &self,
         name: &str,
         path: &str,
         bytes: i64,
         error: &str,
+        session_id: Option<i64>,
+        start_ms: Option<i64>,
     ) -> Result<AudioCapture, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
-            "INSERT INTO audio_captures (name, path, bytes, error) VALUES (?1, ?2, ?3, ?4)",
-            params![name, path, bytes, error],
+            "INSERT INTO audio_captures (name, path, bytes, error, session_id, start_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![name, path, bytes, error, session_id, start_ms],
         )
         .map_err(|e| e.to_string())?;
         let id = conn.last_insert_rowid();
@@ -873,18 +974,9 @@ impl Database {
     pub fn get_audio_capture(&self, id: i64) -> Result<AudioCapture, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.query_row(
-            "SELECT id, name, path, bytes, error, created_at FROM audio_captures WHERE id = ?1",
+            "SELECT id, name, path, bytes, error, created_at, session_id, start_ms FROM audio_captures WHERE id = ?1",
             params![id],
-            |row| {
-                Ok(AudioCapture {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    path: row.get(2)?,
-                    bytes: row.get(3)?,
-                    error: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            },
+            Self::map_capture,
         )
         .map_err(|e| e.to_string())
     }
@@ -892,25 +984,29 @@ impl Database {
     pub fn list_audio_captures(&self) -> Result<Vec<AudioCapture>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
-            .prepare("SELECT id, name, path, bytes, error, created_at FROM audio_captures ORDER BY id DESC")
+            .prepare("SELECT id, name, path, bytes, error, created_at, session_id, start_ms FROM audio_captures ORDER BY id DESC")
             .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(AudioCapture {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    path: row.get(2)?,
-                    bytes: row.get(3)?,
-                    error: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            })
-            .map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], Self::map_capture).map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row.map_err(|e| e.to_string())?);
         }
         Ok(out)
+    }
+
+    pub fn list_session_captures(&self, session_id: i64) -> Result<Vec<AudioCapture>, String> {
+        let all = self.list_audio_captures()?;
+        Ok(all.into_iter().filter(|row| row.session_id == Some(session_id)).collect())
+    }
+
+    pub fn delete_session_captures(&self, session_id: i64) -> Result<Vec<AudioCapture>, String> {
+        let rows = self.list_session_captures(session_id)?;
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        for row in &rows {
+            conn.execute("DELETE FROM audio_captures WHERE id = ?1", params![row.id])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(rows)
     }
 
     pub fn update_audio_capture_error(&self, id: i64, error: &str) -> Result<(), String> {
@@ -1200,9 +1296,11 @@ mod tests {
     #[test]
     fn test_meeting_sessions_segments_and_actions() {
         let db = Database::new(":memory:").unwrap();
-        let session = db.create_session("bn", 1_700_000_000).unwrap();
+        let session = db.create_session("bn", 1_700_000_000, "brief", "Keep it short.").unwrap();
         assert_eq!(session.status, "recording");
         assert_eq!(session.language, "bn");
+        assert_eq!(session.style_id, "brief");
+        assert_eq!(session.style_prefix, "Keep it short.");
 
         db.set_session_audio_path(session.id, "/tmp/audio.wav").unwrap();
         let seg = db.insert_segment(session.id, 0, 1500, "hello").unwrap();

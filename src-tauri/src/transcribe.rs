@@ -62,6 +62,50 @@ pub fn requires_cloudflare_json(model: &str) -> bool {
     lower.contains("large-v3") || lower.contains("turbo") || lower.contains("whisper-large")
 }
 
+pub fn accept_asr_text(text: &str, samples: usize) -> Option<&str> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if samples > 0 && samples <= 16_000 * 4 && is_short_clip_filler(text) {
+        return None;
+    }
+    Some(text)
+}
+
+fn is_short_clip_filler(text: &str) -> bool {
+    let mut words = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() || c.is_whitespace() {
+            words.push(c.to_ascii_lowercase());
+        }
+    }
+    let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+    matches!(
+        words.as_str(),
+        "thank you"
+            | "thank you very much"
+            | "thanks for watching"
+            | "thanks for watching please subscribe"
+            | "please subscribe"
+            | "you"
+            | "bye"
+            | "goodbye"
+            | "okay"
+            | "ok"
+            | "so"
+            | "hmm"
+            | "uh"
+            | "um"
+            | "there you go"
+            | "lets say hello"
+            | "go back to the shop"
+            | "see you next time"
+            | "ill see you next time"
+            | "subtitles by the amara.org community"
+    )
+}
+
 pub fn describe_api_error(status: u16, body_text: &str) -> String {
     let err_summary = if let Ok(json) = serde_json::from_str::<Value>(body_text) {
         if let Some(msg) = json
@@ -270,6 +314,24 @@ pub async fn transcribe_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_clip_stock_captions_are_dropped() {
+        let short = 16_000 * 2;
+        assert!(accept_asr_text("Thank you.", short).is_none());
+        assert!(accept_asr_text("Thank you very much!", short).is_none());
+        assert!(accept_asr_text("There you go.", short).is_none());
+        assert!(accept_asr_text("Let's say hello.", short).is_none());
+        assert!(accept_asr_text("Go back to the shop.", short).is_none());
+        assert_eq!(
+            accept_asr_text("I doubled the print farm to 26 printers.", short),
+            Some("I doubled the print farm to 26 printers.")
+        );
+        assert_eq!(
+            accept_asr_text("Thank you.", 16_000 * 8),
+            Some("Thank you.")
+        );
+    }
 
     #[test]
     fn api_error_keeps_the_provider_size_message() {

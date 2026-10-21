@@ -4182,10 +4182,12 @@ optgroup {
 .meetings-detail {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   padding: 16px;
   gap: 12px;
+  overflow-y: auto;
 }
 
 .meetings-controls {
@@ -4193,6 +4195,55 @@ optgroup {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.meetings-setup {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 560px;
+}
+
+.meetings-setup h3 {
+  font-size: 20px;
+  margin: 0;
+}
+
+.meetings-setup label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.meetings-custom-prompt {
+  min-height: 88px;
+  resize: vertical;
+}
+
+.meetings-failed {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  background: rgba(251, 191, 36, 0.08);
+  border-radius: 10px;
+}
+
+.meetings-failed h4 {
+  margin: 0;
+  font-size: 13px;
+  color: #fbbf24;
+}
+
+.meetings-failed-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(251, 191, 36, 0.2);
 }
 
 .meetings-summary h3 {

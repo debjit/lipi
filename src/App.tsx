@@ -122,6 +122,7 @@ interface OperationResult {
   text: string;
   cf_neurons?: number | null;
   cf_cost?: number | null;
+  meeting_session_id?: number | null;
 }
 
 interface AudioCapture {
@@ -1903,6 +1904,11 @@ export default function App() {
     setIsTranscribing(true);
     try {
       const res = await invoke<OperationResult>("retry_audio_capture", { id });
+      if (res.meeting_session_id) {
+        showToast("Added back to the meeting.");
+        await loadCaptures();
+        return;
+      }
       await applySavedTranscript(res);
       await loadCaptures();
     } catch (err: any) {

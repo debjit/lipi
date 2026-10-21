@@ -1,6 +1,7 @@
 use crate::vad::{SileroVad, SpeechSegmenter};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
+use serde::Serialize;
 use std::fs::File;
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,20 @@ enum Job {
 pub enum MeetingAudio {
     Chunk { pcm: Vec<f32>, start_ms: u64, end_ms: u64 },
     Limit,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CaptureReport {
+    pub microphone: bool,
+    pub playback: bool,
+    pub note: String,
+}
+
+struct MicFeed {
+    samples: Arc<Mutex<Vec<f32>>>,
+    sample_rate: u32,
+    channels: u16,
+    _stream: Stream,
 }
 
 pub struct AudioRecorder {
@@ -177,19 +192,19 @@ impl AudioRecorder {
         }
     }
 
-    pub fn start_meeting(&self, wav_path: PathBuf, vad_path: PathBuf) -> Result<Receiver<MeetingAudio>, String> {
+    pub fn start_meeting(
+        &self,
+        wav_path: PathBuf,
+        vad_path: PathBuf,
+    ) -> Result<(Receiver<MeetingAudio>, CaptureReport), String> {
         self.ensure_idle()?;
         let (stop_sender, stop_receiver) = mpsc::channel::<bool>();
         let (seg_tx, seg_rx) = mpsc::channel::<MeetingAudio>();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
-        let (device, config) = input_device()?;
-        let sample_rate = config.sample_rate().0;
-        let channels = config.channels();
-        let sample_format = config.sample_format();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<CaptureReport, String>>();
 
         let handle = thread::spawn(move || {
             let mut ready = Some(ready_tx);
-            let report = |ready: &mut Option<Sender<Result<(), String>>>, res: Result<(), String>| {
+            let report = |ready: &mut Option<Sender<Result<CaptureReport, String>>>, res: Result<CaptureReport, String>| {
                 if let Some(tx) = ready.take() {
                     let _ = tx.send(res);
                 }
@@ -208,36 +223,35 @@ impl AudioRecorder {
                     return;
                 }
             };
-            let recorded = Arc::new(Mutex::new(Vec::<f32>::new()));
-            let samples = Arc::clone(&recorded);
-            let stream = match build_stream(device, config, sample_format, channels, samples) {
-                Ok(stream) => stream,
-                Err(e) => {
-                    report(&mut ready, Err(e));
+            let mic = open_microphone();
+            let playback = crate::system_audio::open_playback();
+            let (mic, playback) = match (mic, playback) {
+                (Err(mic_err), Err(play_err)) => {
+                    report(
+                        &mut ready,
+                        Err(format!(
+                            "No microphone and no system audio could be opened. Microphone: {mic_err} Playback: {play_err}"
+                        )),
+                    );
                     return;
                 }
+                (mic, playback) => (mic.ok(), playback.ok()),
             };
-            if let Err(e) = stream.play() {
-                report(&mut ready, Err(format!("Failed to start recording: {}", e)));
-                return;
-            }
-            report(&mut ready, Ok(()));
-            let _ = meeting_loop(
-                recorded,
-                channels,
-                sample_rate,
-                &mut vad,
-                sink,
-                &seg_tx,
-                stop_receiver,
+            report(
+                &mut ready,
+                Ok(CaptureReport {
+                    microphone: mic.is_some(),
+                    playback: playback.is_some(),
+                    note: capture_note(mic.is_some(), playback.is_some()),
+                }),
             );
-            drop(stream);
+            let _ = meeting_loop(mic, playback, &mut vad, sink, &seg_tx, stop_receiver);
         });
 
         match ready_rx.recv() {
-            Ok(Ok(())) => {
+            Ok(Ok(sources)) => {
                 self.store_job(stop_sender, Job::Meeting(handle), false, true)?;
-                Ok(seg_rx)
+                Ok((seg_rx, sources))
             }
             Ok(Err(e)) => {
                 let _ = handle.join();
@@ -245,7 +259,7 @@ impl AudioRecorder {
             }
             Err(_) => {
                 let _ = handle.join();
-                Err("Meeting capture thread exited before the microphone opened".into())
+                Err("Meeting capture thread exited before audio opened".into())
             }
         }
     }
@@ -453,17 +467,88 @@ fn live_loop(
     Ok(())
 }
 
+fn open_microphone() -> Result<MicFeed, String> {
+    let (device, config) = input_device()?;
+    let sample_rate = config.sample_rate().0;
+    let channels = config.channels();
+    let sample_format = config.sample_format();
+    let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let stream = build_stream(device, config, sample_format, channels, Arc::clone(&samples))?;
+    stream
+        .play()
+        .map_err(|e| format!("Failed to start the microphone: {e}"))?;
+    Ok(MicFeed {
+        samples,
+        sample_rate,
+        channels,
+        _stream: stream,
+    })
+}
+
+fn capture_note(microphone: bool, playback: bool) -> String {
+    match (microphone, playback) {
+        (true, true) => "Recording the microphone and the audio this computer is playing.".into(),
+        (true, false) => {
+            "Recording the microphone only. Headphones and webinar audio will not be in the recording.".into()
+        }
+        (false, true) => "Recording the audio this computer is playing. The microphone did not open.".into(),
+        (false, false) => "No audio source opened.".into(),
+    }
+}
+
+const MIX_LAG_SAMPLES: usize = 16_000;
+
+fn mix_capture(mic: &mut Vec<f32>, play: &mut Vec<f32>, mic_open: bool, play_open: bool) -> Vec<f32> {
+    if mic_open && play_open {
+        let ahead = mic.len().abs_diff(play.len());
+        if ahead > MIX_LAG_SAMPLES {
+            if mic.len() > play.len() {
+                let solo: Vec<f32> = mic.drain(..ahead).collect();
+                let mut mixed = solo;
+                mixed.extend(mix_pair(mic, play));
+                return mixed;
+            }
+            let solo: Vec<f32> = play.drain(..ahead).collect();
+            let mut mixed = solo;
+            mixed.extend(mix_pair(mic, play));
+            return mixed;
+        }
+        return mix_pair(mic, play);
+    }
+    if mic_open {
+        return std::mem::take(mic);
+    }
+    if play_open {
+        return std::mem::take(play);
+    }
+    Vec::new()
+}
+
+fn mix_pair(mic: &mut Vec<f32>, play: &mut Vec<f32>) -> Vec<f32> {
+    let count = mic.len().min(play.len());
+    mic.drain(..count)
+        .zip(play.drain(..count))
+        .map(|(left, right)| (left + right).clamp(-1.0, 1.0))
+        .collect()
+}
+
 fn meeting_loop(
-    recorded: Arc<Mutex<Vec<f32>>>,
-    channels: u16,
-    sample_rate: u32,
+    mic: Option<MicFeed>,
+    playback: Option<crate::system_audio::PlaybackCapture>,
     vad: &mut SileroVad,
     mut sink: WavSink,
     seg_tx: &Sender<MeetingAudio>,
     stop_receiver: Receiver<bool>,
 ) -> Result<(), String> {
-    let mut resampler = StreamResampler::new(sample_rate);
-    let mut pending = Vec::<f32>::new();
+    let mic_open = mic.is_some();
+    let play_open = playback.is_some();
+    let mic_channels = mic.as_ref().map(|feed| feed.channels).unwrap_or(1);
+    let play_channels = playback.as_ref().map(|feed| feed.channels).unwrap_or(1);
+    let mut mic_resampler = StreamResampler::new(mic.as_ref().map(|feed| feed.sample_rate).unwrap_or(16_000));
+    let mut play_resampler = StreamResampler::new(playback.as_ref().map(|feed| feed.sample_rate).unwrap_or(16_000));
+    let mut mic_pending = Vec::<f32>::new();
+    let mut play_pending = Vec::<f32>::new();
+    let mut frames = Vec::<f32>::new();
     let mut segmenter = SpeechSegmenter::new();
     let mut fed: u64 = 0;
     let mut written: u64 = 0;
@@ -483,21 +568,34 @@ fn meeting_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => Some(false),
         };
-        let raw = {
-            let mut lock = recorded.lock().map_err(|e| e.to_string())?;
-            std::mem::take(&mut *lock)
-        };
-        if !raw.is_empty() {
-            let mono = downmix(&raw, channels);
-            let samples = resampler.push(&mono);
-            if !samples.is_empty() {
-                sink.write_f32(&samples)?;
-                written += samples.len() as u64;
-                pending.extend(samples);
+        if let Some(feed) = &mic {
+            let raw = {
+                let mut lock = feed.samples.lock().map_err(|e| e.to_string())?;
+                std::mem::take(&mut *lock)
+            };
+            if !raw.is_empty() {
+                let mono = downmix(&raw, mic_channels);
+                mic_pending.extend(mic_resampler.push(&mono));
             }
         }
-        while pending.len() >= 512 {
-            let frame: Vec<f32> = pending.drain(..512).collect();
+        if let Some(feed) = &playback {
+            let raw = {
+                let mut lock = feed.samples.lock().map_err(|e| e.to_string())?;
+                std::mem::take(&mut *lock)
+            };
+            if !raw.is_empty() {
+                let mono = downmix(&raw, play_channels);
+                play_pending.extend(play_resampler.push(&mono));
+            }
+        }
+        let mixed = mix_capture(&mut mic_pending, &mut play_pending, mic_open, play_open);
+        if !mixed.is_empty() {
+            sink.write_f32(&mixed)?;
+            written += mixed.len() as u64;
+            frames.extend(mixed);
+        }
+        while frames.len() >= 512 {
+            let frame: Vec<f32> = frames.drain(..512).collect();
             fed += frame.len() as u64;
             let speech = vad.probability(&frame).unwrap_or(0.0) >= 0.5;
             if let Some(seg) = segmenter.push(&frame, speech) {
@@ -507,8 +605,8 @@ fn meeting_loop(
         let limit = written >= MEETING_MAX_SAMPLES;
         if limit || stop.is_some() {
             let flush = limit || stop == Some(true);
-            if flush && !pending.is_empty() {
-                let tail = std::mem::take(&mut pending);
+            if flush && !frames.is_empty() {
+                let tail = std::mem::take(&mut frames);
                 fed += tail.len() as u64;
                 segmenter.push_tail(&tail);
             }
@@ -706,6 +804,54 @@ mod tests {
         let resampled_long = resample_linear(&input_long, 48000, 16000);
         assert_eq!(resampled_long.len(), 16000);
         assert!((resampled_long[0] - 0.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn silence_plus_tone_keeps_the_tone() {
+        let mut mic = vec![0.0; 8];
+        let mut play = vec![0.25; 8];
+        let mixed = mix_capture(&mut mic, &mut play, true, true);
+        assert_eq!(mixed, vec![0.25; 8]);
+        assert!(mic.is_empty());
+        assert!(play.is_empty());
+    }
+
+    #[test]
+    fn loud_tones_clamp() {
+        let mut mic = vec![0.8];
+        let mut play = vec![0.8];
+        assert_eq!(mix_capture(&mut mic, &mut play, true, true), vec![1.0]);
+    }
+
+    #[test]
+    fn short_buffer_leaves_the_remainder() {
+        let mut mic = vec![0.2; 100];
+        let mut play = vec![0.3; 40];
+        let mixed = mix_capture(&mut mic, &mut play, true, true);
+        assert_eq!(mixed.len(), 40);
+        assert!((mixed[0] - 0.5).abs() < 1e-5);
+        assert_eq!(mic.len(), 60);
+        assert!(play.is_empty());
+        let rest = mix_capture(&mut mic, &mut play, true, true);
+        assert!(rest.is_empty());
+        assert_eq!(mic.len(), 60);
+    }
+
+    #[test]
+    fn a_stalled_microphone_does_not_hold_playback() {
+        let mut mic = Vec::new();
+        let mut play = vec![0.4; MIX_LAG_SAMPLES + 100];
+        let mixed = mix_capture(&mut mic, &mut play, true, true);
+        assert_eq!(mixed.len(), MIX_LAG_SAMPLES + 100);
+        assert!(play.is_empty());
+    }
+
+    #[test]
+    fn capture_note_names_the_open_sources() {
+        assert!(capture_note(true, false).contains("Headphones and webinar audio will not be in the recording"));
+        assert!(capture_note(false, true).contains("microphone did not open"));
+        assert!(capture_note(true, true).contains("microphone"));
+        assert!(capture_note(true, true).contains("audio this computer is playing"));
     }
 
     #[test]

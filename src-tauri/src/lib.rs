@@ -12,6 +12,7 @@ mod paste;
 mod presets;
 mod shortcut;
 mod specs;
+mod system_audio;
 mod transcribe;
 
 use audio::AudioRecorder;
@@ -221,6 +222,8 @@ pub struct OperationResult {
     pub text: String,
     pub cf_neurons: Option<f64>,
     pub cf_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_session_id: Option<i64>,
 }
 
 pub struct AppState {
@@ -327,7 +330,7 @@ fn spawn_live_worker(
                 }
             };
             let settings = db.get_settings().unwrap_or_default();
-            let prompt = prompt_tail(&full);
+            let samples = pcm.len();
             let language = languages::for_asr(&settings.engine_mode, &settings.local_model_size, settings.language.as_deref());
             let _ = app.emit("live_transcribing", true);
             let text = tauri::async_runtime::block_on(supervisor.transcribe(
@@ -337,7 +340,7 @@ fn spawn_live_worker(
                 language,
                 &app_data_dir,
                 models_folder(&settings),
-                prompt.as_deref(),
+                None,
             ));
             let _ = app.emit("live_transcribing", false);
             if cancel.load(Ordering::SeqCst) {
@@ -345,10 +348,9 @@ fn spawn_live_worker(
             }
             match text {
                 Ok(text) => {
-                    let text = text.trim();
-                    if text.is_empty() {
+                    let Some(text) = crate::transcribe::accept_asr_text(&text, samples) else {
                         continue;
-                    }
+                    };
                     if !full.is_empty() {
                         full.push(' ');
                     }
@@ -369,15 +371,6 @@ fn spawn_live_worker(
         }
         Ok(full)
     })
-}
-
-fn prompt_tail(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let tail: String = trimmed.chars().rev().take(200).collect::<String>().chars().rev().collect();
-    Some(tail)
 }
 
 fn take_live_worker(state: &AppState) -> Option<JoinHandle<Result<String, String>>> {
@@ -458,6 +451,7 @@ async fn stop_recording_and_transcribe(
             text,
             cf_neurons: None,
             cf_cost: None,
+            meeting_session_id: None,
         });
     }
     let wav_bytes = state.audio.stop()?;
@@ -507,6 +501,7 @@ async fn transcribe_bytes(
             text,
             cf_neurons: None,
             cf_cost: None,
+            meeting_session_id: None,
         });
     }
 
@@ -555,6 +550,7 @@ async fn transcribe_bytes(
         text: result,
         cf_neurons,
         cf_cost,
+        meeting_session_id: None,
     })
 }
 
@@ -1012,15 +1008,42 @@ async fn retry_audio_capture(
     };
     let size = captures::format_bytes(bytes.len() as u64);
     let name = capture.name.clone();
+    let recovered_end_ms = capture
+        .session_id
+        .map(|_| meetings::chunk_end_ms(capture.start_ms.unwrap_or(0), &bytes));
+    let kept = if capture.session_id.is_some() {
+        "Switch provider and retry it on this meeting."
+    } else {
+        "Switch provider and retry it from Saved audio."
+    };
     match transcribe_bytes(&state, bytes, &name, &mime).await {
         Ok(result) if result.text.trim().is_empty() => {
             let message = "The provider returned an empty transcript.";
             let _ = state.db.update_audio_capture_error(id, message);
-            Err(format!(
-                "{message}\n\nFile size: {size}. The audio is still saved. Switch provider and retry it from Saved audio."
-            ))
+            Err(format!("{message}\n\nFile size: {size}. The audio is still saved. {kept}"))
         }
         Ok(result) => {
+            if let Some(session_id) = capture.session_id {
+                let start_ms = capture.start_ms.unwrap_or(0);
+                let end_ms = recovered_end_ms.unwrap_or(start_ms);
+                if let Err(e) = meetings::attach_recovered_text(&state.db, session_id, start_ms, end_ms, &result.text) {
+                    let _ = state.db.update_audio_capture_error(id, &e);
+                    return Err(format!("{e}\n\nFile size: {size}. The audio is still saved. {kept}"));
+                }
+                if let Ok(removed) = state.db.delete_audio_capture(id) {
+                    captures::remove_file(&removed);
+                }
+                let rewrite = meetings::rewrite_if_settled(state.db.clone(), &state.app_data_dir, session_id).await;
+                if let Err(e) = rewrite {
+                    return Err(format!("The transcript was added back to the meeting. The note could not be rewritten: {e}"));
+                }
+                return Ok(OperationResult {
+                    text: result.text,
+                    cf_neurons: result.cf_neurons,
+                    cf_cost: result.cf_cost,
+                    meeting_session_id: Some(session_id),
+                });
+            }
             if let Ok(removed) = state.db.delete_audio_capture(id) {
                 captures::remove_file(&removed);
             }
@@ -1028,9 +1051,7 @@ async fn retry_audio_capture(
         }
         Err(e) => {
             let _ = state.db.update_audio_capture_error(id, &e);
-            Err(format!(
-                "{e}\n\nFile size: {size}. The audio is still saved. Switch provider and retry it from Saved audio."
-            ))
+            Err(format!("{e}\n\nFile size: {size}. The audio is still saved. {kept}"))
         }
     }
 }
@@ -1281,6 +1302,7 @@ async fn transform_with_llm(
         text: result_text,
         cf_neurons,
         cf_cost,
+        meeting_session_id: None,
     })
 }
 
@@ -1871,7 +1893,9 @@ pub fn run() {
             meetings::get_meeting,
             meetings::delete_meeting,
             meetings::set_action_item_done,
-            meetings::list_languages
+            meetings::list_languages,
+            meetings::list_meeting_styles,
+            meetings::list_session_captures
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

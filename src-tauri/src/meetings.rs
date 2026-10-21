@@ -35,15 +35,6 @@ fn model_id(settings: &crate::db::AppSettings) -> &str {
     }
 }
 
-fn prompt_tail(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let tail: String = trimmed.chars().rev().take(200).collect::<String>().chars().rev().collect();
-    Some(tail)
-}
-
 pub fn parse_due(raw: &str) -> Option<(String, i64)> {
     let s = raw.trim();
     if s.is_empty() || s.eq_ignore_ascii_case("null") || s.eq_ignore_ascii_case("none") {
@@ -119,6 +110,10 @@ fn parse_meeting_notes(raw: &str) -> MeetingDraft {
         decisions,
         actions,
     }
+}
+
+fn stored_decisions(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
 fn string_list(value: Option<&Value>) -> Vec<String> {
@@ -249,7 +244,6 @@ async fn transcribe_chunk(
     supervisor: &ModelSupervisor,
     db: &Database,
     wav: Vec<u8>,
-    prompt: Option<&str>,
     language: Option<&str>,
 ) -> Result<String, String> {
     let settings = db.get_settings().unwrap_or_default();
@@ -262,7 +256,7 @@ async fn transcribe_chunk(
                 language,
                 app_data_dir,
                 crate::models_folder(&settings),
-                prompt,
+                None,
             )
             .await;
     }
@@ -324,14 +318,13 @@ fn spawn_meeting_worker(
                 }
             };
             let _ = app.emit("meeting_transcribing", true);
-            let prompt = prompt_tail(&full);
+            let samples = pcm.len();
             let wav_for_retry = wav.clone();
             let text = tauri::async_runtime::block_on(transcribe_chunk(
                 &app_data_dir,
                 &supervisor,
                 &db,
                 wav,
-                prompt.as_deref(),
                 lang.as_deref(),
             ));
             let _ = app.emit("meeting_transcribing", false);
@@ -340,8 +333,10 @@ fn spawn_meeting_worker(
                     if cancel.load(Ordering::SeqCst) {
                         break;
                     }
-                    let text = text.trim();
-                    if text.is_empty() {
+                    let Some(text) = crate::transcribe::accept_asr_text(&text, samples) else {
+                        continue;
+                    };
+                    if !full.is_empty() && full.trim_end().ends_with(text) && text.chars().count() < 40 {
                         continue;
                     }
                     if !full.is_empty() {
@@ -366,10 +361,11 @@ fn spawn_meeting_worker(
                     }
                 }
                 Err(e) => {
-                    let notice = crate::captures::keep_failed(
+                    let notice = crate::captures::keep_meeting_chunk(
                         &db,
                         &app_data_dir,
-                        &format!("meeting-{session_id}-{start_ms}.wav"),
+                        session_id,
+                        start_ms as i64,
                         &wav_for_retry,
                         &e,
                     );
@@ -394,6 +390,8 @@ async fn join_worker(slot: &std::sync::Mutex<Option<JoinHandle<()>>>) {
 pub async fn start_meeting(
     app: AppHandle,
     state: tauri::State<'_, crate::AppState>,
+    style_id: Option<String>,
+    style_prefix: Option<String>,
 ) -> Result<MeetingSession, String> {
     if state.audio.is_recording() {
         return Err(if state.audio.is_meeting() {
@@ -412,7 +410,12 @@ pub async fn start_meeting(
     let language = languages::for_asr(&settings.engine_mode, model_id(&settings), settings.language.as_deref())
         .unwrap_or("")
         .to_string();
-    let session = state.db.create_session(&language, Utc::now().timestamp())?;
+    let style_id = style_id.unwrap_or_else(|| "notes".into());
+    let style_id = if style_id.trim().is_empty() { "notes".to_string() } else { style_id.trim().to_string() };
+    let custom_prefix = style_prefix.unwrap_or_default();
+    let styles = crate::presets::load_meeting_styles(&state.app_data_dir);
+    let prefix = crate::presets::meeting_style_text(&styles, &style_id, &custom_prefix);
+    let session = state.db.create_session(&language, Utc::now().timestamp(), &style_id, &prefix)?;
     let audio_path = state
         .app_data_dir
         .join("sessions")
@@ -426,7 +429,10 @@ pub async fn start_meeting(
 
     let vad_path = crate::models::vad_model_path(&state.app_data_dir, custom);
     let rx = match state.audio.start_meeting(audio_path, vad_path) {
-        Ok(rx) => rx,
+        Ok((rx, sources)) => {
+            let _ = app.emit("meeting_capture", &sources);
+            rx
+        }
         Err(e) => {
             let _ = state.db.set_session_status(session.id, "error");
             return Err(e);
@@ -519,9 +525,22 @@ pub fn get_meeting(state: tauri::State<'_, crate::AppState>, session_id: i64) ->
 
 #[tauri::command]
 pub fn delete_meeting(state: tauri::State<'_, crate::AppState>, session_id: i64) -> Result<(), String> {
+    if let Ok(captures) = state.db.delete_session_captures(session_id) {
+        for capture in captures {
+            crate::captures::remove_file(&capture);
+        }
+    }
     let session = state.db.delete_session(session_id)?;
     remove_session_audio(&session);
     Ok(())
+}
+
+#[tauri::command]
+pub fn list_session_captures(
+    state: tauri::State<'_, crate::AppState>,
+    session_id: i64,
+) -> Result<Vec<crate::db::AudioCapture>, String> {
+    state.db.list_session_captures(session_id)
 }
 
 #[tauri::command]
@@ -536,6 +555,11 @@ pub fn set_action_item_done(
 #[tauri::command]
 pub fn list_languages(engine_mode: String, model_id: String) -> Vec<languages::LanguageOption> {
     languages::languages_for(&engine_mode, &model_id)
+}
+
+#[tauri::command]
+pub fn list_meeting_styles(state: tauri::State<'_, crate::AppState>) -> Vec<crate::presets::PromptPreset> {
+    crate::presets::load_meeting_styles(&state.app_data_dir)
 }
 
 fn remove_session_audio(session: &MeetingSession) {
@@ -593,63 +617,156 @@ async fn finish_claimed_session(
     app_data_dir: &Path,
     session_id: i64,
 ) -> Result<MeetingDetail, String> {
+    let session = db.get_session(session_id)?;
     let segments = db.segments_for(session_id)?;
     let llm = crate::env_config::load_llm_settings(app_data_dir);
+    let rewriting = session.note_id.is_some();
     let mut title = String::new();
     let mut summary = String::new();
     let mut decisions = Vec::new();
     let mut action_drafts: Vec<(String, Option<String>)> = Vec::new();
+    let mut replace_actions = false;
 
     if segments.is_empty() {
         title = default_title();
         summary.clear();
     } else if llm.enabled {
         let transcript = transcript_for_model(&segments);
-        match summarize(db.as_ref(), &llm, &transcript).await {
+        match summarize(db.as_ref(), &llm, &transcript, &session.style_prefix).await {
             Ok(draft) => {
                 title = draft.title;
                 summary = draft.summary;
                 decisions = draft.decisions;
                 action_drafts = draft.actions;
+                replace_actions = true;
+            }
+            Err(_) if rewriting => {
+                title = session.title.clone();
+                summary = session.summary.clone();
+                decisions = stored_decisions(&session.decisions);
             }
             Err(e) => {
                 summary = format!("The summary could not be written: {e}");
             }
         }
+    } else if rewriting {
+        title = session.title.clone();
+        summary = session.summary.clone();
+        decisions = stored_decisions(&session.decisions);
     }
 
     if title.trim().is_empty() {
         title = default_title();
     }
 
-    let mut stored_actions = Vec::new();
-    for (text, due_raw) in &action_drafts {
-        let parsed = due_raw.as_deref().and_then(parse_due);
-        stored_actions.push((
-            text.clone(),
-            parsed.as_ref().map(|(label, _)| label.clone()).or(due_raw.clone()),
-            parsed.map(|(_, epoch)| epoch),
-        ));
-    }
-    let actions = db.replace_action_items(session_id, &stored_actions)?;
-    let body = render_meeting_note(&summary, &decisions, &actions, &segments);
-    let note = db.save_note(&title, &body)?;
-    let decisions_json = serde_json::to_string(&decisions).unwrap_or_else(|_| "[]".into());
-    db.finish_session(
+    let actions = if replace_actions {
+        let mut stored_actions = Vec::new();
+        for (text, due_raw) in &action_drafts {
+            let parsed = due_raw.as_deref().and_then(parse_due);
+            stored_actions.push((
+                text.clone(),
+                parsed.as_ref().map(|(label, _)| label.clone()).or(due_raw.clone()),
+                parsed.map(|(_, epoch)| epoch),
+            ));
+        }
+        db.replace_action_items(session_id, &stored_actions)?
+    } else if rewriting {
+        db.actions_for(session_id)?
+    } else {
+        db.replace_action_items(session_id, &[])?
+    };
+    persist_meeting_note(
+        db.as_ref(),
         session_id,
         &title,
         &summary,
-        &decisions_json,
-        Some(note.id),
-        "ready",
+        &decisions,
+        &actions,
+        &segments,
+        session.note_id.is_none(),
     )?;
     db.meeting_detail(session_id)
+}
+
+fn persist_meeting_note(
+    db: &Database,
+    session_id: i64,
+    title: &str,
+    summary: &str,
+    decisions: &[String],
+    actions: &[ActionItem],
+    segments: &[crate::db::MeetingSegment],
+    first_write: bool,
+) -> Result<i64, String> {
+    let body = render_meeting_note(summary, decisions, actions, segments);
+    let existing = db.get_session(session_id)?;
+    let note_id = if let Some(id) = existing.note_id {
+        db.update_note(id, title, &body)?;
+        id
+    } else {
+        db.save_note(title, &body)?.id
+    };
+    let decisions_json = serde_json::to_string(decisions).unwrap_or_else(|_| "[]".into());
+    if first_write {
+        db.finish_session(session_id, title, summary, &decisions_json, Some(note_id), "ready")?;
+    } else {
+        db.update_session_summary(session_id, title, summary, &decisions_json, Some(note_id))?;
+    }
+    Ok(note_id)
+}
+
+pub fn attach_recovered_text(
+    db: &Database,
+    session_id: i64,
+    start_ms: i64,
+    end_ms: i64,
+    text: &str,
+) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("The provider returned an empty transcript.".into());
+    }
+    db.get_session(session_id)?;
+    db.insert_segment(session_id, start_ms, end_ms, text)?;
+    Ok(())
+}
+
+pub fn chunk_end_ms(start_ms: i64, wav: &[u8]) -> i64 {
+    let duration = if wav.len() > 44 {
+        ((wav.len() - 44) / 32) as i64
+    } else {
+        0
+    };
+    start_ms.saturating_add(duration)
+}
+
+pub async fn rewrite_if_settled(
+    db: Arc<Database>,
+    app_data_dir: &Path,
+    session_id: i64,
+) -> Result<MeetingDetail, String> {
+    let session = db.get_session(session_id)?;
+    if matches!(session.status.as_str(), "recording" | "cancelled" | "error") {
+        return db.meeting_detail(session_id);
+    }
+    if session.status == "summarizing" {
+        return wait_until_settled(&db, session_id).await;
+    }
+    if !db.claim_session_rewrite(session_id)? {
+        return wait_until_settled(&db, session_id).await;
+    }
+    let outcome = finish_claimed_session(db.clone(), app_data_dir, session_id).await;
+    if outcome.is_err() {
+        let _ = db.set_session_status_if(session_id, "summarizing", "interrupted");
+    }
+    outcome
 }
 
 async fn summarize(
     db: &Database,
     settings: &crate::env_config::LlmSettings,
     transcript: &str,
+    style_prefix: &str,
 ) -> Result<MeetingDraft, String> {
     let active_id = settings.active_provider_id.clone();
     let provider = settings
@@ -670,7 +787,7 @@ async fn summarize(
         &base_url,
         &api_key,
         &model,
-        crate::llm::meeting_notes_prompt(),
+        &crate::llm::meeting_style_prompt(style_prefix),
         transcript,
         timeout_secs,
     )
@@ -750,5 +867,49 @@ mod tests {
         assert!(note.contains("- Ship it"));
         assert!(note.contains("- [ ] Send notes"));
         assert!(note.contains("[00:01] Hello team"));
+    }
+
+    #[test]
+    fn recovered_text_joins_the_meeting_and_rewrite_keeps_the_note() {
+        let db = Database::new(":memory:").unwrap();
+        let session = db.create_session("en", 10, "brief", "Keep the summary to two sentences.").unwrap();
+        assert_eq!(session.style_id, "brief");
+        assert_eq!(session.style_prefix, "Keep the summary to two sentences.");
+        attach_recovered_text(&db, session.id, 0, 1200, "hello team").unwrap();
+        let segments = db.segments_for(session.id).unwrap();
+        assert_eq!(segments[0].text, "hello team");
+        let note_id = persist_meeting_note(
+            &db,
+            session.id,
+            "Standup",
+            "Hello",
+            &[],
+            &[],
+            &segments,
+            true,
+        )
+        .unwrap();
+        attach_recovered_text(&db, session.id, 1200, 2400, "ship the note").unwrap();
+        let segments = db.segments_for(session.id).unwrap();
+        assert_eq!(segments.len(), 2);
+        let again = persist_meeting_note(
+            &db,
+            session.id,
+            "Standup",
+            "Hello and ship",
+            &[],
+            &[],
+            &segments,
+            false,
+        )
+        .unwrap();
+        assert_eq!(note_id, again);
+        let notes = db.get_notes().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].content.contains("ship the note"));
+        let saved = db.get_session(session.id).unwrap();
+        assert_eq!(saved.status, "ready");
+        assert_eq!(saved.note_id, Some(note_id));
+        assert!(saved.ended_at.is_some());
     }
 }

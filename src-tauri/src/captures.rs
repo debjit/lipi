@@ -57,9 +57,31 @@ pub fn keep_failed(
         return error.to_string();
     }
     let size = format_bytes(bytes.len() as u64);
-    match store(db, app_data_dir, name, bytes, error) {
+    match store(db, app_data_dir, name, bytes, error, None, None) {
         Ok(_) => format!(
             "{error}\n\nFile size: {size}. The audio was saved. Switch provider and retry it from Saved audio."
+        ),
+        Err(save_err) => format!("{error}\n\nThe audio could not be saved ({size}): {save_err}"),
+    }
+}
+
+/// Keep a failed meeting chunk so it can be retried into that meeting.
+pub fn keep_meeting_chunk(
+    db: &Database,
+    app_data_dir: &Path,
+    session_id: i64,
+    start_ms: i64,
+    bytes: &[u8],
+    error: &str,
+) -> String {
+    if bytes.is_empty() {
+        return error.to_string();
+    }
+    let size = format_bytes(bytes.len() as u64);
+    let name = format!("meeting-{session_id}-{start_ms}.wav");
+    match store(db, app_data_dir, &name, bytes, error, Some(session_id), Some(start_ms)) {
+        Ok(_) => format!(
+            "{error}\n\nFile size: {size}. The audio was saved. Switch provider and retry it on this meeting."
         ),
         Err(save_err) => format!("{error}\n\nThe audio could not be saved ({size}): {save_err}"),
     }
@@ -71,6 +93,8 @@ pub fn store(
     name: &str,
     bytes: &[u8],
     error: &str,
+    session_id: Option<i64>,
+    start_ms: Option<i64>,
 ) -> Result<AudioCapture, String> {
     let dir = app_data_dir.join("captures");
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create captures folder: {e}"))?;
@@ -86,7 +110,14 @@ pub fn store(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(&stored_name);
-    match db.insert_audio_capture(display, &path.to_string_lossy(), bytes.len() as i64, error) {
+    match db.insert_audio_capture(
+        display,
+        &path.to_string_lossy(),
+        bytes.len() as i64,
+        error,
+        session_id,
+        start_ms,
+    ) {
         Ok(capture) => Ok(capture),
         Err(e) => {
             let _ = fs::remove_file(&path);
