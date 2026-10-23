@@ -13,6 +13,10 @@ pub fn presets_dir(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("presets")
 }
 
+pub fn meeting_styles_dir(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("meeting_styles")
+}
+
 pub const GUIDE_CONTENT: &str = r#"# Lipi Presets Guide (.guide.md)
 
 This directory contains voice & tone transformation presets for Lipi.
@@ -47,6 +51,109 @@ You can create a new `.md` file directly in this folder:
 2. Add the `---` frontmatter header and your prompt instructions.
 3. Save the file. Lipi will automatically detect and list it in the workspace and settings.
 "#;
+
+pub const MEETING_STYLE_GUIDE: &str = r#"# Lipi Meeting Styles (.guide.md)
+
+This folder is only for meeting notes. Dictation voice presets live in the presets folder and are not used here.
+
+Each style is a Markdown file. The text after the frontmatter is a prefix added to the meeting note instructions. The note is still a title, summary, decisions, and action items.
+
+```markdown
+---
+id: brief
+label: Brief
+---
+Keep the summary to two sentences. Include only decisions and tasks that were stated.
+```
+"#;
+
+pub fn default_meeting_styles() -> Vec<PromptPreset> {
+    vec![
+        PromptPreset {
+            id: "notes".into(),
+            label: "Meeting notes".into(),
+            prompt: "Write a plain summary of what was discussed. Keep decisions and action items short and literal.".into(),
+        },
+        PromptPreset {
+            id: "brief".into(),
+            label: "Brief".into(),
+            prompt: "Keep the summary to two sentences. Include only decisions and tasks that were stated.".into(),
+        },
+        PromptPreset {
+            id: "decisions".into(),
+            label: "Decisions first".into(),
+            prompt: "Open the summary with the decisions. Put open questions after the decisions.".into(),
+        },
+        PromptPreset {
+            id: "actions".into(),
+            label: "Action items".into(),
+            prompt: "Emphasize follow-ups. Each action item names the task and a due time when one was said.".into(),
+        },
+    ]
+}
+
+pub fn meeting_style_text(styles: &[PromptPreset], id: &str, custom_prefix: &str) -> String {
+    if id.trim() == "custom" {
+        return custom_prefix.trim().to_string();
+    }
+    styles
+        .iter()
+        .find(|style| style.id == id)
+        .map(|style| style.prompt.clone())
+        .unwrap_or_default()
+}
+
+pub fn ensure_meeting_styles_dir(app_data_dir: &Path) -> Result<(), String> {
+    let dir = meeting_styles_dir(app_data_dir);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let guide_path = dir.join(".guide.md");
+    if !guide_path.exists() {
+        let _ = fs::write(&guide_path, MEETING_STYLE_GUIDE);
+    }
+    for style in default_meeting_styles() {
+        let file_path = dir.join(format!("{}.md", style.id));
+        if !file_path.exists() {
+            let _ = fs::write(&file_path, serialize_preset(&style));
+        }
+    }
+    Ok(())
+}
+
+pub fn load_meeting_styles(app_data_dir: &Path) -> Vec<PromptPreset> {
+    let _ = ensure_meeting_styles_dir(app_data_dir);
+    let dir = meeting_styles_dir(app_data_dir);
+    let mut styles = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let filename = entry.file_name().to_string_lossy().to_string();
+            if filename.starts_with('.') || !filename.ends_with(".md") {
+                continue;
+            }
+            if let Ok(content) = fs::read_to_string(&path) {
+                styles.push(parse_preset_file(&filename, &content));
+            }
+        }
+    }
+    if styles.is_empty() {
+        return default_meeting_styles();
+    }
+    let order = ["notes", "brief", "decisions", "actions"];
+    styles.sort_by(|a, b| {
+        let pos_a = order.iter().position(|&x| x == a.id);
+        let pos_b = order.iter().position(|&x| x == b.id);
+        match (pos_a, pos_b) {
+            (Some(i), Some(j)) => i.cmp(&j),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.label.cmp(&b.label),
+        }
+    });
+    styles
+}
 
 pub fn default_presets() -> Vec<PromptPreset> {
     vec![
@@ -335,5 +442,19 @@ Line two of prompt."#;
         assert_eq!(sanitize_preset_filename("grammar_fix"), "grammar_fix");
         assert_eq!(sanitize_preset_filename("a:b*c?d\"e<f>g|h"), "a_b_c_d_e_f_g_h");
         assert_eq!(sanitize_preset_filename(":::"), "preset");
+    }
+
+    #[test]
+    fn meeting_styles_are_not_voice_presets() {
+        let ids: Vec<_> = default_meeting_styles().into_iter().map(|style| style.id).collect();
+        assert_eq!(ids, vec!["notes", "brief", "decisions", "actions"]);
+        assert!(!ids.iter().any(|id| id == "grammar_fix" || id == "professional"));
+        let voice_ids: Vec<_> = default_presets().into_iter().map(|preset| preset.id).collect();
+        assert!(voice_ids.iter().any(|id| id == "grammar_fix"));
+        assert!(!voice_ids.iter().any(|id| ids.contains(id)));
+        let custom = meeting_style_text(&default_meeting_styles(), "custom", "Use short headings.");
+        assert_eq!(custom, "Use short headings.");
+        let brief = meeting_style_text(&default_meeting_styles(), "brief", "");
+        assert!(brief.contains("two sentences"));
     }
 }

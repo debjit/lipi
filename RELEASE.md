@@ -83,7 +83,9 @@ After `release-meta` is updated, CI POSTs `latest.json` to the GitHub Actions se
 
 ## Apt repository
 
-A published stable release starts [`.github/workflows/apt-repo.yml`](.github/workflows/apt-repo.yml). That workflow collects every stable `Lipi_*_amd64.deb` (not the renamed `Lipi-linux.deb` copy), signs them with `reprepro`, and deploys the archive to GitHub Pages at `https://debjit.github.io/lipi`. Debian 12 and Ubuntu 22.04 or newer can then `sudo apt install lipi`. Dev prereleases are left out.
+When the Release workflow finishes a stable publish, it starts [`.github/workflows/apt-repo.yml`](.github/workflows/apt-repo.yml) with `gh workflow run`. That workflow collects every stable `Lipi_*_amd64.deb` (not the renamed `Lipi-linux.deb` copy), signs them with `reprepro`, and deploys the archive to GitHub Pages at `https://debjit.github.io/lipi`. Debian 12 and Ubuntu 22.04 or newer can then `sudo apt install lipi`. Dev prereleases are left out.
+
+Publishing the draft with `gh release edit --draft=false` does not emit `release: published`, so the Release workflow starts the apt job itself. If that step does not run, start **Apt repository** from the Actions tab on the stable tag. If `LIPI_SITE_DEPLOY_HOOK` is empty, CI skips the site redeploy and the release still publishes.
 
 [`install.sh`](install.sh) writes the same keyring (`/etc/apt/keyrings/lipi.gpg`) and `lipi.sources` entry as the commands in the README, then runs `apt-get install lipi`. The release workflow does not rewrite that script.
 

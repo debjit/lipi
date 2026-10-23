@@ -7,7 +7,8 @@ const FRAME: usize = 512;
 const CONTEXT: usize = 64;
 const SPEECH_START: usize = 1440;
 const SILENCE_END: usize = 9600;
-const MIN_KEEP: usize = 4000;
+const MIN_KEEP: usize = 12_800;
+const SILENCE_KEEP: usize = 1600;
 const MAX_LEN: usize = 16_000 * 20;
 const OVERLAP: usize = 3200;
 const PREROLL_MAX: usize = 4800;
@@ -149,11 +150,15 @@ impl SpeechSegmenter {
     }
 
     fn finish(&mut self) -> Option<Vec<f32>> {
-        let seg = std::mem::take(&mut self.current);
+        let mut seg = std::mem::take(&mut self.current);
+        let silence = self.silence_samples;
         self.in_speech = false;
         self.speech_samples = 0;
         self.silence_samples = 0;
         self.preroll.clear();
+        if silence > SILENCE_KEEP && seg.len() > silence - SILENCE_KEEP {
+            seg.truncate(seg.len() - (silence - SILENCE_KEEP));
+        }
         if seg.len() < MIN_KEEP {
             None
         } else {
@@ -196,14 +201,14 @@ mod tests {
         }
         let audio = got.expect("silence after speech should close a segment");
         assert!(audio.len() >= MIN_KEEP);
-        assert!(audio.len() < MAX_LEN);
+        assert!(audio.len() < 16_000, "trailing silence should be trimmed, got {}", audio.len());
     }
 
     #[test]
     fn segmenter_flush_keeps_open_speech() {
         let mut seg = SpeechSegmenter::new();
         let frame = vec![0.2f32; FRAME];
-        for _ in 0..12 {
+        for _ in 0..30 {
             assert!(seg.push(&frame, true).is_none());
         }
         let audio = seg.flush().expect("open speech should flush");

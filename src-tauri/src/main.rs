@@ -18,6 +18,27 @@ fn main() {
             }
         }
 
+        // The snap ships an older GSettings schema. WebKitGTK 2.52 reads
+        // org.gnome.settings-daemon.plugins.xsettings.antialiasing and GLib
+        // aborts when that key is missing. GSETTINGS_SCHEMA_DIR replaces the
+        // host schema search path, so it has to go before GTK starts.
+        if let Ok(orig) = std::env::var("XDG_DATA_DIRS_VSCODE_SNAP_ORIG") {
+            std::env::set_var("XDG_DATA_DIRS", orig);
+        } else if let Ok(dirs) = std::env::var("XDG_DATA_DIRS") {
+            let host: Vec<&str> = dirs.split(':').filter(|dir| !dir.contains("/snap/")).collect();
+            if host.is_empty() {
+                std::env::remove_var("XDG_DATA_DIRS");
+            } else {
+                std::env::set_var("XDG_DATA_DIRS", host.join(":"));
+            }
+        }
+        let snap = std::env::var("SNAP").is_ok();
+        if let Ok(schema_dir) = std::env::var("GSETTINGS_SCHEMA_DIR") {
+            if snap || schema_dir.contains("/snap/") {
+                std::env::remove_var("GSETTINGS_SCHEMA_DIR");
+            }
+        }
+
         // Silence noisy upstream deprecation warning from libayatana-appindicator
         extern "C" fn null_log_handler(
             _log_domain: *const std::ffi::c_char,

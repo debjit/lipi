@@ -293,8 +293,23 @@ class H(BaseHTTPRequestHandler):
             prompt = unquote(qs.get('prompt', [''])[0]).strip()
             if prompt:
                 kw['initial_prompt'] = prompt
+            kw['temperature'] = 0.0
+            kw['condition_on_previous_text'] = False
+            kw['compression_ratio_threshold'] = 2.4
+            kw['log_prob_threshold'] = -1.0
+            kw['no_speech_threshold'] = 0.6
+            import inspect
+            if 'hallucination_silence_threshold' in inspect.signature(model.transcribe).parameters:
+                kw['hallucination_silence_threshold'] = 2.0
             segments, _ = model.transcribe(io.BytesIO(audio), **kw)
-            text = "".join(s.text for s in segments).strip()
+            parts = []
+            for s in segments:
+                if getattr(s, 'no_speech_prob', 0.0) > 0.6:
+                    continue
+                if getattr(s, 'avg_logprob', 0.0) < -1.0:
+                    continue
+                parts.append(s.text)
+            text = "".join(parts).strip()
             res = json.dumps({"text": text}).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -512,7 +527,9 @@ server.serve_forever()
                                 .mime_str("audio/wav")
                                 .map_err(|e| e.to_string())?,
                         )
-                        .text("response_format", "json");
+                        .text("response_format", "json")
+                        .text("temperature", "0")
+                        .text("temperature_inc", "0");
 
                     if let Some(lang) = language {
                         let trimmed = lang.trim();
@@ -705,11 +722,27 @@ lang = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
 try:
     # If model_target is a directory containing model.bin, loads completely offline
     model = WhisperModel(model_target, device="cpu", compute_type="int8")
-    kwargs = {}
+    kwargs = {
+        "temperature": 0.0,
+        "condition_on_previous_text": False,
+        "compression_ratio_threshold": 2.4,
+        "log_prob_threshold": -1.0,
+        "no_speech_threshold": 0.6,
+    }
     if lang and lang != "auto":
         kwargs["language"] = lang
+    import inspect
+    if "hallucination_silence_threshold" in inspect.signature(model.transcribe).parameters:
+        kwargs["hallucination_silence_threshold"] = 2.0
     segments, _ = model.transcribe(wav_path, **kwargs)
-    text = "".join(seg.text for seg in segments).strip()
+    parts = []
+    for seg in segments:
+        if getattr(seg, "no_speech_prob", 0.0) > 0.6:
+            continue
+        if getattr(seg, "avg_logprob", 0.0) < -1.0:
+            continue
+        parts.append(seg.text)
+    text = "".join(parts).strip()
     sys.stdout.write(text)
 except Exception as e:
     sys.stderr.write(f"Inference error: {e}\n")

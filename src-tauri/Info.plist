@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Lipi records the audio this computer is playing so a meeting in headphones can be transcribed.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Lipi uses the microphone for dictation and meeting notes.</string>
+</dict>
+</plist>
