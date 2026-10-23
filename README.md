@@ -50,7 +50,11 @@ On Debian 12 and Ubuntu 22.04 or newer (x86_64):
 curl -fsSL https://raw.githubusercontent.com/debjit/lipi/main/install.sh | bash
 ```
 
-The script adds the archive key and source, then installs Lipi. Later upgrades are `sudo apt update && sudo apt upgrade`.
+The script adds the archive key and source, then installs Lipi. Later upgrades are `sudo apt update && sudo apt upgrade`. To upgrade only Lipi:
+
+```bash
+sudo apt update && sudo apt upgrade --only-upgrade lipi
+```
 
 To add the archive by hand:
 
@@ -69,7 +73,7 @@ sudo apt update
 sudo apt install lipi
 ```
 
-Later versions are `sudo apt update && sudo apt upgrade`. The archive lists stable releases only. Dev builds stay on the **[GitHub Releases](https://github.com/debjit/lipi/releases)** page and are not linked as the latest download. The site at [lipi.debjit.in](https://lipi.debjit.in) reads [`latest.json`](https://raw.githubusercontent.com/debjit/lipi/release-meta/latest.json) on the `release-meta` branch.
+Later versions are `sudo apt update && sudo apt upgrade`, or `sudo apt update && sudo apt upgrade --only-upgrade lipi` to upgrade only Lipi. The archive lists stable releases only. Dev builds stay on the **[GitHub Releases](https://github.com/debjit/lipi/releases)** page and are not linked as the latest download. The site at [lipi.debjit.in](https://lipi.debjit.in) reads [`latest.json`](https://raw.githubusercontent.com/debjit/lipi/release-meta/latest.json) on the `release-meta` branch.
 
 ## Quick start
 
