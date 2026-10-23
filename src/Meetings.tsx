@@ -408,6 +408,7 @@ export function Meetings({
           ← Notes
         </button>
         <h2>Meetings</h2>
+        <span className="beta-tag">Beta</span>
         {screen !== "recording" && (
           <button type="button" className="btn btn-secondary" onClick={showNew}>
             New meeting

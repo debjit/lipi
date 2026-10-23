@@ -4127,8 +4127,20 @@ optgroup {
 }
 
 .meetings-header h2 {
+  margin: 0;
   font-size: 16px;
   font-weight: 600;
+}
+
+.beta-tag {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 6px;
 }
 
 .meetings-header-note {

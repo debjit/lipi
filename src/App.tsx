@@ -4462,9 +4462,9 @@ export default function App() {
                 type="button"
                 className="btn btn-secondary"
                 onClick={() => setActiveView("meetings")}
-                title="Record a meeting and save notes"
+                title="Beta. Record a meeting and save notes on this computer."
               >
-                Meetings
+                Meetings <span className="beta-tag">Beta</span>
               </button>
               <button
                 type="button"

@@ -33,6 +33,7 @@ Press **`Alt + R`** in any app, speak, and press it again. Lipi transcribes your
 - **AI polish.** Automatically fix grammar, change tone, summarize, or turn speech into bullet points with a local or remote LLM. Prompts are plain Markdown files you can edit.
 - **Mini floating widget with `Alt + M`.** Shrink Lipi into a small always-on-top pill that stays out of your way.
 - **Private, local history.** Every note and transcript is stored on your machine in SQLite and can be searched later.
+- **Meetings (beta).** Record a call from the Meetings button and keep the transcript and notes on this computer. See [Meetings](#meetings).
 
 ## Download
 
@@ -90,6 +91,12 @@ The transcript (polished by your active AI preset, if auto-transform is on) is p
 | :--- | :--- |
 | `Alt + R` | Start or stop recording from anywhere |
 | `Alt + M` | Switch between the full window and the mini floating widget |
+
+## Meetings
+
+Beta. Open **Meetings** in the Lipi window to record a call. Lipi records your microphone and the audio this computer is playing, then writes a transcript, summary, decisions, and action items. The audio and the note stay on this computer. Open the saved note from the meeting when it finishes.
+
+Tell the other people they are being recorded before you start. Stop dictation before starting a meeting. If a piece of the transcript fails, switch provider in Settings and retry it into the same meeting.
 
 ## Configuration
 
