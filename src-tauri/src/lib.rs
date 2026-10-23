@@ -1,14 +1,18 @@
 mod audio;
+mod captures;
 mod db;
 mod vad;
 mod engine;
 mod env_config;
+mod languages;
 mod llm;
+mod meetings;
 mod models;
 mod paste;
 mod presets;
 mod shortcut;
 mod specs;
+mod system_audio;
 mod transcribe;
 
 use audio::AudioRecorder;
@@ -67,7 +71,7 @@ fn update_tray_icon(app: &tauri::AppHandle, busy: bool) {
     }
 }
 
-fn apply_tray_activity(app: &tauri::AppHandle, record_item: &MenuItem<tauri::Wry>, phase: &str, elapsed_secs: u64) {
+pub(crate) fn apply_tray_activity(app: &tauri::AppHandle, record_item: &MenuItem<tauri::Wry>, phase: &str, elapsed_secs: u64) {
     update_tray_icon(app, activity_is_busy(phase));
     if let Some(tray) = app.tray_by_id("main-tray") {
         let _ = tray.set_tooltip(Some(activity_tooltip(phase, elapsed_secs)));
@@ -218,19 +222,24 @@ pub struct OperationResult {
     pub text: String,
     pub cf_neurons: Option<f64>,
     pub cf_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_session_id: Option<i64>,
 }
 
 pub struct AppState {
-    db: Arc<Database>,
-    audio: Arc<AudioRecorder>,
-    supervisor: Arc<engine::ModelSupervisor>,
-    app_data_dir: std::path::PathBuf,
+    pub(crate) db: Arc<Database>,
+    pub(crate) audio: Arc<AudioRecorder>,
+    pub(crate) supervisor: Arc<engine::ModelSupervisor>,
+    pub(crate) app_data_dir: std::path::PathBuf,
     is_mini: std::sync::atomic::AtomicBool,
     paste_target: Arc<std::sync::Mutex<Option<paste::PasteTarget>>>,
     clipboard: Arc<paste::ClipboardService>,
-    tray_record_item: MenuItem<tauri::Wry>,
+    pub(crate) tray_record_item: MenuItem<tauri::Wry>,
     live_worker: Arc<std::sync::Mutex<Option<JoinHandle<Result<String, String>>>>>,
     live_cancel: Arc<AtomicBool>,
+    pub(crate) meeting_worker: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    pub(crate) meeting_cancel: Arc<AtomicBool>,
+    pub(crate) meeting_id: Arc<std::sync::Mutex<Option<i64>>>,
 }
 
 #[tauri::command]
@@ -239,6 +248,9 @@ fn start_recording(
     state: tauri::State<'_, AppState>,
     lipi_focused: Option<bool>,
 ) -> Result<(), String> {
+    if state.audio.is_meeting() {
+        return Err("A meeting is still recording. Stop it from Meetings.".into());
+    }
     let settings = state.db.get_settings().unwrap_or_default();
     let is_mini = state.is_mini.load(std::sync::atomic::Ordering::SeqCst);
     if settings.auto_paste {
@@ -286,7 +298,7 @@ fn start_recording(
     Ok(())
 }
 
-fn models_folder(settings: &AppSettings) -> Option<&str> {
+pub(crate) fn models_folder(settings: &AppSettings) -> Option<&str> {
     if settings.models_folder.trim().is_empty() {
         None
     } else {
@@ -318,16 +330,17 @@ fn spawn_live_worker(
                 }
             };
             let settings = db.get_settings().unwrap_or_default();
-            let prompt = prompt_tail(&full);
+            let samples = pcm.len();
+            let language = languages::for_asr(&settings.engine_mode, &settings.local_model_size, settings.language.as_deref());
             let _ = app.emit("live_transcribing", true);
             let text = tauri::async_runtime::block_on(supervisor.transcribe(
                 wav,
                 &settings.local_engine,
                 &settings.local_model_size,
-                settings.language.as_deref(),
+                language,
                 &app_data_dir,
                 models_folder(&settings),
-                prompt.as_deref(),
+                None,
             ));
             let _ = app.emit("live_transcribing", false);
             if cancel.load(Ordering::SeqCst) {
@@ -335,10 +348,9 @@ fn spawn_live_worker(
             }
             match text {
                 Ok(text) => {
-                    let text = text.trim();
-                    if text.is_empty() {
+                    let Some(text) = crate::transcribe::accept_asr_text(&text, samples) else {
                         continue;
-                    }
+                    };
                     if !full.is_empty() {
                         full.push(' ');
                     }
@@ -361,21 +373,15 @@ fn spawn_live_worker(
     })
 }
 
-fn prompt_tail(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let tail: String = trimmed.chars().rev().take(200).collect::<String>().chars().rev().collect();
-    Some(tail)
-}
-
 fn take_live_worker(state: &AppState) -> Option<JoinHandle<Result<String, String>>> {
     state.live_worker.lock().ok().and_then(|mut slot| slot.take())
 }
 
 #[tauri::command]
 async fn cancel_recording(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if state.audio.is_meeting() {
+        return Err("A meeting is still recording. Stop it from Meetings.".into());
+    }
     state.live_cancel.store(true, Ordering::SeqCst);
     if state.audio.is_live() {
         state.audio.end_live(false)?;
@@ -445,22 +451,49 @@ async fn stop_recording_and_transcribe(
             text,
             cf_neurons: None,
             cf_cost: None,
+            meeting_session_id: None,
         });
     }
     let wav_bytes = state.audio.stop()?;
-    let settings = state.db.get_settings()?;
+    match transcribe_bytes(&state, wav_bytes.clone(), "recording.wav", "audio/wav").await {
+        Ok(result) => Ok(result),
+        Err(e) => Err(captures::keep_failed(
+            &state.db,
+            &state.app_data_dir,
+            "recording.wav",
+            &wav_bytes,
+            &e,
+        )),
+    }
+}
 
+async fn transcribe_bytes(
+    state: &AppState,
+    bytes: Vec<u8>,
+    file_name: &str,
+    mime: &str,
+) -> Result<OperationResult, String> {
+    let settings = state.db.get_settings()?;
     if settings.engine_mode == "local" {
-        let custom_dir = models_folder(&settings);
+        if !captures::is_wav_name(file_name) {
+            return Err(
+                "Local Whisper only accepts WAV. Switch to an online provider and retry this file."
+                    .into(),
+            );
+        }
         let text = state
             .supervisor
             .transcribe(
-                wav_bytes,
+                bytes,
                 &settings.local_engine,
                 &settings.local_model_size,
-                settings.language.as_deref(),
+                languages::for_asr(
+                    &settings.engine_mode,
+                    &settings.local_model_size,
+                    settings.language.as_deref(),
+                ),
                 &state.app_data_dir,
-                custom_dir,
+                models_folder(&settings),
                 None,
             )
             .await?;
@@ -468,39 +501,41 @@ async fn stop_recording_and_transcribe(
             text,
             cf_neurons: None,
             cf_cost: None,
+            meeting_session_id: None,
         });
     }
 
     let llm_cfg = env_config::load_llm_settings(&state.app_data_dir);
     let (api_base_url, api_key) = env_config::resolve_asr_endpoint(&settings, &llm_cfg);
-
     if api_base_url.trim().is_empty() {
         return Err("API endpoint URL is missing. Set it in Settings.".into());
     }
 
-    let timeout_secs = llm_cfg.request_timeout_secs.max(settings.request_timeout_secs).max(180) as u64;
-
-    let wav_len = wav_bytes.len();
-    let duration_secs = if wav_len > 44 {
-        (wav_len - 44) as f64 / 32000.0
+    let timeout_secs = llm_cfg
+        .request_timeout_secs
+        .max(settings.request_timeout_secs)
+        .max(180) as u64;
+    let duration_secs = if captures::is_wav_name(file_name) && bytes.len() > 44 {
+        (bytes.len() - 44) as f64 / 32000.0
     } else {
         0.0
     };
 
     let result = transcribe::transcribe_audio(
-        wav_bytes,
+        bytes,
         &api_base_url,
         &api_key,
         &settings.model,
-        settings.language.as_deref(),
+        languages::for_asr(&settings.engine_mode, &settings.model, settings.language.as_deref()),
         timeout_secs,
+        file_name,
+        mime,
     )
     .await?;
 
     let mut cf_neurons = None;
     let mut cf_cost = None;
-
-    if api_base_url.contains("api.cloudflare.com") {
+    if duration_secs > 0.0 && api_base_url.contains("api.cloudflare.com") {
         if let Ok((neurons, cost)) = state.db.log_cf_asr_usage(&settings.model, duration_secs) {
             eprintln!(
                 "[Cloudflare ASR] Audio: {:.2}s | Model: {} | Consumed: {:.2} Neurons (~${:.5})",
@@ -515,6 +550,7 @@ async fn stop_recording_and_transcribe(
         text: result,
         cf_neurons,
         cf_cost,
+        meeting_session_id: None,
     })
 }
 
@@ -560,8 +596,16 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSettings, String
 #[tauri::command]
 fn save_settings(
     state: tauri::State<'_, AppState>,
-    settings: AppSettings,
+    mut settings: AppSettings,
 ) -> Result<(), String> {
+    let model_id = if settings.engine_mode == "local" {
+        settings.local_model_size.clone()
+    } else {
+        settings.model.clone()
+    };
+    if languages::for_asr(&settings.engine_mode, &model_id, settings.language.as_deref()).is_none() {
+        settings.language = None;
+    }
     state.db.save_settings(&settings)
 }
 
@@ -868,6 +912,200 @@ async fn pick_directory() -> Result<Option<String>, String> {
     Ok(None)
 }
 
+#[cfg(target_os = "linux")]
+fn linux_pick_audio() -> Result<Option<std::path::PathBuf>, String> {
+    if let Ok(output) = std::process::Command::new("zenity")
+        .arg("--file-selection")
+        .arg("--title=Select audio to transcribe")
+        .arg("--file-filter=Audio | *.wav *.mp3 *.m4a *.mp4 *.ogg *.webm *.flac *.mpeg *.mpga")
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if path.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(std::path::PathBuf::from(path)));
+        }
+        return Ok(None);
+    }
+
+    if let Ok(output) = std::process::Command::new("kdialog")
+        .arg("--title")
+        .arg("Select audio to transcribe")
+        .arg("--getopenfilename")
+        .arg(".")
+        .arg("Audio (*.wav *.mp3 *.m4a *.mp4 *.ogg *.webm *.flac *.mpeg *.mpga)")
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if path.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(std::path::PathBuf::from(path)));
+        }
+        return Ok(None);
+    }
+
+    Err("Install zenity or kdialog to choose an audio file.".into())
+}
+
+async fn pick_audio_file() -> Result<Option<std::path::PathBuf>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        return tauri::async_runtime::spawn_blocking(linux_pick_audio)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        let file = tauri::async_runtime::spawn_blocking(|| {
+            rfd::FileDialog::new()
+                .set_title("Select audio to transcribe")
+                .add_filter(
+                    "Audio",
+                    &["wav", "mp3", "m4a", "mp4", "ogg", "webm", "flac", "mpeg", "mpga"],
+                )
+                .pick_file()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        return Ok(file);
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    Err("Audio upload is not available on this system.".into())
+}
+
+const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
+#[tauri::command]
+fn list_audio_captures(state: tauri::State<'_, AppState>) -> Result<Vec<db::AudioCapture>, String> {
+    state.db.list_audio_captures()
+}
+
+#[tauri::command]
+fn delete_audio_capture(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
+    let capture = state.db.delete_audio_capture(id)?;
+    captures::remove_file(&capture);
+    Ok(())
+}
+
+#[tauri::command]
+async fn retry_audio_capture(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<OperationResult, String> {
+    let capture = state.db.get_audio_capture(id)?;
+    let (bytes, mime) = match captures::read_capture(&capture) {
+        Ok(pair) => pair,
+        Err(e) => {
+            let _ = state.db.update_audio_capture_error(id, &e);
+            return Err(e);
+        }
+    };
+    let size = captures::format_bytes(bytes.len() as u64);
+    let name = capture.name.clone();
+    let recovered_end_ms = capture
+        .session_id
+        .map(|_| meetings::chunk_end_ms(capture.start_ms.unwrap_or(0), &bytes));
+    let kept = if capture.session_id.is_some() {
+        "Switch provider and retry it on this meeting."
+    } else {
+        "Switch provider and retry it from Saved audio."
+    };
+    match transcribe_bytes(&state, bytes, &name, &mime).await {
+        Ok(result) if result.text.trim().is_empty() => {
+            let message = "The provider returned an empty transcript.";
+            let _ = state.db.update_audio_capture_error(id, message);
+            Err(format!("{message}\n\nFile size: {size}. The audio is still saved. {kept}"))
+        }
+        Ok(result) => {
+            if let Some(session_id) = capture.session_id {
+                let start_ms = capture.start_ms.unwrap_or(0);
+                let end_ms = recovered_end_ms.unwrap_or(start_ms);
+                if let Err(e) = meetings::attach_recovered_text(&state.db, session_id, start_ms, end_ms, &result.text) {
+                    let _ = state.db.update_audio_capture_error(id, &e);
+                    return Err(format!("{e}\n\nFile size: {size}. The audio is still saved. {kept}"));
+                }
+                if let Ok(removed) = state.db.delete_audio_capture(id) {
+                    captures::remove_file(&removed);
+                }
+                let rewrite = meetings::rewrite_if_settled(state.db.clone(), &state.app_data_dir, session_id).await;
+                if let Err(e) = rewrite {
+                    return Err(format!("The transcript was added back to the meeting. The note could not be rewritten: {e}"));
+                }
+                return Ok(OperationResult {
+                    text: result.text,
+                    cf_neurons: result.cf_neurons,
+                    cf_cost: result.cf_cost,
+                    meeting_session_id: Some(session_id),
+                });
+            }
+            if let Ok(removed) = state.db.delete_audio_capture(id) {
+                captures::remove_file(&removed);
+            }
+            Ok(result)
+        }
+        Err(e) => {
+            let _ = state.db.update_audio_capture_error(id, &e);
+            Err(format!("{e}\n\nFile size: {size}. The audio is still saved. {kept}"))
+        }
+    }
+}
+
+#[tauri::command]
+async fn pick_audio_path() -> Result<Option<String>, String> {
+    Ok(pick_audio_file()
+        .await?
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+async fn transcribe_upload(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<OperationResult, String> {
+    let path = std::path::PathBuf::from(path);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("upload.wav")
+        .to_string();
+    let meta = std::fs::metadata(&path).map_err(|e| format!("Could not read {name}: {e}"))?;
+    let size = meta.len();
+    if size == 0 {
+        return Err(format!("{name} is empty."));
+    }
+    if size > MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "{name} is {}. Lipi loads audio up to 100 MB. Choose a smaller file.",
+            captures::format_bytes(size)
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("Could not read {name}: {e}"))?;
+    let mime = captures::mime_for_ext(&captures::audio_ext(&name)).to_string();
+    match transcribe_bytes(&state, bytes.clone(), &name, &mime).await {
+        Ok(result) if result.text.trim().is_empty() => Err(captures::keep_failed(
+            &state.db,
+            &state.app_data_dir,
+            &name,
+            &bytes,
+            "The provider returned an empty transcript.",
+        )),
+        Ok(result) => Ok(result),
+        Err(e) => Err(captures::keep_failed(
+            &state.db,
+            &state.app_data_dir,
+            &name,
+            &bytes,
+            &e,
+        )),
+    }
+}
+
 #[tauri::command]
 async fn install_faster_whisper(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let app_data_dir = state.app_data_dir.clone();
@@ -1064,6 +1302,7 @@ async fn transform_with_llm(
         text: result_text,
         cf_neurons,
         cf_cost,
+        meeting_session_id: None,
     })
 }
 
@@ -1413,6 +1652,7 @@ pub fn run() {
             None,
         ))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let app_data_dir = app
                 .path()
@@ -1556,6 +1796,7 @@ pub fn run() {
             // X11 grabs do not see keys delivered to Wayland windows. The portal does.
             shortcut::spawn_wayland_shortcuts(app.handle().clone());
 
+            let reminder_db = db_arc.clone();
             app.manage(AppState {
                 db: db_arc,
                 audio: Arc::new(AudioRecorder::new()),
@@ -1567,6 +1808,15 @@ pub fn run() {
                 tray_record_item: record_item,
                 live_worker: Arc::new(std::sync::Mutex::new(None)),
                 live_cancel: Arc::new(AtomicBool::new(false)),
+                meeting_worker: Arc::new(std::sync::Mutex::new(None)),
+                meeting_cancel: Arc::new(AtomicBool::new(false)),
+                meeting_id: Arc::new(std::sync::Mutex::new(None)),
+            });
+
+            let reminder_app = app.handle().clone();
+            std::thread::spawn(move || loop {
+                meetings::notify_due(&reminder_app, &reminder_db);
+                std::thread::sleep(std::time::Duration::from_secs(60));
             });
 
             Ok(())
@@ -1593,6 +1843,11 @@ pub fn run() {
             download_vad_model,
             is_recording,
             stop_recording_and_transcribe,
+            list_audio_captures,
+            delete_audio_capture,
+            retry_audio_capture,
+            pick_audio_path,
+            transcribe_upload,
             paste_into_previous_app,
             get_notes,
             save_note,
@@ -1630,7 +1885,17 @@ pub fn run() {
             check_system_prerequisites,
             test_and_fetch_models,
             check_for_update,
-            download_and_launch_update
+            download_and_launch_update,
+            meetings::start_meeting,
+            meetings::stop_meeting,
+            meetings::cancel_meeting,
+            meetings::list_meetings,
+            meetings::get_meeting,
+            meetings::delete_meeting,
+            meetings::set_action_item_done,
+            meetings::list_languages,
+            meetings::list_meeting_styles,
+            meetings::list_session_captures
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -28,7 +28,9 @@ tauri = { version = "2", features = ["image-png", "tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
+chrono = "0.4"
 serde_json = "1"
 cpal = "0.15"
 hound = "3.5"
@@ -43,9 +45,19 @@ ndarray = "0.16"
 x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
 gio = "0.18"
 glib = "0.18"
+libpulse-binding = "2.30"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rfd = "0.15"
+core-foundation = "0.10"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSUUID", "NSValue"] }
+objc2-core-audio = { version = "0.3", features = ["objc2-foundation"] }
+objc2-core-audio-types = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 rfd = "0.15"
+wasapi = "0.26"
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading", "Win32_Graphics_Dwm"] }
 
 

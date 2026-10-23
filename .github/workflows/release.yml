@@ -59,7 +59,8 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            libasound2-dev
+            libasound2-dev \
+            libpulse-dev
 
       - name: Install frontend dependencies
         run: npm ci || npm install
@@ -71,7 +72,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: ${{ steps.ver.outputs.prerelease == 'true' && format('Lipi v{0} (dev)', steps.ver.outputs.version) || format('Lipi v{0}', steps.ver.outputs.version) }}
-          releaseBody: ${{ steps.ver.outputs.prerelease == 'true' && 'Developer pre-release from the dev branch. Download the installer for your platform from the assets below. This build is not a stable release.' || 'Stable Lipi release. Download the installer for your platform from the assets below.' }}
+          releaseBody: "${{ steps.ver.outputs.prerelease == 'true' && 'Developer pre-release from the dev branch. Download the installer for your platform from the assets below. This build is not a stable release.' || format('Meetings (beta) are in this release. Open Meetings in Lipi to record a call and save the notes on this computer. https://github.com/debjit/lipi/blob/v{0}/README.md#meetings Download the installer for your platform from the assets below.', steps.ver.outputs.version) }}"
           releaseDraft: true
           prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
           args: ${{ matrix.args }}
@@ -81,6 +82,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -147,6 +149,12 @@ jobs:
             --prerelease=false \
             --latest \
             --title "Lipi v${{ steps.channel.outputs.version }}"
+
+      - name: Update apt repository
+        if: steps.channel.outputs.stable == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run apt-repo.yml --ref "${{ steps.channel.outputs.tag }}"
 
       - name: Write release manifest
         if: steps.channel.outputs.stable == 'true'

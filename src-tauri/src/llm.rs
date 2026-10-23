@@ -31,6 +31,23 @@ pub fn resolve_system_prompt(preset: &str, custom_prompt: &str) -> String {
     }
 }
 
+/// Meeting notes stay off the dictation preset list so auto-paste does not rewrite a meeting.
+pub fn meeting_notes_prompt() -> &'static str {
+    "You take notes for a meeting transcript. Reply with one JSON object and nothing else. Use this shape: {\"title\":\"\",\"summary\":\"\",\"decisions\":[\"\"],\"action_items\":[{\"text\":\"\",\"due\":null}]}. title is a short name for the meeting. summary is a few sentences of what was discussed. decisions lists choices the speakers agreed on, or an empty list. action_items lists follow-ups. text is the task. due is an ISO-8601 date or datetime when a time was named, otherwise null. Keep the language of the transcript. Do not invent people, dates, or tasks that were not said."
+}
+
+/// Meeting JSON stays the shape. `prefix` comes from the meeting styles folder, not a dictation preset.
+pub fn meeting_style_prompt(prefix: &str) -> String {
+    let base = meeting_notes_prompt();
+    let extra = prefix.trim();
+    if extra.is_empty() {
+        return base.to_string();
+    }
+    format!(
+        "{base}\n\nApply this note style to the wording inside the JSON strings. The reply is still one JSON object and nothing else.\n{extra}"
+    )
+}
+
 pub fn normalize_base_url(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if (trimmed.contains(":11434") || trimmed.to_lowercase().contains("ollama"))
@@ -419,6 +436,13 @@ mod tests {
         assert!(resolve_system_prompt("casual", "").contains("conversational"));
         assert!(resolve_system_prompt("concise", "").contains("Condense"));
         assert!(resolve_system_prompt("bullets", "").contains("bullet"));
+        assert!(meeting_notes_prompt().contains("action_items"));
+        assert!(!resolve_system_prompt("meeting_notes", "").contains("action_items"));
+        assert_eq!(meeting_style_prompt(""), meeting_notes_prompt());
+        let styled = meeting_style_prompt("Keep the summary to two sentences.");
+        assert!(styled.contains("action_items"));
+        assert!(styled.contains("Keep the summary to two sentences."));
+        assert!(!styled.contains("Output ONLY the rewritten text"));
         assert_eq!(
             resolve_system_prompt("custom", "Make it a poem"),
             "Make it a poem"
