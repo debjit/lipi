@@ -19,6 +19,11 @@ impl Drop for PlaybackCapture {
     }
 }
 
+/// PulseAudio reports a hole in bytes of the stream format. Meetings capture float32.
+pub fn hole_sample_count(nbytes: usize) -> usize {
+    nbytes / 4
+}
+
 pub fn open_playback() -> Result<PlaybackCapture, String> {
     #[cfg(windows)]
     {
@@ -413,7 +418,13 @@ mod linux {
                     }
                     let _ = stream.discard();
                 }
-                Ok(PeekResult::Hole(_)) => {
+                Ok(PeekResult::Hole(nbytes)) => {
+                    let silent = super::hole_sample_count(nbytes);
+                    if silent > 0 {
+                        if let Ok(mut lock) = samples.lock() {
+                            lock.extend(std::iter::repeat(0.0).take(silent));
+                        }
+                    }
                     let _ = stream.discard();
                 }
                 Ok(PeekResult::Empty) => {
@@ -806,5 +817,17 @@ mod macos {
             let sum: f32 = frame.iter().copied().sum();
             out.push(sum / frame.len() as f32);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hole_sample_count;
+
+    #[test]
+    fn a_playback_hole_becomes_silence_of_the_reported_size() {
+        assert_eq!(hole_sample_count(800), 200);
+        assert_eq!(hole_sample_count(0), 0);
+        assert_eq!(hole_sample_count(3), 0);
     }
 }

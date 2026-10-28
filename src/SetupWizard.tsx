@@ -113,7 +113,7 @@ export interface SetupWizardProps {
   onFinish: (
     settingsPatch: {
       engine_mode: "local" | "cloud";
-      local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan";
+      local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan" | "parakeet";
       local_model_size: LocalModelSize;
       api_base_url: string;
       api_key: string;
@@ -134,7 +134,7 @@ export interface SetupWizardProps {
   onStartRecording: () => Promise<void>;
   currentSettings: {
     engine_mode: "local" | "cloud";
-    local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan";
+    local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan" | "parakeet";
     local_model_size: LocalModelSize;
     api_base_url: string;
     api_key: string;

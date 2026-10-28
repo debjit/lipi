@@ -35,6 +35,7 @@ pub struct MeetingSegment {
     pub start_ms: i64,
     pub end_ms: i64,
     pub text: String,
+    pub source: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -87,6 +88,7 @@ pub struct AppSettings {
     pub provider_id: Option<String>,
     pub wizard_completed: bool,
     pub live_dictation: bool,
+    pub meeting_engine: String,
 }
 
 impl Default for AppSettings {
@@ -103,13 +105,14 @@ impl Default for AppSettings {
             local_engine: "whisper_cpu".into(),
             local_model_size: "base".into(),
             models_folder: String::new(),
-            model_idle_timeout_mins: 10,
+            model_idle_timeout_mins: 0,
             request_timeout_secs: 180,
             mini_record_mode: "new_note".into(),
             shortcut_record_mode: "new_note".into(),
             provider_id: None,
             wizard_completed: false,
             live_dictation: false,
+            meeting_engine: "parakeet".into(),
         }
     }
 }
@@ -259,7 +262,8 @@ impl Database {
                 session_id INTEGER NOT NULL,
                 start_ms INTEGER NOT NULL,
                 end_ms INTEGER NOT NULL,
-                text TEXT NOT NULL
+                text TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS action_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -303,6 +307,10 @@ impl Database {
         );
         let _ = conn.execute("ALTER TABLE audio_captures ADD COLUMN session_id INTEGER", []);
         let _ = conn.execute("ALTER TABLE audio_captures ADD COLUMN start_ms INTEGER", []);
+        let _ = conn.execute(
+            "ALTER TABLE segments ADD COLUMN source TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_captures_session ON audio_captures(session_id)",
             [],
@@ -412,13 +420,14 @@ impl Database {
             local_engine: get_val("local_engine").unwrap_or_else(|| "whisper_cpu".into()),
             local_model_size: get_val("local_model_size").unwrap_or_else(|| "base".into()),
             models_folder: get_val("models_folder").unwrap_or_default(),
-            model_idle_timeout_mins: get_val("model_idle_timeout_mins").and_then(|v| v.parse().ok()).unwrap_or(10),
+            model_idle_timeout_mins: get_val("model_idle_timeout_mins").and_then(|v| v.parse().ok()).unwrap_or(0),
             request_timeout_secs: get_val("request_timeout_secs").and_then(|v| v.parse().ok()).unwrap_or(180).max(180),
             mini_record_mode: get_val("mini_record_mode").unwrap_or_else(|| "new_note".into()),
             shortcut_record_mode: get_val("shortcut_record_mode").unwrap_or_else(|| "new_note".into()),
             provider_id: get_val("provider_id").filter(|s| !s.is_empty()),
             wizard_completed: get_val("wizard_completed").map(|v| v == "true" || v == "1").unwrap_or(false),
             live_dictation: get_val("live_dictation").map(|v| v == "true" || v == "1").unwrap_or(false),
+            meeting_engine: get_val("meeting_engine").unwrap_or_else(|| "parakeet".into()),
         })
     }
 
@@ -450,6 +459,7 @@ impl Database {
         set_val("provider_id", settings.provider_id.as_deref().unwrap_or("")).map_err(|e| e.to_string())?;
         set_val("wizard_completed", if settings.wizard_completed { "true" } else { "false" }).map_err(|e| e.to_string())?;
         set_val("live_dictation", if settings.live_dictation { "true" } else { "false" }).map_err(|e| e.to_string())?;
+        set_val("meeting_engine", &settings.meeting_engine).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -775,12 +785,13 @@ impl Database {
         session_id: i64,
         start_ms: i64,
         end_ms: i64,
+        source: &str,
         text: &str,
     ) -> Result<MeetingSegment, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
-            "INSERT INTO segments (session_id, start_ms, end_ms, text) VALUES (?1, ?2, ?3, ?4)",
-            params![session_id, start_ms, end_ms, text],
+            "INSERT INTO segments (session_id, start_ms, end_ms, text, source) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, start_ms, end_ms, text, source],
         )
         .map_err(|e| e.to_string())?;
         let id = conn.last_insert_rowid();
@@ -790,14 +801,43 @@ impl Database {
             start_ms,
             end_ms,
             text: text.to_string(),
+            source: source.to_string(),
         })
+    }
+
+    pub fn delete_mic_line(&self, session_id: i64, start_ms: i64, text: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM segments WHERE session_id = ?1 AND start_ms = ?2 AND source = 'mic' AND text = ?3",
+            params![session_id, start_ms, text],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn replace_segments(
+        &self,
+        session_id: i64,
+        rows: &[(i64, i64, String, String)],
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM segments WHERE session_id = ?1", params![session_id])
+            .map_err(|e| e.to_string())?;
+        for (start_ms, end_ms, source, text) in rows {
+            conn.execute(
+                "INSERT INTO segments (session_id, start_ms, end_ms, text, source) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![session_id, start_ms, end_ms, text, source],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn segments_for(&self, session_id: i64) -> Result<Vec<MeetingSegment>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, session_id, start_ms, end_ms, text FROM segments WHERE session_id = ?1 ORDER BY start_ms, id",
+                "SELECT id, session_id, start_ms, end_ms, text, source FROM segments WHERE session_id = ?1 ORDER BY start_ms, id",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -808,6 +848,7 @@ impl Database {
                     start_ms: row.get(2)?,
                     end_ms: row.get(3)?,
                     text: row.get(4)?,
+                    source: row.get(5)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1062,7 +1103,7 @@ mod tests {
         assert_eq!(default_settings.local_engine, "whisper_cpu");
         assert_eq!(default_settings.local_model_size, "base");
         assert_eq!(default_settings.models_folder, "");
-        assert_eq!(default_settings.model_idle_timeout_mins, 10);
+        assert_eq!(default_settings.model_idle_timeout_mins, 0);
         assert_eq!(default_settings.mini_record_mode, "new_note");
         assert_eq!(default_settings.shortcut_record_mode, "new_note");
 
@@ -1085,6 +1126,7 @@ mod tests {
             provider_id: Some("GROQ_DEFAULT".into()),
             wizard_completed: true,
             live_dictation: true,
+            meeting_engine: "dictation".into(),
         };
         db.save_settings(&new_settings).unwrap();
         let loaded = db.get_settings().unwrap();
@@ -1106,6 +1148,8 @@ mod tests {
         assert_eq!(loaded.provider_id, Some("GROQ_DEFAULT".into()));
         assert_eq!(loaded.wizard_completed, true);
         assert_eq!(loaded.live_dictation, true);
+        assert_eq!(loaded.meeting_engine, "dictation");
+        assert_eq!(default_settings.meeting_engine, "parakeet");
         assert!(!default_settings.live_dictation);
     }
 
@@ -1303,7 +1347,7 @@ mod tests {
         assert_eq!(session.style_prefix, "Keep it short.");
 
         db.set_session_audio_path(session.id, "/tmp/audio.wav").unwrap();
-        let seg = db.insert_segment(session.id, 0, 1500, "hello").unwrap();
+        let seg = db.insert_segment(session.id, 0, 1500, "", "hello").unwrap();
         assert_eq!(seg.text, "hello");
 
         let actions = db

@@ -24,6 +24,7 @@ interface MeetingSegment {
   start_ms: number;
   end_ms: number;
   text: string;
+  source?: string;
 }
 
 interface ActionItem {
@@ -47,6 +48,20 @@ interface SegmentEvent {
   start_ms: number;
   end_ms: number;
   text: string;
+  source?: string;
+}
+
+interface PartialEvent {
+  session_id: number;
+  source: string;
+  start_ms: number;
+  text: string;
+}
+
+function speakerLabel(source?: string): string {
+  if (source === "mic") return "Mic";
+  if (source === "call") return "Call";
+  return "";
 }
 
 interface AudioCapture {
@@ -76,18 +91,24 @@ type MeetingScreen = "new" | "recording" | "review";
 const MEETING_STYLE_KEY = "lipi.meeting.style";
 const MEETING_PREFIX_KEY = "lipi.meeting.prefix";
 const MEETING_CAPTURE_KEY = "lipi.meeting.capture";
+const MEETING_LIVE_KEY = "lipi.meeting.live";
+const MEETING_KEEP_KEY = "lipi.meeting.keep";
+const MEETING_CALL_KEY = "lipi.meeting.callonly";
 
 export function Meetings({
   onBack,
   onOpenNote,
   onOpenPreferences,
+  meetingEngine = "parakeet",
 }: {
   onBack: () => void;
   onOpenNote: (id: number) => void;
   onOpenPreferences: () => void;
+  meetingEngine?: "parakeet" | "dictation";
 }) {
   const [sessions, setSessions] = useState<MeetingSession[]>([]);
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
+  const [partials, setPartials] = useState<Record<string, { start_ms: number; text: string }>>({});
   const [screen, setScreen] = useState<MeetingScreen>("new");
   const [phase, setPhase] = useState<"idle" | "starting" | "recording" | "saving">("idle");
   const [chunkBusy, setChunkBusy] = useState(false);
@@ -98,6 +119,10 @@ export function Meetings({
   const [styles, setStyles] = useState<PromptChoice[]>([]);
   const [styleId, setStyleId] = useState(() => localStorage.getItem(MEETING_STYLE_KEY) || "notes");
   const [stylePrefix, setStylePrefix] = useState(() => localStorage.getItem(MEETING_PREFIX_KEY) || "");
+  const [liveLines, setLiveLines] = useState(() => localStorage.getItem(MEETING_LIVE_KEY) !== "0");
+  const [keepAudio, setKeepAudio] = useState(() => localStorage.getItem(MEETING_KEEP_KEY) !== "0");
+  const [callOnly, setCallOnly] = useState(() => localStorage.getItem(MEETING_CALL_KEY) === "1");
+  const [redoing, setRedoing] = useState(false);
   const [failed, setFailed] = useState<AudioCapture[]>([]);
   const [retryingId, setRetryingId] = useState<number | null>(null);
   const [sources, setSources] = useState<CaptureSources | null>(() => {
@@ -159,6 +184,7 @@ export function Meetings({
     setDetail(null);
     setFailed([]);
     setSources(null);
+    setPartials({});
     sessionStorage.removeItem(MEETING_CAPTURE_KEY);
     setScreen("new");
     setPhase("idle");
@@ -185,9 +211,15 @@ export function Meetings({
     };
     track("meeting_segment", (event: SegmentEvent) => {
       if (event.session_id !== activeIdRef.current) return;
+      setPartials((current) => {
+        if (!event.source || !(event.source in current)) return current;
+        const next = { ...current };
+        delete next[event.source];
+        return next;
+      });
       setDetail((current) => {
         if (!current || current.session.id !== event.session_id) return current;
-        if (current.segments.some((seg) => seg.start_ms === event.start_ms && seg.text === event.text)) {
+        if (current.segments.some((seg) => seg.start_ms === event.start_ms && seg.text === event.text && seg.source === event.source)) {
           return current;
         }
         return {
@@ -200,9 +232,31 @@ export function Meetings({
               start_ms: event.start_ms,
               end_ms: event.end_ms,
               text: event.text,
+              source: event.source || "",
             },
           ],
         };
+      });
+    });
+    track("meeting_segment_drop", (event: SegmentEvent) => {
+      if (event.session_id !== activeIdRef.current) return;
+      setDetail((current) => {
+        if (!current || current.session.id !== event.session_id) return current;
+        return {
+          ...current,
+          segments: current.segments.filter(
+            (seg) => !(seg.source === (event.source || "mic") && seg.start_ms === event.start_ms && seg.text === event.text)
+          ),
+        };
+      });
+    });
+    track("meeting_partial", (event: PartialEvent) => {
+      if (event.session_id !== activeIdRef.current) return;
+      setPartials((current) => {
+        const next = { ...current };
+        if (!event.text.trim()) delete next[event.source];
+        else next[event.source] = { start_ms: event.start_ms, text: event.text };
+        return next;
       });
     });
     track("meeting_transcribing", (busy: boolean) => setChunkBusy(busy));
@@ -236,7 +290,7 @@ export function Meetings({
   useEffect(() => {
     const node = transcriptRef.current;
     if (node) node.scrollTop = node.scrollHeight;
-  }, [detail?.segments.length]);
+  }, [detail?.segments.length, partials]);
 
   function showNew() {
     if (recordingIdRef.current) return;
@@ -269,12 +323,19 @@ export function Meetings({
     try {
       localStorage.setItem(MEETING_STYLE_KEY, styleId);
       localStorage.setItem(MEETING_PREFIX_KEY, stylePrefix);
+      localStorage.setItem(MEETING_LIVE_KEY, liveLines ? "1" : "0");
+      localStorage.setItem(MEETING_KEEP_KEY, keepAudio ? "1" : "0");
+      localStorage.setItem(MEETING_CALL_KEY, callOnly ? "1" : "0");
       const session = await invoke<MeetingSession>("start_meeting", {
         styleId,
         stylePrefix: styleId === "custom" ? stylePrefix : "",
+        live: liveLines,
+        keepAudio,
+        callOnly,
       });
       activeIdRef.current = session.id;
       recordingIdRef.current = session.id;
+      setPartials({});
       setDetail({ session, segments: [], actions: [] });
       setFailed([]);
       setScreen("recording");
@@ -298,6 +359,7 @@ export function Meetings({
       if (stoppingLive) {
         recordingIdRef.current = null;
         setChunkBusy(false);
+        setPartials({});
         setSources(null);
         sessionStorage.removeItem(MEETING_CAPTURE_KEY);
         setScreen("review");
@@ -386,6 +448,21 @@ export function Meetings({
     }
   }
 
+  async function retranscribe(id: number) {
+    setRedoing(true);
+    setError(null);
+    try {
+      const next = await invoke<MeetingDetail>("retranscribe_meeting", { sessionId: id });
+      setDetail(next);
+      const list = await invoke<MeetingSession[]>("list_meetings");
+      setSessions(list);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setRedoing(false);
+    }
+  }
+
   async function discardChunk(id: number) {
     if (!detail) return;
     try {
@@ -438,7 +515,12 @@ export function Meetings({
         </aside>
 
         <section className="meetings-detail">
-          {error && <div className="toast-error-message meetings-error">{error}</div>}
+          {error && (
+            <div className="toast-error-message meetings-error" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span>{error}</span>
+              <button type="button" className="btn-icon" onClick={() => setError(null)} title="Dismiss" style={{ color: "inherit", marginLeft: "8px" }}>✕</button>
+            </div>
+          )}
 
           {screen === "new" && (
             <div className="meetings-setup">
@@ -473,6 +555,67 @@ export function Meetings({
                   />
                 </label>
               )}
+              <fieldset className="meetings-choices">
+                <legend>Transcript</legend>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                  <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+                    Engine: <strong style={{ color: "var(--text-primary)" }}>{meetingEngine === "dictation" ? "Dictation Engine" : "NVIDIA Parakeet (EOU + TDT v3)"}</strong>
+                  </span>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    style={{ fontSize: "11px", padding: "2px 8px" }}
+                    onClick={onOpenPreferences}
+                    title="Configure meeting speech engine in Settings"
+                  >
+                    ⚙ Engine Settings
+                  </button>
+                </div>
+                <label className="checkbox-label">
+                  <input
+                    type="radio"
+                    name="meeting-when"
+                    className="checkbox-input"
+                    checked={liveLines}
+                    onChange={() => setLiveLines(true)}
+                  />
+                  <span>Show lines as we talk</span>
+                </label>
+                <label className="checkbox-label">
+                  <input
+                    type="radio"
+                    name="meeting-when"
+                    className="checkbox-input"
+                    checked={!liveLines}
+                    onChange={() => setLiveLines(false)}
+                  />
+                  <span>Record now, transcribe when I stop</span>
+                </label>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    className="checkbox-input"
+                    checked={callOnly}
+                    onChange={(e) => setCallOnly(e.target.checked)}
+                  />
+                  <span>Playing on speakers — call audio only</span>
+                </label>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    className="checkbox-input"
+                    checked={keepAudio}
+                    onChange={(e) => setKeepAudio(e.target.checked)}
+                  />
+                  <span>Keep the recording</span>
+                </label>
+                <p className="form-hint">
+                  {callOnly
+                    ? "The microphone stays off, so the speakers are not written a second time. Leave this off when you need your own voice, or when you are on headphones. "
+                    : ""}
+                  The meeting is saved as one audio file. Keep it if you want to transcribe it again when the text is off.
+                </p>
+              </fieldset>
               <div className="meetings-controls">
                 <button
                   type="button"
@@ -498,7 +641,7 @@ export function Meetings({
                 }}
                 disabled={busy}
               >
-                {phase === "saving" ? "Writing note…" : "■ Stop"}
+                {phase === "saving" ? (liveLines ? "Writing note…" : "Transcribing…") : "■ Stop"}
               </button>
               <span className="record-elapsed-time">{formatClock(elapsed)}</span>
               {chunkBusy && <span className="live-wait" title="Transcribing the last pause" />}
@@ -600,6 +743,16 @@ export function Meetings({
                 )}
                 {screen === "review" && (
                   <div className="meetings-detail-actions">
+                    {detail.session.audio_path && (
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        disabled={busy || redoing}
+                        onClick={() => void retranscribe(detail.session.id)}
+                      >
+                        {redoing ? "Transcribing…" : "Transcribe again"}
+                      </button>
+                    )}
                     {detail.session.note_id != null && (
                       <button type="button" className="btn btn-secondary" onClick={() => onOpenNote(detail.session.note_id as number)}>
                         Open note
@@ -613,15 +766,33 @@ export function Meetings({
               </div>
 
               <div className="meetings-transcript" ref={transcriptRef}>
-                {detail.segments.length === 0 ? (
-                  <div className="history-empty">The transcript shows up here as you talk.</div>
+                {detail.segments.length === 0 && Object.keys(partials).length === 0 ? (
+                  <div className="history-empty">
+                    {screen === "recording" && !liveLines
+                      ? "The transcript is written when you stop."
+                      : "The transcript shows up here as you talk."}
+                  </div>
                 ) : (
-                  detail.segments.map((seg) => (
-                    <p key={`${seg.id}-${seg.start_ms}`}>
-                      <span className="meetings-stamp">{formatMs(seg.start_ms)}</span>
-                      {seg.text}
-                    </p>
-                  ))
+                  <>
+                    {detail.segments.map((seg) => (
+                      <p key={`${seg.id}-${seg.start_ms}-${seg.source || ""}`}>
+                        <span className="meetings-stamp">
+                          {speakerLabel(seg.source) ? `${speakerLabel(seg.source)} ` : ""}
+                          {formatMs(seg.start_ms)}
+                        </span>
+                        {seg.text}
+                      </p>
+                    ))}
+                    {Object.entries(partials).map(([source, line]) => (
+                      <p key={`open-${source}`} className="meetings-open">
+                        <span className="meetings-stamp">
+                          {speakerLabel(source) ? `${speakerLabel(source)} ` : ""}
+                          {formatMs(line.start_ms)}
+                        </span>
+                        {line.text}
+                      </p>
+                    ))}
+                  </>
                 )}
               </div>
             </>

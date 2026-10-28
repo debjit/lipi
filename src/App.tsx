@@ -27,7 +27,7 @@ interface AppSettings {
   auto_paste: boolean;
   always_on_top: boolean;
   engine_mode: "cloud" | "local";
-  local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan";
+  local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan" | "parakeet";
   local_model_size: "tiny" | "base" | "small" | "medium" | "turbo_q8";
   models_folder?: string;
   model_idle_timeout_mins?: number;
@@ -37,6 +37,7 @@ interface AppSettings {
   provider_id?: string;
   wizard_completed?: boolean;
   live_dictation?: boolean;
+  meeting_engine?: "parakeet" | "dictation";
 }
 
 function listenForever<T>(event: string, handler: (event: { payload: T }) => void) {
@@ -123,6 +124,7 @@ interface OperationResult {
   cf_neurons?: number | null;
   cf_cost?: number | null;
   meeting_session_id?: number | null;
+  duration_ms?: number | null;
 }
 
 interface AudioCapture {
@@ -179,7 +181,18 @@ function maskAccountId(id: string): string {
 function getDisplayModelName(settings: AppSettings): string {
   if (settings.engine_mode === "local") {
     // Strictly zero-cost / local offline
-    return `Whisper (${settings.local_model_size})`;
+    if (settings.local_engine === "parakeet") {
+      return "Parakeet (NVIDIA NeMo)";
+    }
+    const size = settings.local_model_size || "base";
+    const capSize = size.charAt(0).toUpperCase() + size.slice(1);
+    if (settings.local_engine === "faster_whisper") {
+      return `Faster-Whisper (${capSize})`;
+    }
+    if (settings.local_engine === "whisper_vulkan") {
+      return `Whisper GPU (${capSize})`;
+    }
+    return `Whisper (${capSize})`;
   }
   const raw = (settings.model || "").trim();
   let baseName = raw;
@@ -304,6 +317,7 @@ export default function App() {
   const [updatePercent, setUpdatePercent] = useState<number | null>(null);
   const updateDownloadActiveRef = useRef(false);
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
+  const [parakeetStatus, setParakeetStatus] = useState<ModelStatus | null>(null);
   const [memoryStatus, setMemoryStatus] = useState<ModelMemoryStatus | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
   const [vadDownloadProgress, setVadDownloadProgress] = useState<number | null>(null);
@@ -336,7 +350,7 @@ export default function App() {
     local_engine: "whisper_cpu",
     local_model_size: "base",
     models_folder: "",
-    model_idle_timeout_mins: 10,
+    model_idle_timeout_mins: 0,
     request_timeout_secs: 180,
     mini_record_mode: "new_note",
     shortcut_record_mode: "new_note",
@@ -494,18 +508,12 @@ export default function App() {
     showToast("✓ Diagnostic logs copied!");
   };
 
-  const [settingsNavTab, setSettingsNavTab] = useState<"providers" | "asr" | "llm" | "preferences" | "logs">("providers");
+  const [settingsNavTab, setSettingsNavTab] = useState<"providers" | "asr" | "llm" | "meetings" | "preferences" | "logs">("providers");
 
   const [cfUsage, setCfUsage] = useState<CloudflareUsageSummary | null>(null);
   const [loadingCfUsage, setLoadingCfUsage] = useState<boolean>(false);
   const [revealAccountId, setRevealAccountId] = useState<boolean>(false);
   const [focusedAccountId, setFocusedAccountId] = useState<string | null>(null);
-
-  const speechReady =
-    settings.engine_mode === "cloud"
-      ? settings.api_key.trim().length > 0 && !settings.api_base_url.includes("<account_id>")
-      : !!(modelStatus?.installed && modelStatus.binary_available);
-  const showSetupBanner = settings.wizard_completed && !wizardOpen && modelStatus !== null && !speechReady;
 
   const currentAsrProvider = (llmSettings.providers || []).find((p) => p.id === (settings.provider_id || (llmSettings.providers.find((pr) => pr.base_url === settings.api_base_url)?.id)));
   const isCloudflareAsr = settings.engine_mode === "cloud" && (settings.api_base_url.includes("api.cloudflare.com") || currentAsrProvider?.provider_type === "cloudflare");
@@ -709,6 +717,41 @@ export default function App() {
     }
   }
 
+  async function refreshParakeetStatus(customDir = settingsRef.current.models_folder) {
+    try {
+      const s: ModelStatus = await invoke("get_model_status", {
+        engine: "parakeet",
+        modelSize: "",
+        customModelsDir: customDir || undefined,
+      });
+      setParakeetStatus(s);
+    } catch (e) {
+      console.error("Failed to check parakeet status:", e);
+    }
+  }
+
+  async function handleDownloadParakeet(): Promise<void> {
+    setIsDownloading(true);
+    setDownloadProgress(0);
+    setErrorMsg(null);
+    try {
+      await invoke("download_model", {
+        engine: "parakeet",
+        modelSize: "",
+        customModelsDir: settingsRef.current.models_folder || undefined,
+      });
+      await refreshParakeetStatus();
+      showToast("✓ Parakeet models ready!");
+    } catch (err: any) {
+      const errStr = String(err);
+      setErrorMsg(errStr);
+      showToast(`Download failed: ${errStr}`);
+    } finally {
+      setIsDownloading(false);
+      setDownloadProgress(null);
+    }
+  }
+
   async function handleDownloadModel(): Promise<string | null> {
     setIsDownloading(true);
     setDownloadProgress(0);
@@ -719,7 +762,11 @@ export default function App() {
         modelSize: settingsRef.current.local_model_size,
         customModelsDir: settingsRef.current.models_folder || undefined,
       });
-      if (settingsRef.current.live_dictation && settingsRef.current.engine_mode === "local") {
+      if (
+        settingsRef.current.live_dictation &&
+        settingsRef.current.engine_mode === "local" &&
+        settingsRef.current.local_engine !== "parakeet"
+      ) {
         await downloadVadModel();
       }
       await updateAndSaveSettings({
@@ -1423,6 +1470,7 @@ export default function App() {
       settingsRef.current = s;
       await invoke("set_always_on_top", { alwaysOnTop: s.always_on_top });
       await refreshModelStatus(s.local_engine, s.local_model_size);
+      await refreshParakeetStatus(s.models_folder);
       await refreshVadInstalled();
       await refreshMemoryStatus();
       await loadLlmSettings();
@@ -1478,12 +1526,13 @@ export default function App() {
     }
   }
 
-  function openSettings(tab: "providers" | "asr" | "llm" | "preferences" | "logs" = "asr") {
+  function openSettings(tab: "providers" | "asr" | "llm" | "meetings" | "preferences" | "logs" = "asr") {
     setSettingsNavTab(tab);
     loadSettings();
     loadLlmSettings();
     loadCfUsage();
     refreshModelStatus();
+    refreshParakeetStatus();
     refreshMemoryStatus();
     setActiveView("settings");
   }
@@ -1626,7 +1675,7 @@ export default function App() {
     transcript: string,
     itemNeurons: number | null,
     itemCost: number | null,
-    mode: { createNew: boolean; wasLive: boolean; liveBase: string; liveNoteId: number | null },
+    mode: { createNew: boolean; wasLive: boolean; liveBase: string; liveNoteId: number | null; durationMs?: number | null },
   ) {
     const spoken = transcript.trim();
     if (!spoken) return;
@@ -1634,13 +1683,15 @@ export default function App() {
     const wasLive = mode.wasLive;
     const liveBase = mode.liveBase;
     const liveNoteId = mode.liveNoteId;
+    const durationMs = mode.durationMs ?? null;
+    const durationSec = durationMs != null ? (durationMs / 1000).toFixed(1) + "s" : "";
     await loadCfUsage();
 
     const isCfAsr = settingsRef.current.engine_mode === "cloud" && (settingsRef.current.api_base_url || "").includes("api.cloudflare.com");
     const isLocalAsr = settingsRef.current.engine_mode === "local";
     const isTinyEn = isCfAsr && (settingsRef.current.model || "").includes("tiny");
 
-    let asrMsg = `Transcribed ${spoken.split(/\s+/).filter(Boolean).length} words.`;
+    let asrMsg = `Transcribed ${spoken.split(/\s+/).filter(Boolean).length} words${durationSec ? ` in ${durationSec}` : ""}.`;
     if (isTinyEn) {
       asrMsg += ` (whisper-tiny-en · Beta)`;
     } else if (isCfAsr) {
@@ -1651,7 +1702,16 @@ export default function App() {
       asrMsg += ` (Local engine - zero cost)`;
     }
 
+    if (llmSettingsRef.current.enabled) {
+      asrMsg += " · LLM Transform: Active";
+    } else {
+      asrMsg += " · LLM Post-Processing: OFF";
+    }
+
     let asrDetails = `Result: "${spoken.slice(0, 200)}${spoken.length > 200 ? "..." : ""}"`;
+    if (durationMs != null) {
+      asrDetails += `\n\nLatency: ${durationMs}ms`;
+    }
     if (isTinyEn) {
       asrDetails += `\n\nCloudflare Workers AI (whisper-tiny-en Beta · Fast) - zero neuron billing.`;
     } else if (isCfAsr) {
@@ -1698,16 +1758,17 @@ export default function App() {
       if (llmSettingsRef.current.auto_mode) {
         await handleTransform(nextRaw, true);
       } else {
-        await deliverTranscript(spoken, "✓ Transcribed to raw buffer!");
+        await deliverTranscript(spoken, durationSec ? `✓ Transcribed to raw buffer in ${durationSec}!` : "✓ Transcribed to raw buffer!");
       }
     } else {
       let nextContent: string;
       let targetNoteId: number | null;
 
+      setLlmResult("");
+
       if (shouldCreateNewNote) {
         nextContent = spoken;
         targetNoteId = wasLive ? liveNoteId : null;
-        setLlmResult("");
       } else if (wasLive) {
         const base = liveBase.trim();
         nextContent = base ? `${base} ${spoken}` : spoken;
@@ -1733,7 +1794,7 @@ export default function App() {
         details: asrDetails,
       });
 
-      await deliverTranscript(spoken, "✓ Transcribed!");
+      await deliverTranscript(spoken, durationSec ? `✓ Transcribed in ${durationSec}!` : "✓ Transcribed!");
     }
   }
 
@@ -1774,7 +1835,9 @@ export default function App() {
         }
 
         const live =
-          settingsRef.current.engine_mode === "local" && !!settingsRef.current.live_dictation;
+          settingsRef.current.engine_mode === "local" &&
+          !!settingsRef.current.live_dictation &&
+          settingsRef.current.local_engine !== "parakeet";
         liveActiveRef.current = live;
         liveSeqRef.current = 0;
         setLiveChunkBusy(false);
@@ -1804,7 +1867,9 @@ export default function App() {
         liveActiveRef.current = false;
         isShortcutRecordingRef.current = false;
         wasLipiFocusedOnRecordRef.current = false;
-        setErrorMsg(String(err));
+        const msg = String(err);
+        setErrorMsg(msg);
+        showToast(`⚠️ ${msg}`);
       } finally {
         recordingOpInFlightRef.current = false;
       }
@@ -1822,8 +1887,11 @@ export default function App() {
         livePersistTimer.current = null;
       }
       setIsTranscribing(true);
+      const transcribeStartTime = performance.now();
       try {
         const res: OperationResult = await invoke("stop_recording_and_transcribe");
+        const clientDurationMs = Math.round(performance.now() - transcribeStartTime);
+        const elapsedDurationMs = res?.duration_ms ?? clientDurationMs;
         const returned = (res && typeof res === "object" ? res.text : String(res || "")).trim();
         const transcript = returned || (wasLive ? liveAcc.trim() : "");
         const itemNeurons = res?.cf_neurons ?? null;
@@ -1840,6 +1908,7 @@ export default function App() {
             wasLive,
             liveBase,
             liveNoteId,
+            durationMs: elapsedDurationMs,
           });
         }
       } catch (err: any) {
@@ -1871,6 +1940,7 @@ export default function App() {
       wasLive: false,
       liveBase: "",
       liveNoteId: null,
+      durationMs: res?.duration_ms ?? null,
     });
   }
 
@@ -2311,7 +2381,8 @@ export default function App() {
           onOpenNote={(id) => {
             void openMeetingNote(id);
           }}
-          onOpenPreferences={() => openSettings("preferences")}
+          onOpenPreferences={() => openSettings("meetings")}
+          meetingEngine={settings.meeting_engine || "parakeet"}
         />
       </div>
     );
@@ -2453,6 +2524,14 @@ export default function App() {
                 <span className="settings-nav-icon">🤖</span>
                 <span className="settings-nav-label">LLM Transform</span>
                 {llmSettings.enabled && <span className="settings-badge-on">ON</span>}
+              </button>
+              <button
+                type="button"
+                className={`settings-nav-tab ${settingsNavTab === "meetings" ? "active" : ""}`}
+                onClick={() => setSettingsNavTab("meetings")}
+              >
+                <span className="settings-nav-icon">👥</span>
+                <span className="settings-nav-label">Meetings</span>
               </button>
               <button
                 type="button"
@@ -3135,6 +3214,9 @@ export default function App() {
                       <option value="whisper_vulkan">
                         Vulkan-Accelerated Whisper (GPU) — Hardware GPU compute (cross-vendor)
                       </option>
+                      <option value="parakeet">
+                        NVIDIA Parakeet (EOU 120M + TDT 0.6B v3) — High-speed FastConformer with built-in ONNX Runtime
+                      </option>
                     </select>
                   </div>
                   <div className="form-group">
@@ -3142,7 +3224,8 @@ export default function App() {
                       <input
                         type="checkbox"
                         className="checkbox-input"
-                        checked={!!settings.live_dictation}
+                        checked={settings.local_engine === "parakeet" ? false : !!settings.live_dictation}
+                        disabled={settings.local_engine === "parakeet"}
                         onChange={(e) => {
                           const on = e.target.checked;
                           if (!on) {
@@ -3171,8 +3254,9 @@ export default function App() {
                       </span>
                     </label>
                     <span className="form-hint" style={{ marginLeft: "26px" }}>
-                      {settings.live_dictation ? "On. " : "Off. "}
-                      {liveCpuNote(settings.local_model_size)} API transcription stays one shot after you stop. We are still working on live dictation, so results can be rough.
+                      {settings.local_engine === "parakeet"
+                        ? "Parakeet writes each meeting line as you talk, then replaces the saved transcript when you stop. Dictation runs once when you stop. Live dictation stays on the Whisper engines."
+                        : `${settings.live_dictation ? "On. " : "Off. "}${liveCpuNote(settings.local_model_size)} API transcription stays one shot after you stop. We are still working on live dictation, so results can be rough.`}
                     </span>
                     {vadDownloadProgress !== null && (
                       <div className="progress-container" style={{ marginLeft: "26px", marginTop: "6px" }}>
@@ -3198,14 +3282,16 @@ export default function App() {
                   <div className="runner-card">
                     <div className="runner-info">
                       <div className="runner-status">
-                        {modelStatus?.binary_available ? (
+                        {settings.local_engine === "parakeet" || modelStatus?.binary_available ? (
                           <span className="text-success">✓ Runner environment ready</span>
                         ) : (
                           <span className="text-warning">⚠ Runner binary/runtime missing</span>
                         )}
                       </div>
                       <div className="runner-path" title={modelStatus?.binary_path || ""}>
-                        {modelStatus?.binary_available
+                        {settings.local_engine === "parakeet"
+                          ? "ONNX Runtime is built in"
+                          : modelStatus?.binary_available
                           ? modelStatus.binary_path
                           : modelStatus?.binary_path || (settings.local_engine === "faster_whisper"
                           ? "Python faster-whisper virtualenv not configured"
@@ -3215,7 +3301,7 @@ export default function App() {
                       </div>
                     </div>
                     <div style={{ display: "flex", gap: "8px" }}>
-                      {!modelStatus?.binary_available ? (
+                      {settings.local_engine !== "parakeet" && !modelStatus?.binary_available ? (
                         <button
                           type="button"
                           className="btn btn-secondary btn-sm"
@@ -3231,7 +3317,7 @@ export default function App() {
                             : "⬇ Download Runner Binary"}
                         </button>
                       ) : (
-                        settings.local_engine !== "faster_whisper" && (
+                        settings.local_engine !== "faster_whisper" && settings.local_engine !== "parakeet" && (
                           <button
                             type="button"
                             className="btn btn-secondary btn-sm"
@@ -3295,6 +3381,7 @@ export default function App() {
                     </span>
                   </div>
 
+                  {settings.local_engine !== "parakeet" && (
                   <div className="form-group">
                     <label className="form-label">Model Size</label>
                     <select
@@ -3313,12 +3400,15 @@ export default function App() {
                       <option value="medium">Medium (~1.5 GB) — Deep nuance & accuracy (~2.5 GB RAM)</option>
                     </select>
                   </div>
+                  )}
 
                   <div className="model-status-card">
                     <div className="model-status-header">
                       <div className="model-status-title">
                         <span className="model-name">
-                          {modelStatus?.file_path
+                          {settings.local_engine === "parakeet"
+                            ? "NVIDIA Parakeet (EOU 120M + TDT 0.6B v3)"
+                            : modelStatus?.file_path
                             ? modelStatus.file_path.replace(/\\/g, "/").split("/").pop()
                             : settings.local_engine === "faster_whisper"
                             ? `faster-whisper-${settings.local_model_size}`
@@ -3329,6 +3419,8 @@ export default function App() {
                             ? "CPU"
                             : settings.local_engine === "faster_whisper"
                             ? "CTranslate2"
+                            : settings.local_engine === "parakeet"
+                            ? "NVIDIA NeMo • FastConformer"
                             : "Vulkan GPU"}
                         </span>
                       </div>
@@ -3342,6 +3434,23 @@ export default function App() {
                           : "Not Downloaded"}
                       </span>
                     </div>
+
+                    {settings.local_engine === "parakeet" && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "12px", color: "var(--text-secondary)", lineHeight: "1.5", marginTop: "4px" }}>
+                        <div>
+                          <strong style={{ color: "var(--text-primary)" }}>Dual-Model Pipeline by NVIDIA NeMo:</strong>
+                        </div>
+                        <div style={{ paddingLeft: "10px" }}>
+                          • <strong>Realtime EOU 120M v1:</strong> FastConformer streaming model for live End-of-Utterance detection.
+                        </div>
+                        <div style={{ paddingLeft: "10px" }}>
+                          • <strong>Parakeet-TDT 0.6B v3:</strong> Token-and-Duration Transducer (600M params) with duration prediction across 25 European languages.
+                        </div>
+                        <div style={{ paddingLeft: "10px" }}>
+                          • <strong>Runtime:</strong> Built-in ONNX Runtime (CPU/SIMD). 100% offline, zero cloud fees, no Python required.
+                        </div>
+                      </div>
+                    )}
 
                     {downloadProgress !== null && (
                       <div className="progress-container">
@@ -3367,7 +3476,11 @@ export default function App() {
                           onClick={handleDownloadModel}
                           disabled={isDownloading || vadDownloadProgress !== null}
                         >
-                          {isDownloading ? "Downloading..." : `⬇ Download ${settings.local_model_size} Model`}
+                          {isDownloading
+                            ? "Downloading..."
+                            : settings.local_engine === "parakeet"
+                            ? "⬇ Download Parakeet"
+                            : `⬇ Download ${settings.local_model_size} Model`}
                         </button>
                       ) : (
                         <button
@@ -3450,12 +3563,12 @@ export default function App() {
                         <div className="memory-stat-item">
                           <span className="memory-stat-label">Auto-Unload</span>
                           <span className="memory-stat-value">
-                            {(settings.model_idle_timeout_mins ?? 10) === 0
+                            {(settings.model_idle_timeout_mins ?? 0) === 0
                               ? "Disabled"
                               : `in ${formatDuration(
                                   Math.max(
                                     0,
-                                    (settings.model_idle_timeout_mins ?? 10) * 60 -
+                                    (settings.model_idle_timeout_mins ?? 0) * 60 -
                                       memoryStatus.idle_seconds
                                   )
                                 )}`}
@@ -3474,14 +3587,14 @@ export default function App() {
                         {[
                           { label: "2 mins", val: 2 },
                           { label: "5 mins", val: 5 },
-                          { label: "10 mins (Default)", val: 10 },
+                          { label: "10 mins", val: 10 },
                           { label: "30 mins", val: 30 },
-                          { label: "Never (Stay in RAM)", val: 0 },
+                          { label: "Never (Stay in RAM · Default)", val: 0 },
                         ].map((opt) => (
                           <button
                             key={opt.val}
                             type="button"
-                            className={`timeout-pill ${(settings.model_idle_timeout_mins ?? 10) === opt.val ? "active" : ""}`}
+                            className={`timeout-pill ${(settings.model_idle_timeout_mins ?? 0) === opt.val ? "active" : ""}`}
                             onClick={() => updateAndSaveSettings({ model_idle_timeout_mins: opt.val })}
                           >
                             {opt.label}
@@ -3513,7 +3626,13 @@ export default function App() {
               <LanguagePicker
                 value={settings.language || ""}
                 engineMode={settings.engine_mode}
-                modelId={settings.engine_mode === "local" ? settings.local_model_size : settings.model || ""}
+                modelId={
+                  settings.engine_mode !== "local"
+                    ? settings.model || ""
+                    : settings.local_engine === "parakeet"
+                    ? "parakeet"
+                    : settings.local_model_size
+                }
                 onChange={(code) => updateAndSaveSettings({ language: code })}
               />
             </div>
@@ -4095,6 +4214,118 @@ export default function App() {
             </>
           )}
 
+            {/* Section: Meetings Configuration */}
+            {settingsNavTab === "meetings" && (
+              <>
+                <div className="settings-section-card">
+                  <div className="settings-section-heading">
+                    <span>Meeting Speech &amp; Transcription Settings</span>
+                  </div>
+
+                  <div className="form-group" style={{ marginBottom: "16px" }}>
+                    <label className="form-label" style={{ fontWeight: 600 }}>Meeting Speech Engine</label>
+                    <select
+                      className="form-input form-select"
+                      value={settings.meeting_engine || "parakeet"}
+                      onChange={(e) => {
+                        const val = e.target.value as "parakeet" | "dictation";
+                        updateAndSaveSettings({ meeting_engine: val });
+                      }}
+                    >
+                      <option value="parakeet">
+                        ⚡ Parakeet (Local ONNX) — Live streaming lines &amp; automatic echo filtering (Recommended)
+                      </option>
+                      <option value="dictation">
+                        🎙 Use Dictation Engine — Uses the engine selected in Audio / ASR ({settings.engine_mode === "local" ? getDisplayModelName(settings) : "Cloud API"})
+                      </option>
+                    </select>
+                    <span className="form-hint" style={{ marginTop: "6px" }}>
+                      {(settings.meeting_engine || "parakeet") === "parakeet"
+                        ? "Parakeet runs locally with built-in ONNX Runtime for streaming multi-speaker meeting lines. Your normal dictation settings remain completely independent."
+                        : "Meetings will use whatever engine is configured under Audio / ASR."}
+                    </span>
+                  </div>
+
+                  {(settings.meeting_engine || "parakeet") === "parakeet" && (
+                    <div className="model-status-card" style={{ marginTop: "14px" }}>
+                      <div className="model-status-header">
+                        <div className="model-status-title">
+                          <span className="model-name">NVIDIA Parakeet (EOU 120M + TDT 0.6B v3)</span>
+                          <span className="model-engine-badge">NVIDIA NeMo</span>
+                          <span className="model-engine-badge" style={{ background: "rgba(16, 185, 129, 0.15)", color: "var(--success)" }}>
+                            ONNX Runtime
+                          </span>
+                        </div>
+                        <span className={`badge-pill ${parakeetStatus?.installed ? "installed" : "missing"}`}>
+                          {parakeetStatus?.installed ? "✓ Ready" : "Not Downloaded"}
+                        </span>
+                      </div>
+
+                      <div style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "12px", color: "var(--text-secondary)", lineHeight: "1.5" }}>
+                        <div>
+                          <strong style={{ color: "var(--text-primary)" }}>Dual-Model FastConformer Pipeline (NVIDIA NeMo):</strong>
+                        </div>
+                        <div style={{ paddingLeft: "10px" }}>
+                          • <strong>Realtime EOU 120M v1:</strong> Streaming End-of-Utterance model. Decodes live meeting speech in 160ms chunks and marks speaker turn boundaries in real time.
+                        </div>
+                        <div style={{ paddingLeft: "10px" }}>
+                          • <strong>Parakeet-TDT 0.6B v3:</strong> Token-and-Duration Transducer (600M params). Delivers high-precision transcription and full recording rewriting with 25-language European coverage.
+                        </div>
+                        <div style={{ paddingLeft: "10px" }}>
+                          • <strong>100% Offline &amp; Private:</strong> Runs locally via built-in ONNX Runtime (CPU/SIMD). Zero cloud API costs and no external Python packages needed.
+                        </div>
+                      </div>
+
+                      <div className="model-status-details" style={{ borderTop: "1px solid var(--border)", paddingTop: "8px", marginTop: "4px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px" }}>
+                          <span style={{ color: "var(--text-secondary)" }}>Installed Weights:</span>
+                          <span style={{ fontWeight: 500, color: parakeetStatus?.installed ? "var(--success)" : "var(--danger)" }}>
+                            {parakeetStatus?.installed
+                              ? `Installed (~${(parakeetStatus.file_size_bytes / (1024 * 1024)).toFixed(1)} MB on disk)`
+                              : "Missing (~2.8 GB total download required)"}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="model-status-actions">
+                        {!parakeetStatus?.installed ? (
+                          <button
+                            type="button"
+                            className="btn btn-primary btn-sm"
+                            onClick={handleDownloadParakeet}
+                            disabled={isDownloading}
+                          >
+                            {isDownloading ? "Downloading…" : "⬇ Download NVIDIA Parakeet Weights"}
+                          </button>
+                        ) : (
+                          <span className="text-success" style={{ fontSize: "12px", fontWeight: 500 }}>
+                            ✓ Models ready for multi-speaker meeting transcription
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="settings-section-card">
+                  <div className="settings-section-heading">
+                    <span>How Meeting Transcription Works</span>
+                  </div>
+                  <div style={{ fontSize: "13px", color: "var(--text-secondary)", lineHeight: "1.6" }}>
+                    <p style={{ margin: "0 0 8px 0" }}>
+                      • <strong>Separate Audio Tracks:</strong> Lipi captures your microphone and computer speaker audio separately to detect who is speaking without echo.
+                    </p>
+                    <p style={{ margin: "0 0 8px 0" }}>
+                      • <strong>Independent Settings:</strong> Changing your dictation model (e.g. to Whisper Small or Cloud ASR) does not change your meeting configuration when Parakeet is selected.
+                    </p>
+                    <p style={{ margin: "0" }}>
+                      • <strong>Meeting Notes &amp; Summaries:</strong> When LLM Transform is enabled, meetings are automatically structured into clear summaries with action items and decisions.
+                    </p>
+                  </div>
+                </div>
+              </>
+            )}
+
             {/* Section 3: General Audio & Transcription Preferences */}
             {settingsNavTab === "preferences" && (
               <div className="settings-section-card">
@@ -4369,14 +4600,6 @@ export default function App() {
       </div>
     ) : (
         <main className="main-view">
-          {showSetupBanner && (
-            <div className="setup-banner">
-              <span>Speech isn’t ready yet. Finish setup to start dictating.</span>
-              <button type="button" className="btn btn-secondary" onClick={() => setWizardOpen(true)}>
-                Finish setup
-              </button>
-            </div>
-          )}
           {/* Navbar */}
           <header className={`navbar ${isStackedNav ? "compact-stacked" : ""}`}>
             <div className="navbar-left">
@@ -4768,27 +4991,31 @@ export default function App() {
                   </div>
                   <div className="panel-actions">
                     {rawTranscript && (
-                      <>
-                        <button
-                          type="button"
-                          className="btn-panel-action"
-                          onClick={() => copyText(rawTranscript)}
-                          title="Copy raw text to clipboard"
-                        >
-                          📋 <span className="btn-panel-label">Copy</span>
-                        </button>
-                        <button
-                          type="button"
-                          className="btn-panel-action danger"
-                          onClick={() => {
-                            setRawTranscript("");
-                            rawTranscriptRef.current = "";
-                          }}
-                          title="Clear raw transcript buffer"
-                        >
-                          🗑️ <span className="btn-panel-label">Clear</span>
-                        </button>
-                      </>
+                      <button
+                        type="button"
+                        className="btn-panel-action"
+                        onClick={() => copyText(rawTranscript)}
+                        title="Copy raw text to clipboard"
+                      >
+                        📋 <span className="btn-panel-label">Copy</span>
+                      </button>
+                    )}
+                    {(rawTranscript || llmResult) && (
+                      <button
+                        type="button"
+                        className="btn-panel-action danger"
+                        onClick={() => {
+                          setRawTranscript("");
+                          rawTranscriptRef.current = "";
+                          setLlmResult("");
+                          llmResultRef.current = "";
+                          setContent("");
+                          activeContentRef.current = "";
+                        }}
+                        title="Clear raw transcript buffer and LLM result"
+                      >
+                        🗑️ <span className="btn-panel-label">Clear</span>
+                      </button>
                     )}
                   </div>
                 </div>
@@ -4856,6 +5083,17 @@ export default function App() {
                           title="Save result as current note"
                         >
                           💾 <span className="btn-panel-label">Save Note</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-panel-action danger"
+                          onClick={() => {
+                            setLlmResult("");
+                            llmResultRef.current = "";
+                          }}
+                          title="Clear LLM result"
+                        >
+                          🗑️ <span className="btn-panel-label">Clear</span>
                         </button>
                       </>
                     )}

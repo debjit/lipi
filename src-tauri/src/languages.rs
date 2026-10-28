@@ -131,7 +131,21 @@ fn is_english_only(engine_mode: &str, model_id: &str) -> bool {
     }
 }
 
+const PARAKEET: &[&str] = &[
+    "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt", "mt",
+    "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk",
+];
+
 pub fn languages_for(engine_mode: &str, model_id: &str) -> Vec<LanguageOption> {
+    if model_id == "parakeet" {
+        let mut list: Vec<LanguageOption> = WHISPER
+            .iter()
+            .filter(|lang| PARAKEET.contains(&lang.0))
+            .map(option)
+            .collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        return list;
+    }
     if is_english_only(engine_mode, model_id) {
         return WHISPER.iter().filter(|lang| lang.0 == "en").map(option).collect();
     }
@@ -189,5 +203,14 @@ mod tests {
         assert_eq!(for_asr("local", "base", Some("zz")), None);
         assert_eq!(for_asr("cloud", "whisper-tiny.en", Some("bn")), None);
         assert_eq!(for_asr("cloud", "whisper-tiny.en", Some("en")), Some("en"));
+    }
+
+    #[test]
+    fn parakeet_lists_its_twenty_five_languages() {
+        let langs = languages_for("local", "parakeet");
+        assert_eq!(langs.len(), 25);
+        assert!(!langs.iter().any(|lang| lang.code == "bn" || lang.code == "hi"));
+        assert_eq!(for_asr("local", "parakeet", Some("bn")), None);
+        assert_eq!(for_asr("local", "parakeet", Some("en")), Some("en"));
     }
 }

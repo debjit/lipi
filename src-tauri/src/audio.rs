@@ -18,8 +18,24 @@ enum Job {
     Meeting(JoinHandle<()>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackId {
+    Mic,
+    Call,
+}
+
+impl TrackId {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrackId::Mic => "mic",
+            TrackId::Call => "call",
+        }
+    }
+}
+
 pub enum MeetingAudio {
     Chunk { pcm: Vec<f32>, start_ms: u64, end_ms: u64 },
+    Pcm { source: TrackId, pcm: Vec<f32> },
     Limit,
 }
 
@@ -195,7 +211,9 @@ impl AudioRecorder {
     pub fn start_meeting(
         &self,
         wav_path: PathBuf,
-        vad_path: PathBuf,
+        vad_path: Option<PathBuf>,
+        live: bool,
+        call_only: bool,
     ) -> Result<(Receiver<MeetingAudio>, CaptureReport), String> {
         self.ensure_idle()?;
         let (stop_sender, stop_receiver) = mpsc::channel::<bool>();
@@ -209,13 +227,6 @@ impl AudioRecorder {
                     let _ = tx.send(res);
                 }
             };
-            let mut vad = match SileroVad::open(&vad_path) {
-                Ok(vad) => vad,
-                Err(e) => {
-                    report(&mut ready, Err(e));
-                    return;
-                }
-            };
             let sink = match WavSink::create(&wav_path) {
                 Ok(sink) => sink,
                 Err(e) => {
@@ -223,7 +234,11 @@ impl AudioRecorder {
                     return;
                 }
             };
-            let mic = open_microphone();
+            let mic = if call_only {
+                Ok(None)
+            } else {
+                open_microphone().map(Some)
+            };
             let playback = crate::system_audio::open_playback();
             let (mic, playback) = match (mic, playback) {
                 (Err(mic_err), Err(play_err)) => {
@@ -235,17 +250,48 @@ impl AudioRecorder {
                     );
                     return;
                 }
-                (mic, playback) => (mic.ok(), playback.ok()),
+                (mic, playback) => (mic.ok().flatten(), playback.ok()),
             };
+            if call_only && playback.is_none() {
+                report(
+                    &mut ready,
+                    Err("Call-only needs the audio this computer is playing, and that could not be opened.".into()),
+                );
+                return;
+            }
             report(
                 &mut ready,
                 Ok(CaptureReport {
                     microphone: mic.is_some(),
                     playback: playback.is_some(),
-                    note: capture_note(mic.is_some(), playback.is_some()),
+                    note: capture_note(mic.is_some(), playback.is_some(), call_only),
                 }),
             );
-            let _ = meeting_loop(mic, playback, &mut vad, sink, &seg_tx, stop_receiver);
+            if vad_path.is_none() {
+                let (mic_sink, call_sink) = if live {
+                    let mic_sink = open_track_sink(&wav_path, "mic.wav", mic.is_some());
+                    let call_sink = open_track_sink(&wav_path, "call.wav", playback.is_some());
+                    match (mic_sink, call_sink) {
+                        (Ok(mic_sink), Ok(call_sink)) => (mic_sink, call_sink),
+                        (Err(err), _) | (_, Err(err)) => {
+                            eprintln!("Meeting track file failed: {err}");
+                            return;
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+                let _ = meeting_stream_loop(mic, playback, sink, mic_sink, call_sink, &seg_tx, stop_receiver, live);
+            } else if let Some(vad_path) = vad_path {
+                let mut vad = match SileroVad::open(&vad_path) {
+                    Ok(vad) => vad,
+                    Err(err) => {
+                        eprintln!("Meeting voice activity model failed: {err}");
+                        return;
+                    }
+                };
+                let _ = meeting_loop(mic, playback, &mut vad, sink, &seg_tx, stop_receiver);
+            }
         });
 
         match ready_rx.recv() {
@@ -485,7 +531,10 @@ fn open_microphone() -> Result<MicFeed, String> {
     })
 }
 
-fn capture_note(microphone: bool, playback: bool) -> String {
+fn capture_note(microphone: bool, playback: bool, call_only: bool) -> String {
+    if call_only && playback {
+        return "Recording the call only. The microphone is off so the speakers are not written twice.".into();
+    }
     match (microphone, playback) {
         (true, true) => "Recording the microphone and the audio this computer is playing.".into(),
         (true, false) => {
@@ -498,22 +547,33 @@ fn capture_note(microphone: bool, playback: bool) -> String {
 
 const MIX_LAG_SAMPLES: usize = 16_000;
 
+fn open_track_sink(mix_path: &Path, name: &str, open: bool) -> Result<Option<WavSink>, String> {
+    if !open {
+        return Ok(None);
+    }
+    WavSink::create(&mix_path.with_file_name(name)).map(Some)
+}
+
 fn mix_capture(mic: &mut Vec<f32>, play: &mut Vec<f32>, mic_open: bool, play_open: bool) -> Vec<f32> {
+    mix_levels(mic, play, mic_open, play_open, 1.0)
+}
+
+fn mix_levels(mic: &mut Vec<f32>, play: &mut Vec<f32>, mic_open: bool, play_open: bool, scale: f32) -> Vec<f32> {
     if mic_open && play_open {
         let ahead = mic.len().abs_diff(play.len());
         if ahead > MIX_LAG_SAMPLES {
             if mic.len() > play.len() {
                 let solo: Vec<f32> = mic.drain(..ahead).collect();
                 let mut mixed = solo;
-                mixed.extend(mix_pair(mic, play));
+                mixed.extend(mix_pair(mic, play, scale));
                 return mixed;
             }
             let solo: Vec<f32> = play.drain(..ahead).collect();
             let mut mixed = solo;
-            mixed.extend(mix_pair(mic, play));
+            mixed.extend(mix_pair(mic, play, scale));
             return mixed;
         }
-        return mix_pair(mic, play);
+        return mix_pair(mic, play, scale);
     }
     if mic_open {
         return std::mem::take(mic);
@@ -524,11 +584,11 @@ fn mix_capture(mic: &mut Vec<f32>, play: &mut Vec<f32>, mic_open: bool, play_ope
     Vec::new()
 }
 
-fn mix_pair(mic: &mut Vec<f32>, play: &mut Vec<f32>) -> Vec<f32> {
+fn mix_pair(mic: &mut Vec<f32>, play: &mut Vec<f32>, scale: f32) -> Vec<f32> {
     let count = mic.len().min(play.len());
     mic.drain(..count)
         .zip(play.drain(..count))
-        .map(|(left, right)| (left + right).clamp(-1.0, 1.0))
+        .map(|(left, right)| ((left + right) * scale).clamp(-1.0, 1.0))
         .collect()
 }
 
@@ -622,6 +682,98 @@ fn meeting_loop(
         }
     }
     sink.finish()?;
+    Ok(())
+}
+
+fn meeting_stream_loop(
+    mic: Option<MicFeed>,
+    playback: Option<crate::system_audio::PlaybackCapture>,
+    mut sink: WavSink,
+    mut mic_sink: Option<WavSink>,
+    mut call_sink: Option<WavSink>,
+    seg_tx: &Sender<MeetingAudio>,
+    stop_receiver: Receiver<bool>,
+    emit: bool,
+) -> Result<(), String> {
+    let mic_open = mic.is_some();
+    let play_open = playback.is_some();
+    let mic_channels = mic.as_ref().map(|feed| feed.channels).unwrap_or(1);
+    let play_channels = playback.as_ref().map(|feed| feed.channels).unwrap_or(1);
+    let mut mic_resampler = StreamResampler::new(mic.as_ref().map(|feed| feed.sample_rate).unwrap_or(16_000));
+    let mut play_resampler = StreamResampler::new(playback.as_ref().map(|feed| feed.sample_rate).unwrap_or(16_000));
+    let mut mic_pending = Vec::<f32>::new();
+    let mut play_pending = Vec::<f32>::new();
+    let mut written: u64 = 0;
+
+    loop {
+        let stop = match stop_receiver.recv_timeout(Duration::from_millis(20)) {
+            Ok(flush) => Some(flush),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Some(false),
+        };
+        if let Some(feed) = &mic {
+            let raw = {
+                let mut lock = feed.samples.lock().map_err(|e| e.to_string())?;
+                std::mem::take(&mut *lock)
+            };
+            if !raw.is_empty() {
+                let mono = downmix(&raw, mic_channels);
+                let fresh = mic_resampler.push(&mono);
+                if !fresh.is_empty() {
+                    if let Some(track) = mic_sink.as_mut() {
+                        track.write_f32(&fresh)?;
+                    }
+                    if emit {
+                        let _ = seg_tx.send(MeetingAudio::Pcm {
+                            source: TrackId::Mic,
+                            pcm: fresh.clone(),
+                        });
+                    }
+                    mic_pending.extend(fresh);
+                }
+            }
+        }
+        if let Some(feed) = &playback {
+            let raw = {
+                let mut lock = feed.samples.lock().map_err(|e| e.to_string())?;
+                std::mem::take(&mut *lock)
+            };
+            if !raw.is_empty() {
+                let mono = downmix(&raw, play_channels);
+                let fresh = play_resampler.push(&mono);
+                if !fresh.is_empty() {
+                    if let Some(track) = call_sink.as_mut() {
+                        track.write_f32(&fresh)?;
+                    }
+                    if emit {
+                        let _ = seg_tx.send(MeetingAudio::Pcm {
+                            source: TrackId::Call,
+                            pcm: fresh.clone(),
+                        });
+                    }
+                    play_pending.extend(fresh);
+                }
+            }
+        }
+        let mixed = mix_levels(&mut mic_pending, &mut play_pending, mic_open, play_open, 0.5);
+        if !mixed.is_empty() {
+            sink.write_f32(&mixed)?;
+            written += mixed.len() as u64;
+        }
+        if written >= MEETING_MAX_SAMPLES || stop.is_some() {
+            if written >= MEETING_MAX_SAMPLES {
+                let _ = seg_tx.send(MeetingAudio::Limit);
+            }
+            break;
+        }
+    }
+    sink.finish()?;
+    if let Some(track) = mic_sink.as_mut() {
+        track.finish()?;
+    }
+    if let Some(track) = call_sink.as_mut() {
+        track.finish()?;
+    }
     Ok(())
 }
 
@@ -824,6 +976,13 @@ mod tests {
     }
 
     #[test]
+    fn averaged_tones_keep_headroom() {
+        let mut mic = vec![0.8];
+        let mut play = vec![0.8];
+        assert_eq!(mix_levels(&mut mic, &mut play, true, true, 0.5), vec![0.8]);
+    }
+
+    #[test]
     fn short_buffer_leaves_the_remainder() {
         let mut mic = vec![0.2; 100];
         let mut play = vec![0.3; 40];
@@ -848,10 +1007,11 @@ mod tests {
 
     #[test]
     fn capture_note_names_the_open_sources() {
-        assert!(capture_note(true, false).contains("Headphones and webinar audio will not be in the recording"));
-        assert!(capture_note(false, true).contains("microphone did not open"));
-        assert!(capture_note(true, true).contains("microphone"));
-        assert!(capture_note(true, true).contains("audio this computer is playing"));
+        assert!(capture_note(true, false, false).contains("Headphones and webinar audio will not be in the recording"));
+        assert!(capture_note(false, true, false).contains("microphone did not open"));
+        assert!(capture_note(false, true, true).contains("call only"));
+        assert!(capture_note(true, true, false).contains("microphone"));
+        assert!(capture_note(true, true, false).contains("audio this computer is playing"));
     }
 
     #[test]

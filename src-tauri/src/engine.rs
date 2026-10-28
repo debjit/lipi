@@ -384,6 +384,8 @@ server.serve_forever()
                 .arg(&model_file)
                 .arg("--inference-path")
                 .arg("/inference")
+                .arg("-l")
+                .arg("auto")
                 .arg("-nt")
                 .arg("-t")
                 .arg(num_threads);
@@ -531,12 +533,7 @@ server.serve_forever()
                         .text("temperature", "0")
                         .text("temperature_inc", "0");
 
-                    if let Some(lang) = language {
-                        let trimmed = lang.trim();
-                        if !trimmed.is_empty() && trimmed != "auto" {
-                            form = form.text("language", trimmed.to_string());
-                        }
-                    }
+                    form = form.text("language", whisper_language(language).to_string());
                     if let Some(p) = prompt.map(str::trim).filter(|p| !p.is_empty()) {
                         form = form.text("prompt", p.to_string());
                     }
@@ -623,6 +620,13 @@ pub async fn transcribe_local(
     result
 }
 
+fn whisper_language(language: Option<&str>) -> &str {
+    language
+        .map(str::trim)
+        .filter(|lang| !lang.is_empty() && *lang != "auto")
+        .unwrap_or("auto")
+}
+
 async fn transcribe_whisper_cpp(
     wav_path: &Path,
     model_size: &str,
@@ -664,12 +668,7 @@ async fn transcribe_whisper_cpp(
 
     apply_whisper_gpu_flags(&mut cmd, vulkan);
 
-    if let Some(lang) = language {
-        let trimmed = lang.trim();
-        if !trimmed.is_empty() && trimmed != "auto" {
-            cmd.arg("-l").arg(trimmed);
-        }
-    }
+    cmd.arg("-l").arg(whisper_language(language).to_string());
 
     let output = cmd
         .output()
@@ -785,6 +784,16 @@ except Exception as e:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_language_asks_whisper_to_detect() {
+        assert_eq!(whisper_language(None), "auto");
+        assert_eq!(whisper_language(Some("")), "auto");
+        assert_eq!(whisper_language(Some("  ")), "auto");
+        assert_eq!(whisper_language(Some("auto")), "auto");
+        assert_eq!(whisper_language(Some("en")), "en");
+        assert_eq!(whisper_language(Some("bn")), "bn");
+    }
 
     #[test]
     fn test_ram_estimation() {

@@ -57,9 +57,11 @@ pub fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-pub fn requires_cloudflare_json(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    lower.contains("large-v3") || lower.contains("turbo") || lower.contains("whisper-large")
+pub fn requires_cloudflare_json(_model: &str) -> bool {
+    // Cloudflare Workers AI Whisper models natively expect Base64 JSON payloads.
+    // Sending JSON directly on the first attempt avoids the "Invalid input" octet-stream error
+    // and eliminates the double-upload network retry latency.
+    true
 }
 
 pub fn accept_asr_text(text: &str, samples: usize) -> Option<&str> {
@@ -158,6 +160,7 @@ pub async fn transcribe_audio(
     let target_url = resolve_target_url(trimmed_base, model);
     let is_cloudflare = target_url.contains("api.cloudflare.com");
     let trimmed_key = api_key.trim();
+    let request_start = std::time::Instant::now();
 
     let (status, body_text) = if is_cloudflare {
         let cloudflare_needs_json = requires_cloudflare_json(model);
@@ -252,6 +255,13 @@ pub async fn transcribe_audio(
             .map_err(|e| format!("Failed to read response body: {}", e))?;
         (st, txt)
     };
+
+    eprintln!(
+        "[ASR] Received response in {:.2?} from {} (status: {})",
+        request_start.elapsed(),
+        target_url,
+        status.as_u16()
+    );
 
     if !status.is_success() {
         let err_summary = describe_api_error(status.as_u16(), &body_text);
@@ -452,7 +462,7 @@ mod tests {
         assert!(requires_cloudflare_json("@cf/openai/whisper-large-v3-turbo"));
         assert!(requires_cloudflare_json("whisper-large-v3-turbo"));
         assert!(requires_cloudflare_json("@cf/openai/whisper-large"));
-        assert!(!requires_cloudflare_json("@cf/openai/whisper"));
-        assert!(!requires_cloudflare_json("@cf/openai/whisper-tiny-en"));
+        assert!(requires_cloudflare_json("@cf/openai/whisper"));
+        assert!(requires_cloudflare_json("@cf/openai/whisper-tiny-en"));
     }
 }

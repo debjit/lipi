@@ -2,6 +2,20 @@ use ndarray::{Array2, Array3};
 use ort::session::Session;
 use ort::value::Tensor;
 use std::path::Path;
+use std::sync::OnceLock;
+
+static ORT_ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
+
+/// One ONNX Runtime environment for the process. Parakeet sessions use this same value.
+pub fn ort_environment() -> Result<&'static ort::environment::Environment, String> {
+    if let Some(env) = ORT_ENV.get() {
+        return Ok(env);
+    }
+    let env = ort::init()
+        .build()
+        .map_err(|e| format!("ONNX Runtime failed to start: {e}"))?;
+    Ok(ORT_ENV.get_or_init(|| env))
+}
 
 const FRAME: usize = 512;
 const CONTEXT: usize = 64;
@@ -21,8 +35,7 @@ pub struct SileroVad {
 
 impl SileroVad {
     pub fn open(path: &Path) -> Result<Self, String> {
-        let _ = ort::init().commit();
-        let session = Session::builder()
+        let session = Session::builder(ort_environment()?)
             .map_err(|e| e.to_string())?
             .with_intra_threads(1)
             .map_err(|e| e.to_string())?

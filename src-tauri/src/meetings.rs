@@ -18,6 +18,7 @@ struct SegmentEvent {
     start_ms: u64,
     end_ms: u64,
     text: String,
+    source: String,
 }
 
 struct MeetingDraft {
@@ -27,8 +28,19 @@ struct MeetingDraft {
     actions: Vec<(String, Option<String>)>,
 }
 
+fn is_parakeet(settings: &crate::db::AppSettings) -> bool {
+    let engine = if settings.meeting_engine.trim().is_empty() {
+        "parakeet"
+    } else {
+        settings.meeting_engine.as_str()
+    };
+    engine == "parakeet" || (engine == "dictation" && settings.engine_mode == "local" && settings.local_engine == "parakeet")
+}
+
 fn model_id(settings: &crate::db::AppSettings) -> &str {
-    if settings.engine_mode == "local" {
+    if is_parakeet(settings) {
+        "parakeet"
+    } else if settings.engine_mode == "local" {
         settings.local_model_size.as_str()
     } else {
         settings.model.as_str()
@@ -218,7 +230,7 @@ pub fn render_meeting_note(
         out.push_str("No speech was captured.\n");
     } else {
         for seg in segments {
-            out.push_str(&format!("[{}] {}\n\n", fmt_ms(seg.start_ms), seg.text.trim()));
+            out.push_str(&format!("[{}] {}\n\n", segment_stamp(seg), seg.text.trim()));
         }
     }
     out.trim().to_string()
@@ -230,9 +242,18 @@ fn transcript_for_model(segments: &[crate::db::MeetingSegment]) -> String {
         if !text.is_empty() {
             text.push('\n');
         }
-        text.push_str(&format!("[{}] {}", fmt_ms(seg.start_ms), seg.text.trim()));
+        text.push_str(&format!("[{}] {}", segment_stamp(seg), seg.text.trim()));
     }
     clip_transcript(&text)
+}
+
+fn segment_stamp(seg: &crate::db::MeetingSegment) -> String {
+    let who = match seg.source.as_str() {
+        "mic" => "Mic ",
+        "call" => "Call ",
+        _ => "",
+    };
+    format!("{who}{}", fmt_ms(seg.start_ms))
 }
 
 fn default_title() -> String {
@@ -304,6 +325,7 @@ fn spawn_meeting_worker(
                 break;
             }
             let (pcm, start_ms, end_ms) = match event {
+                MeetingAudio::Pcm { .. } => continue,
                 MeetingAudio::Chunk { pcm, start_ms, end_ms } => (pcm, start_ms, end_ms),
                 MeetingAudio::Limit => {
                     let _ = app.emit("meeting_limit", session_id);
@@ -343,7 +365,7 @@ fn spawn_meeting_worker(
                         full.push(' ');
                     }
                     full.push_str(text);
-                    match db.insert_segment(session_id, start_ms as i64, end_ms as i64, text) {
+                    match db.insert_segment(session_id, start_ms as i64, end_ms as i64, "", text) {
                         Ok(_) => {
                             let _ = app.emit(
                                 "meeting_segment",
@@ -352,6 +374,7 @@ fn spawn_meeting_worker(
                                     start_ms,
                                     end_ms,
                                     text: text.to_string(),
+                                    source: String::new(),
                                 },
                             );
                         }
@@ -392,20 +415,41 @@ pub async fn start_meeting(
     state: tauri::State<'_, crate::AppState>,
     style_id: Option<String>,
     style_prefix: Option<String>,
+    live: Option<bool>,
+    keep_audio: Option<bool>,
+    call_only: Option<bool>,
 ) -> Result<MeetingSession, String> {
     if state.audio.is_recording() {
-        return Err(if state.audio.is_meeting() {
-            "A meeting is already recording.".into()
+        let msg = if state.audio.is_meeting() {
+            "A meeting is already recording."
         } else {
-            "Stop dictation before starting a meeting.".into()
-        });
+            "Stop dictation before starting a meeting."
+        };
+        eprintln!("[Meeting] Cannot start meeting: {msg}");
+        return Err(msg.into());
     }
 
     let settings = state.db.get_settings().unwrap_or_default();
     let custom = crate::models_folder(&settings);
-    if !crate::models::vad_installed(&state.app_data_dir, custom) {
+    let live = live.unwrap_or(true);
+    let call_only = call_only.unwrap_or(false);
+    let parakeet = is_parakeet(&settings);
+    eprintln!(
+        "[Meeting] start_meeting (engine: {}, parakeet: {}, live: {}, call_only: {})",
+        settings.meeting_engine, parakeet, live, call_only
+    );
+    if parakeet {
+        let models_dir = crate::models::resolve_models_dir(&state.app_data_dir, custom);
+        if live {
+            crate::parakeet::require_meeting_models(&models_dir)?;
+        } else if !crate::parakeet::tdt_ready(&models_dir) {
+            return Err("Download Parakeet in Settings before starting a meeting.".into());
+        }
+    } else if live && !crate::models::vad_installed(&state.app_data_dir, custom) {
         crate::models::download_vad_model(&app, &state.app_data_dir, custom).await?;
     }
+    state.meeting_later.store(!live, Ordering::SeqCst);
+    state.meeting_keep_audio.store(keep_audio.unwrap_or(true), Ordering::SeqCst);
 
     let language = languages::for_asr(&settings.engine_mode, model_id(&settings), settings.language.as_deref())
         .unwrap_or("")
@@ -427,8 +471,16 @@ pub async fn start_meeting(
         return Err(e);
     }
 
-    let vad_path = crate::models::vad_model_path(&state.app_data_dir, custom);
-    let rx = match state.audio.start_meeting(audio_path, vad_path) {
+    let vad_path = if parakeet || !live {
+        None
+    } else {
+        Some(crate::models::vad_model_path(&state.app_data_dir, custom))
+    };
+    let session_dir = audio_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| state.app_data_dir.join("sessions").join(session.id.to_string()));
+    let rx = match state.audio.start_meeting(audio_path, vad_path, live && parakeet, call_only) {
         Ok((rx, sources)) => {
             let _ = app.emit("meeting_capture", &sources);
             rx
@@ -443,21 +495,35 @@ pub async fn start_meeting(
     if let Ok(mut id) = state.meeting_id.lock() {
         *id = Some(session.id);
     }
-    let worker = spawn_meeting_worker(
-        app.clone(),
-        state.supervisor.clone(),
-        state.db.clone(),
-        state.app_data_dir.clone(),
-        state.meeting_cancel.clone(),
-        session.id,
-        if language.is_empty() { None } else { Some(language) },
-        rx,
-    );
+    let worker = if !live {
+        drop(rx);
+        None
+    } else if parakeet {
+        let app = app.clone();
+        let db = state.db.clone();
+        let models_dir = crate::models::resolve_models_dir(&state.app_data_dir, custom);
+        let cancel = state.meeting_cancel.clone();
+        let session_id = session.id;
+        Some(std::thread::spawn(move || {
+            crate::parakeet::run_meeting(app, db, models_dir, session_dir, cancel, session_id, call_only, rx);
+        }))
+    } else {
+        Some(spawn_meeting_worker(
+            app.clone(),
+            state.supervisor.clone(),
+            state.db.clone(),
+            state.app_data_dir.clone(),
+            state.meeting_cancel.clone(),
+            session.id,
+            if language.is_empty() { None } else { Some(language) },
+            rx,
+        ))
+    };
     if let Ok(mut slot) = state.meeting_worker.lock() {
-        *slot = Some(worker);
+        *slot = worker;
     }
 
-    if settings.engine_mode == "local" {
+    if live && settings.engine_mode == "local" && !parakeet {
         let supervisor = state.supervisor.clone();
         let engine = settings.local_engine.clone();
         let size = settings.local_model_size.clone();
@@ -479,6 +545,7 @@ pub async fn stop_meeting(
     state: tauri::State<'_, crate::AppState>,
     session_id: i64,
 ) -> Result<MeetingDetail, String> {
+    eprintln!("[Meeting] stop_meeting requested for session #{}", session_id);
     let active_id = state.meeting_id.lock().ok().and_then(|guard| *guard);
     if active_id == Some(session_id) && state.audio.is_meeting() {
         state.audio.end_meeting(true)?;
@@ -487,10 +554,35 @@ pub async fn stop_meeting(
             *id = None;
         }
     }
+    let later = state.meeting_later.swap(false, Ordering::SeqCst);
+    let keep = state.meeting_keep_audio.load(Ordering::SeqCst);
     crate::apply_tray_activity(&app, &state.tray_record_item, "transcribing", 0);
-    let detail = write_meeting_note(state.db.clone(), &state.app_data_dir, session_id).await;
+    if later {
+        if let Err(err) = transcribe_saved_recording(&app, &state, session_id).await {
+            let _ = state.db.set_session_status(session_id, "interrupted");
+            crate::apply_tray_activity(&app, &state.tray_record_item, "idle", 0);
+            return Err(err);
+        }
+    }
+    let detail = match write_meeting_note(state.db.clone(), &state.app_data_dir, session_id).await {
+        Ok(detail) => detail,
+        Err(err) => {
+            if let Ok(session) = state.db.get_session(session_id) {
+                tidy_recording(&session, true);
+            }
+            crate::apply_tray_activity(&app, &state.tray_record_item, "idle", 0);
+            return Err(err);
+        }
+    };
+    if let Ok(session) = state.db.get_session(session_id) {
+        tidy_recording(&session, keep);
+    }
     crate::apply_tray_activity(&app, &state.tray_record_item, "idle", 0);
-    detail
+    let mut detail = detail;
+    if !keep || !recording_file(&detail.session).is_file() {
+        detail.session.audio_path.clear();
+    }
+    Ok(detail)
 }
 
 #[tauri::command]
@@ -508,7 +600,12 @@ pub async fn cancel_meeting(
             *id = None;
         }
     }
+    let keep = state.meeting_keep_audio.load(Ordering::SeqCst);
+    state.meeting_later.store(false, Ordering::SeqCst);
     state.db.set_session_status(session_id, "cancelled")?;
+    if let Ok(session) = state.db.get_session(session_id) {
+        tidy_recording(&session, keep);
+    }
     crate::apply_tray_activity(&app, &state.tray_record_item, "idle", 0);
     Ok(())
 }
@@ -520,7 +617,36 @@ pub fn list_meetings(state: tauri::State<'_, crate::AppState>) -> Result<Vec<Mee
 
 #[tauri::command]
 pub fn get_meeting(state: tauri::State<'_, crate::AppState>, session_id: i64) -> Result<MeetingDetail, String> {
-    state.db.meeting_detail(session_id)
+    let mut detail = state.db.meeting_detail(session_id)?;
+    if !recording_file(&detail.session).is_file() {
+        detail.session.audio_path.clear();
+    }
+    Ok(detail)
+}
+
+#[tauri::command]
+pub async fn retranscribe_meeting(
+    app: AppHandle,
+    state: tauri::State<'_, crate::AppState>,
+    session_id: i64,
+) -> Result<MeetingDetail, String> {
+    let active = state.meeting_id.lock().ok().and_then(|guard| *guard);
+    if active == Some(session_id) && state.audio.is_meeting() {
+        return Err("Stop the meeting before transcribing it again.".into());
+    }
+    crate::apply_tray_activity(&app, &state.tray_record_item, "transcribing", 0);
+    let transcribed = transcribe_saved_recording(&app, &state, session_id).await;
+    if let Err(err) = transcribed {
+        crate::apply_tray_activity(&app, &state.tray_record_item, "idle", 0);
+        return Err(err);
+    }
+    let session = state.db.get_session(session_id)?;
+    if matches!(session.status.as_str(), "cancelled" | "recording" | "error") {
+        state.db.set_session_status(session_id, "interrupted")?;
+    }
+    let detail = rewrite_if_settled(state.db.clone(), &state.app_data_dir, session_id).await;
+    crate::apply_tray_activity(&app, &state.tray_record_item, "idle", 0);
+    detail
 }
 
 #[tauri::command]
@@ -560,6 +686,78 @@ pub fn list_languages(engine_mode: String, model_id: String) -> Vec<languages::L
 #[tauri::command]
 pub fn list_meeting_styles(state: tauri::State<'_, crate::AppState>) -> Vec<crate::presets::PromptPreset> {
     crate::presets::load_meeting_styles(&state.app_data_dir)
+}
+
+fn recording_file(session: &MeetingSession) -> PathBuf {
+    PathBuf::from(&session.audio_path)
+}
+
+fn tidy_recording(session: &MeetingSession, keep: bool) {
+    let path = recording_file(session);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_file(dir.join("mic.wav"));
+        let _ = std::fs::remove_file(dir.join("call.wav"));
+    }
+    if !keep {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+async fn transcribe_saved_recording(
+    app: &AppHandle,
+    state: &tauri::State<'_, crate::AppState>,
+    session_id: i64,
+) -> Result<(), String> {
+    let session = state.db.get_session(session_id)?;
+    let path = recording_file(&session);
+    if !path.is_file() {
+        return Err("This meeting has no saved recording.".into());
+    }
+    let _ = app.emit("meeting_transcribing", true);
+    let pcm = crate::parakeet::read_wav_file(&path)?;
+    let settings = state.db.get_settings().unwrap_or_default();
+    let parakeet = is_parakeet(&settings);
+    let rows = if parakeet {
+        let models_dir = crate::models::resolve_models_dir(&state.app_data_dir, crate::models_folder(&settings));
+        tauri::async_runtime::spawn_blocking(move || crate::parakeet::transcribe_pcm(&models_dir, &pcm))
+            .await
+            .map_err(|err| err.to_string())??
+            .into_iter()
+            .map(|(start, end, text)| (start, end, String::new(), text))
+            .collect()
+    } else {
+        let ranges = crate::parakeet::split_ranges(pcm.len(), |at| crate::parakeet::region_quiet(&pcm, at));
+        let language = if session.language.trim().is_empty() {
+            None
+        } else {
+            Some(session.language.clone())
+        };
+        let mut rows = Vec::new();
+        for (start, end) in ranges {
+            let wav = crate::audio::pcm_f32_to_wav(&pcm[start..end])?;
+            let samples = end.saturating_sub(start);
+            let text = transcribe_chunk(
+                &state.app_data_dir,
+                &state.supervisor,
+                &state.db,
+                wav,
+                language.as_deref(),
+            )
+            .await?;
+            let Some(text) = crate::transcribe::accept_asr_text(&text, samples) else {
+                continue;
+            };
+            let start_ms = (start as i64) * 1000 / 16_000;
+            let end_ms = (end as i64) * 1000 / 16_000;
+            rows.push((start_ms, end_ms, String::new(), text.to_string()));
+        }
+        rows
+    };
+    let _ = app.emit("meeting_transcribing", false);
+    if rows.is_empty() {
+        return Err("The recording produced no words. The previous transcript was kept.".into());
+    }
+    state.db.replace_segments(session_id, &rows)
 }
 
 fn remove_session_audio(session: &MeetingSession) {
@@ -727,7 +925,7 @@ pub fn attach_recovered_text(
         return Err("The provider returned an empty transcript.".into());
     }
     db.get_session(session_id)?;
-    db.insert_segment(session_id, start_ms, end_ms, text)?;
+    db.insert_segment(session_id, start_ms, end_ms, "", text)?;
     Ok(())
 }
 
@@ -860,6 +1058,7 @@ mod tests {
             start_ms: 1000,
             end_ms: 2000,
             text: "Hello team".into(),
+            source: String::new(),
         }];
         let note = render_meeting_note("We met.", &["Ship it".into()], &actions, &segments);
         assert!(note.contains("## Summary"));
