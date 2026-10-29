@@ -257,6 +257,15 @@ pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, 
     }
 }
 
+fn keep_spoken_languages(prompt: &str) -> String {
+    const LINE: &str = "Do not translate. Keep every language the speaker used, even when one utterance mixes languages.";
+    if prompt.contains("Do not translate.") {
+        prompt.to_string()
+    } else {
+        format!("{prompt} {LINE}")
+    }
+}
+
 pub async fn transform_text_with_prompt(
     base_url: &str,
     api_key: &str,
@@ -302,6 +311,7 @@ pub async fn transform_text_with_prompt(
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", format_reqwest_error(&e)))?;
 
+    let system_prompt = keep_spoken_languages(system_prompt);
     let payload = serde_json::json!({
         "model": model_to_use,
         "messages": [
@@ -447,6 +457,10 @@ mod tests {
             resolve_system_prompt("custom", "Make it a poem"),
             "Make it a poem"
         );
+        let kept = keep_spoken_languages("Fix the grammar.");
+        assert!(kept.contains("Do not translate."));
+        assert!(kept.contains("mixes languages"));
+        assert_eq!(keep_spoken_languages(&kept), kept);
     }
 
     #[test]

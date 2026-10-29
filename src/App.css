@@ -3853,19 +3853,6 @@ optgroup {
   margin: 6px 0 0 24px;
 }
 
-.setup-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin: 12px 16px 0;
-  padding: 10px 14px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--bg-secondary);
-  font-size: 13px;
-}
-
 /* Wizard OS Toggle & Prerequisite Styles */
 .wizard-os-toggle-group {
   display: inline-flex;
@@ -4229,6 +4216,25 @@ optgroup {
   color: var(--text-secondary);
 }
 
+.meetings-choices {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.meetings-choices legend {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+}
+
+.meetings-choices .checkbox-label {
+  flex-direction: row;
+}
+
 .meetings-custom-prompt {
   min-height: 88px;
   resize: vertical;
@@ -4323,6 +4329,10 @@ optgroup {
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
   font-size: 12px;
+}
+
+.meetings-open {
+  opacity: 0.72;
 }
 
 .meetings-error {

@@ -1,6 +1,7 @@
 mod audio;
 mod captures;
 mod db;
+mod parakeet;
 mod vad;
 mod engine;
 mod env_config;
@@ -224,6 +225,8 @@ pub struct OperationResult {
     pub cf_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meeting_session_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 pub struct AppState {
@@ -240,6 +243,8 @@ pub struct AppState {
     pub(crate) meeting_worker: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
     pub(crate) meeting_cancel: Arc<AtomicBool>,
     pub(crate) meeting_id: Arc<std::sync::Mutex<Option<i64>>>,
+    pub(crate) meeting_later: AtomicBool,
+    pub(crate) meeting_keep_audio: AtomicBool,
 }
 
 #[tauri::command]
@@ -262,7 +267,13 @@ fn start_recording(
         *guard = None;
     }
 
-    let live = settings.engine_mode == "local" && settings.live_dictation;
+    let live = settings.engine_mode == "local"
+        && settings.live_dictation
+        && settings.local_engine != "parakeet";
+    eprintln!(
+        "[Dictation] Starting recording (mode: {}, local_engine: {}, live: {})",
+        settings.engine_mode, settings.local_engine, live
+    );
     if live {
         let custom = models_folder(&settings);
         if !models::vad_installed(&state.app_data_dir, custom) {
@@ -433,6 +444,7 @@ async fn stop_recording_and_transcribe(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<OperationResult, String> {
+    eprintln!("[Dictation] Stop recording requested (is_live: {})...", state.audio.is_live());
     apply_tray_activity(&app, &state.tray_record_item, "transcribing", 0);
     if state.audio.is_live() {
         state.audio.end_live(true)?;
@@ -452,6 +464,7 @@ async fn stop_recording_and_transcribe(
             cf_neurons: None,
             cf_cost: None,
             meeting_session_id: None,
+            duration_ms: None,
         });
     }
     let wav_bytes = state.audio.stop()?;
@@ -473,13 +486,42 @@ async fn transcribe_bytes(
     file_name: &str,
     mime: &str,
 ) -> Result<OperationResult, String> {
+    let t0 = std::time::Instant::now();
     let settings = state.db.get_settings()?;
+    eprintln!(
+        "[Dictation] Transcribing {} bytes (mode: {}, local_engine: {})...",
+        bytes.len(),
+        settings.engine_mode,
+        settings.local_engine
+    );
     if settings.engine_mode == "local" {
         if !captures::is_wav_name(file_name) {
             return Err(
                 "Local Whisper only accepts WAV. Switch to an online provider and retry this file."
                     .into(),
             );
+        }
+        if settings.local_engine == "parakeet" {
+            let app_data_dir = state.app_data_dir.clone();
+            let folder = settings.models_folder.clone();
+            let text = tauri::async_runtime::spawn_blocking(move || {
+                let custom = if folder.trim().is_empty() { None } else { Some(folder.as_str()) };
+                parakeet::transcribe_wav_bytes(&app_data_dir, custom, &bytes)
+            })
+            .await
+            .map_err(|err| err.to_string())??;
+            eprintln!(
+                "[Dictation] Parakeet transcription completed in {}ms: {:?}",
+                t0.elapsed().as_millis(),
+                text
+            );
+            return Ok(OperationResult {
+                text,
+                cf_neurons: None,
+                cf_cost: None,
+                meeting_session_id: None,
+                duration_ms: Some(t0.elapsed().as_millis() as u64),
+            });
         }
         let text = state
             .supervisor
@@ -502,6 +544,7 @@ async fn transcribe_bytes(
             cf_neurons: None,
             cf_cost: None,
             meeting_session_id: None,
+            duration_ms: Some(t0.elapsed().as_millis() as u64),
         });
     }
 
@@ -551,6 +594,7 @@ async fn transcribe_bytes(
         cf_neurons,
         cf_cost,
         meeting_session_id: None,
+        duration_ms: Some(t0.elapsed().as_millis() as u64),
     })
 }
 
@@ -839,6 +883,9 @@ async fn prepare_engine(
     engine: String,
 ) -> Result<String, String> {
     let app_data_dir = state.app_data_dir.clone();
+    if engine == "parakeet" {
+        return Ok("Parakeet uses the built-in ONNX Runtime.".into());
+    }
     if engine == "faster_whisper" {
         tauri::async_runtime::spawn_blocking(move || {
             models::install_faster_whisper_deps(&app_data_dir)
@@ -1042,6 +1089,7 @@ async fn retry_audio_capture(
                     cf_neurons: result.cf_neurons,
                     cf_cost: result.cf_cost,
                     meeting_session_id: Some(session_id),
+                    duration_ms: result.duration_ms,
                 });
             }
             if let Ok(removed) = state.db.delete_audio_capture(id) {
@@ -1303,6 +1351,7 @@ async fn transform_with_llm(
         cf_neurons,
         cf_cost,
         meeting_session_id: None,
+        duration_ms: None,
     })
 }
 
@@ -1683,7 +1732,7 @@ pub fn run() {
                     let timeout = watchdog_db
                         .get_settings()
                         .map(|s| s.model_idle_timeout_mins)
-                        .unwrap_or(10);
+                        .unwrap_or(0);
                     watchdog_sup.check_idle_timeout(timeout);
                 }
             });
@@ -1811,6 +1860,8 @@ pub fn run() {
                 meeting_worker: Arc::new(std::sync::Mutex::new(None)),
                 meeting_cancel: Arc::new(AtomicBool::new(false)),
                 meeting_id: Arc::new(std::sync::Mutex::new(None)),
+                meeting_later: AtomicBool::new(false),
+                meeting_keep_audio: AtomicBool::new(true),
             });
 
             let reminder_app = app.handle().clone();
@@ -1895,7 +1946,8 @@ pub fn run() {
             meetings::set_action_item_done,
             meetings::list_languages,
             meetings::list_meeting_styles,
-            meetings::list_session_captures
+            meetings::list_session_captures,
+            meetings::retranscribe_meeting
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

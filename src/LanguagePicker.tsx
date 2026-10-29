@@ -93,7 +93,9 @@ export function LanguagePicker({
             type="text"
             className="form-input"
             placeholder={englishOnly ? "English" : "Search languages"}
-            value={open ? query : value ? labelFor(options, value) : ""}
+            value={
+              open ? query : value ? labelFor(options, value) : englishOnly ? "English" : "Auto-detect"
+            }
             onFocus={() => setOpen(true)}
             onChange={(e) => {
               setQuery(e.target.value);
@@ -126,7 +128,7 @@ export function LanguagePicker({
         <span className="form-hint">
           {englishOnly
             ? "This model transcribes English."
-            : "Choosing a language skips Whisper's detection step. The list is limited to languages this model can transcribe."}
+            : "Auto-detect follows the language being spoken, including a mix. Pick a language only when you want to force that one."}
         </span>
       </div>
       <div className="language-quick-chips">

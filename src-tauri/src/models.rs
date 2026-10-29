@@ -377,6 +377,9 @@ pub fn check_model_status(
     model_size: &str,
 ) -> Result<ModelStatus, String> {
     let models_dir = resolve_models_dir(app_data_dir, custom_dir);
+    if engine == "parakeet" {
+        return Ok(parakeet_status(&models_dir));
+    }
     let filename = get_model_filename(engine, model_size);
     let target_path = models_dir.join(&filename);
 
@@ -825,6 +828,176 @@ async fn download_faster_whisper_weights(
     Ok(model_folder.to_string_lossy().to_string())
 }
 
+fn parakeet_status(models_dir: &Path) -> ModelStatus {
+    let installed = crate::parakeet::eou_ready(models_dir) && crate::parakeet::tdt_ready(models_dir);
+    let mut size = 0u64;
+    for name in ["parakeet-eou", "parakeet-tdt"] {
+        let dir = models_dir.join(name);
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        size += meta.len();
+                    }
+                }
+            }
+        }
+    }
+    ModelStatus {
+        engine: "parakeet".into(),
+        model_size: "parakeet".into(),
+        installed,
+        file_path: models_dir.to_string_lossy().to_string(),
+        file_size_bytes: size,
+        binary_available: true,
+        binary_path: "ONNX Runtime is built in".into(),
+        models_dir: models_dir.to_string_lossy().to_string(),
+    }
+}
+
+struct ParakeetFile {
+    dir: &'static str,
+    name: &'static str,
+    path: &'static str,
+    min_bytes: u64,
+}
+
+fn parakeet_files() -> Vec<ParakeetFile> {
+    vec![
+        ParakeetFile {
+            dir: "parakeet-eou",
+            name: "encoder.onnx",
+            path: "realtime_eou_120m-v1-onnx/encoder.onnx",
+            min_bytes: 430_000_000,
+        },
+        ParakeetFile {
+            dir: "parakeet-eou",
+            name: "decoder_joint.onnx",
+            path: "realtime_eou_120m-v1-onnx/decoder_joint.onnx",
+            min_bytes: 18_000_000,
+        },
+        ParakeetFile {
+            dir: "parakeet-eou",
+            name: "tokenizer.json",
+            path: "realtime_eou_120m-v1-onnx/tokenizer.json",
+            min_bytes: 1_000,
+        },
+        ParakeetFile {
+            dir: "parakeet-tdt",
+            name: "encoder-model.onnx",
+            path: "parakeet-tdt-0.6b-v3/encoder-model.onnx",
+            min_bytes: 2_000_000,
+        },
+        ParakeetFile {
+            dir: "parakeet-tdt",
+            name: "encoder-model.onnx.data",
+            path: "parakeet-tdt-0.6b-v3/encoder-model.onnx.data",
+            min_bytes: 2_300_000_000,
+        },
+        ParakeetFile {
+            dir: "parakeet-tdt",
+            name: "decoder_joint-model.onnx",
+            path: "parakeet-tdt-0.6b-v3/decoder_joint-model.onnx",
+            min_bytes: 60_000_000,
+        },
+        ParakeetFile {
+            dir: "parakeet-tdt",
+            name: "vocab.txt",
+            path: "parakeet-tdt-0.6b-v3/vocab.txt",
+            min_bytes: 1_000,
+        },
+    ]
+}
+
+async fn download_parakeet_weights(app_handle: &tauri::AppHandle, models_dir: &Path) -> Result<String, String> {
+    let files = parakeet_files();
+    let total: u64 = files.iter().map(|file| file.min_bytes).sum();
+    let mut downloaded = 0u64;
+    let client = reqwest::Client::builder()
+        .user_agent("lipi")
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(6 * 60 * 60))
+        .build()
+        .map_err(|err| format!("Failed to create HTTP client: {err}"))?;
+    let start = std::time::Instant::now();
+    for file in &files {
+        let dir = models_dir.join(file.dir);
+        fs::create_dir_all(&dir).map_err(|err| format!("Failed to create {}: {err}", dir.display()))?;
+        let target = dir.join(file.name);
+        if fs::metadata(&target).map(|meta| meta.len() > file.min_bytes).unwrap_or(false) {
+            downloaded += file.min_bytes;
+            emit_parakeet_progress(app_handle, downloaded, total, start.elapsed().as_secs_f64(), false);
+            continue;
+        }
+        let temp = dir.join(format!("{}.part", file.name));
+        let mut response = client
+            .get(format!(
+                "https://huggingface.co/altunenes/parakeet-rs/resolve/main/{}",
+                file.path
+            ))
+            .send()
+            .await
+            .map_err(|err| format!("Download request failed for {}: {err}", file.name))?;
+        if !response.status().is_success() {
+            return Err(format!("Download failed for {} ({})", file.name, response.status()));
+        }
+        let mut out = File::create(&temp).map_err(|err| format!("Failed to create {}: {err}", temp.display()))?;
+        let mut got = 0u64;
+        while let Some(chunk) = response.chunk().await.map_err(|err| {
+            remove_part(&temp);
+            format!("Failed reading {}: {err}", file.name)
+        })? {
+            out.write_all(&chunk).map_err(|err| {
+                remove_part(&temp);
+                format!("Failed writing {}: {err}", file.name)
+            })?;
+            got += chunk.len() as u64;
+            emit_parakeet_progress(
+                app_handle,
+                downloaded + got.min(file.min_bytes),
+                total,
+                start.elapsed().as_secs_f64(),
+                false,
+            );
+        }
+        out.flush().map_err(|err| format!("Failed to flush {}: {err}", file.name))?;
+        drop(out);
+        if target.exists() {
+            let _ = fs::remove_file(&target);
+        }
+        fs::rename(&temp, &target).map_err(|err| format!("Failed to save {}: {err}", file.name))?;
+        downloaded += file.min_bytes;
+    }
+    emit_parakeet_progress(app_handle, total, total, start.elapsed().as_secs_f64(), true);
+    Ok(models_dir.to_string_lossy().to_string())
+}
+
+fn emit_parakeet_progress(app: &tauri::AppHandle, downloaded: u64, total: u64, elapsed: f64, done: bool) {
+    let percent = if done || total == 0 {
+        100
+    } else {
+        ((downloaded as f64 / total as f64) * 99.0) as i64
+    };
+    let speed_bps = if elapsed > 0.4 { downloaded as f64 / elapsed } else { 0.0 };
+    let eta_secs = if speed_bps > 1000.0 && total > downloaded {
+        (total - downloaded) as f64 / speed_bps
+    } else {
+        0.0
+    };
+    let _ = app.emit(
+        "model-download-progress",
+        serde_json::json!({
+            "engine": "parakeet",
+            "model_size": "parakeet",
+            "downloaded": downloaded,
+            "total": total,
+            "percentage": percent,
+            "speed_bps": speed_bps,
+            "eta_secs": eta_secs
+        }),
+    );
+}
+
 pub async fn download_model_weights(
     app_handle: &tauri::AppHandle,
     app_data_dir: &Path,
@@ -834,6 +1007,10 @@ pub async fn download_model_weights(
 ) -> Result<String, String> {
     let models_dir = resolve_models_dir(app_data_dir, custom_dir);
     fs::create_dir_all(&models_dir).map_err(|e| format!("Failed to create models dir: {}", e))?;
+
+    if engine == "parakeet" {
+        return download_parakeet_weights(app_handle, &models_dir).await;
+    }
 
     if engine == "faster_whisper" {
         return download_faster_whisper_weights(app_handle, &models_dir, model_size).await;
@@ -948,6 +1125,15 @@ pub fn delete_model(
     model_size: &str,
 ) -> Result<(), String> {
     let models_dir = resolve_models_dir(app_data_dir, custom_dir);
+    if engine == "parakeet" {
+        for name in ["parakeet-eou", "parakeet-tdt"] {
+            let path = models_dir.join(name);
+            if path.is_dir() {
+                fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
+            }
+        }
+        return Ok(());
+    }
     let filename = get_model_filename(engine, model_size);
     let target_path = models_dir.join(&filename);
 
