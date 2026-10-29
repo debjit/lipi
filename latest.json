@@ -1,13 +1,13 @@
 {
-  "version": "0.1.8",
-  "tag": "v0.1.8",
+  "version": "0.1.9",
+  "tag": "v0.1.9",
   "prerelease": false,
-  "published_at": "2026-10-23T06:34:19Z",
-  "notes": "Meetings (beta) are in this release. Open Meetings in Lipi to record a call and save the notes on this computer. https://github.com/debjit/lipi/blob/v0.1.8/README.md#meetings Download the installer for your platform from the assets below.",
+  "published_at": "2026-10-29T18:18:46Z",
+  "notes": "Meetings (beta) are in this release. Open Meetings in Lipi to record a call and save the notes on this computer. https://github.com/debjit/lipi/blob/v0.1.9/README.md#meetings Download the installer for your platform from the assets below.",
   "downloads": {
-    "windows_setup": "https://github.com/debjit/lipi/releases/download/v0.1.8/Lipi-windows-setup.exe",
-    "windows_msi": "https://github.com/debjit/lipi/releases/download/v0.1.8/Lipi-windows.msi",
-    "linux_deb": "https://github.com/debjit/lipi/releases/download/v0.1.8/Lipi-linux.deb",
-    "linux_appimage": "https://github.com/debjit/lipi/releases/download/v0.1.8/Lipi-linux.AppImage"
+    "windows_setup": "https://github.com/debjit/lipi/releases/download/v0.1.9/Lipi-windows-setup.exe",
+    "windows_msi": "https://github.com/debjit/lipi/releases/download/v0.1.9/Lipi-windows.msi",
+    "linux_deb": "https://github.com/debjit/lipi/releases/download/v0.1.9/Lipi-linux.deb",
+    "linux_appimage": "https://github.com/debjit/lipi/releases/download/v0.1.9/Lipi-linux.AppImage"
   }
 }
