@@ -4328,7 +4328,7 @@ export default function App() {
                       <span>Look up sites named in a meeting</span>
                     </label>
                     <span className="form-hint" style={{ marginLeft: "26px" }}>
-                      Off by default. Used only while writing meeting notes, and only when someone names a site. Dictation does not use this.
+                      Off by default. This is the starting position of the switch on each new meeting. You can change it before recording starts. Used only while writing that meeting's notes, and only when someone names a site.
                     </span>
                   </div>
                   <div className="form-group" style={{ marginTop: "12px" }}>

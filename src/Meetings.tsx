@@ -16,6 +16,7 @@ interface MeetingSession {
   note_id?: number | null;
   style_id?: string;
   style_prefix?: string;
+  tavily_enabled?: boolean;
 }
 
 interface MeetingSegment {
@@ -122,6 +123,8 @@ export function Meetings({
   const [liveLines, setLiveLines] = useState(() => localStorage.getItem(MEETING_LIVE_KEY) !== "0");
   const [keepAudio, setKeepAudio] = useState(() => localStorage.getItem(MEETING_KEEP_KEY) !== "0");
   const [callOnly, setCallOnly] = useState(() => localStorage.getItem(MEETING_CALL_KEY) === "1");
+  const [useTavily, setUseTavily] = useState(false);
+  const [tavilyKeySet, setTavilyKeySet] = useState(false);
   const [redoing, setRedoing] = useState(false);
   const [failed, setFailed] = useState<AudioCapture[]>([]);
   const [retryingId, setRetryingId] = useState<number | null>(null);
@@ -198,6 +201,12 @@ export function Meetings({
           if (current === "custom" || rows.some((style) => style.id === current)) return current;
           return rows[0]?.id || "notes";
         });
+      })
+      .catch(() => {});
+    invoke<{ tavily_enabled?: boolean; tavily_api_key?: string }>("get_llm_config")
+      .then((cfg) => {
+        setUseTavily(cfg.tavily_enabled === true);
+        setTavilyKeySet(!!cfg.tavily_api_key?.trim());
       })
       .catch(() => {});
     refreshList().catch((err) => setError(String(err)));
@@ -332,6 +341,7 @@ export function Meetings({
         live: liveLines,
         keepAudio,
         callOnly,
+        tavily: useTavily,
       });
       activeIdRef.current = session.id;
       recordingIdRef.current = session.id;
@@ -609,7 +619,21 @@ export function Meetings({
                   />
                   <span>Keep the recording</span>
                 </label>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    className="checkbox-input"
+                    checked={useTavily}
+                    onChange={(e) => setUseTavily(e.target.checked)}
+                  />
+                  <span>Look up sites with Tavily</span>
+                </label>
                 <p className="form-hint">
+                  {useTavily && !tavilyKeySet
+                    ? "Add a Tavily API key under Settings → Meetings, or this meeting skips the lookup. "
+                    : useTavily
+                      ? "If someone names a site, that page is fetched before the note is written. "
+                      : "This meeting goes from the transcript straight to the notes LLM. "}
                   {callOnly
                     ? "The microphone stays off, so the speakers are not written a second time. Leave this off when you need your own voice, or when you are on headphones. "
                     : ""}

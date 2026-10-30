@@ -26,6 +26,7 @@ pub struct MeetingSession {
     pub note_id: Option<i64>,
     pub style_id: String,
     pub style_prefix: String,
+    pub tavily_enabled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -255,7 +256,8 @@ impl Database {
                 voice_preset TEXT NOT NULL DEFAULT '',
                 custom_prompt TEXT NOT NULL DEFAULT '',
                 style_id TEXT NOT NULL DEFAULT '',
-                style_prefix TEXT NOT NULL DEFAULT ''
+                style_prefix TEXT NOT NULL DEFAULT '',
+                tavily_enabled INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS segments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -303,6 +305,10 @@ impl Database {
         );
         let _ = conn.execute(
             "ALTER TABLE sessions ADD COLUMN style_prefix TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN tavily_enabled INTEGER NOT NULL DEFAULT 0",
             [],
         );
         let _ = conn.execute("ALTER TABLE audio_captures ADD COLUMN session_id INTEGER", []);
@@ -630,11 +636,12 @@ impl Database {
         started_epoch: i64,
         style_id: &str,
         style_prefix: &str,
+        tavily_enabled: bool,
     ) -> Result<MeetingSession, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
-            "INSERT INTO sessions (title, language, started_epoch, status, style_id, style_prefix) VALUES ('Meeting', ?1, ?2, 'recording', ?3, ?4)",
-            params![language, started_epoch, style_id, style_prefix],
+            "INSERT INTO sessions (title, language, started_epoch, status, style_id, style_prefix, tavily_enabled) VALUES ('Meeting', ?1, ?2, 'recording', ?3, ?4, ?5)",
+            params![language, started_epoch, style_id, style_prefix, tavily_enabled as i32],
         )
         .map_err(|e| e.to_string())?;
         let id = conn.last_insert_rowid();
@@ -747,11 +754,12 @@ impl Database {
             note_id: row.get(10)?,
             style_id: row.get(11)?,
             style_prefix: row.get(12)?,
+            tavily_enabled: row.get::<_, i64>(13)? != 0,
         })
     }
 
     const SESSION_COLS: &'static str =
-        "id, title, language, started_at, started_epoch, ended_at, audio_path, status, summary, decisions, note_id, style_id, style_prefix";
+        "id, title, language, started_at, started_epoch, ended_at, audio_path, status, summary, decisions, note_id, style_id, style_prefix, tavily_enabled";
 
     pub fn get_session(&self, id: i64) -> Result<MeetingSession, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
@@ -1340,11 +1348,12 @@ mod tests {
     #[test]
     fn test_meeting_sessions_segments_and_actions() {
         let db = Database::new(":memory:").unwrap();
-        let session = db.create_session("bn", 1_700_000_000, "brief", "Keep it short.").unwrap();
+        let session = db.create_session("bn", 1_700_000_000, "brief", "Keep it short.", false).unwrap();
         assert_eq!(session.status, "recording");
         assert_eq!(session.language, "bn");
         assert_eq!(session.style_id, "brief");
         assert_eq!(session.style_prefix, "Keep it short.");
+        assert!(!session.tavily_enabled);
 
         db.set_session_audio_path(session.id, "/tmp/audio.wav").unwrap();
         let seg = db.insert_segment(session.id, 0, 1500, "", "hello").unwrap();

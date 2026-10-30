@@ -418,6 +418,7 @@ pub async fn start_meeting(
     live: Option<bool>,
     keep_audio: Option<bool>,
     call_only: Option<bool>,
+    tavily: Option<bool>,
 ) -> Result<MeetingSession, String> {
     if state.audio.is_recording() {
         let msg = if state.audio.is_meeting() {
@@ -459,7 +460,13 @@ pub async fn start_meeting(
     let custom_prefix = style_prefix.unwrap_or_default();
     let styles = crate::presets::load_meeting_styles(&state.app_data_dir);
     let prefix = crate::presets::meeting_style_text(&styles, &style_id, &custom_prefix);
-    let session = state.db.create_session(&language, Utc::now().timestamp(), &style_id, &prefix)?;
+    let session = state.db.create_session(
+        &language,
+        Utc::now().timestamp(),
+        &style_id,
+        &prefix,
+        tavily.unwrap_or(false),
+    )?;
     let audio_path = state
         .app_data_dir
         .join("sessions")
@@ -830,7 +837,7 @@ async fn finish_claimed_session(
         summary.clear();
     } else if llm.enabled {
         let transcript = transcript_for_model(&segments);
-        match summarize(db.as_ref(), &llm, &transcript, &session.style_prefix).await {
+        match summarize(db.as_ref(), &llm, &transcript, &session.style_prefix, session.tavily_enabled).await {
             Ok(draft) => {
                 title = draft.title;
                 summary = draft.summary;
@@ -983,8 +990,8 @@ fn transcript_urls(text: &str) -> Vec<String> {
     found
 }
 
-fn tavily_urls(settings: &crate::env_config::LlmSettings, transcript: &str) -> Vec<String> {
-    if !settings.tavily_enabled || settings.tavily_api_key.trim().is_empty() {
+fn tavily_urls(enabled: bool, api_key: &str, transcript: &str) -> Vec<String> {
+    if !enabled || api_key.trim().is_empty() {
         return Vec::new();
     }
     transcript_urls(transcript)
@@ -1043,8 +1050,12 @@ fn notes_prompt(style_prefix: &str, has_pages: bool) -> String {
     }
 }
 
-async fn named_page_context(settings: &crate::env_config::LlmSettings, transcript: &str) -> String {
-    let urls = tavily_urls(settings, transcript);
+async fn named_page_context(
+    settings: &crate::env_config::LlmSettings,
+    enabled: bool,
+    transcript: &str,
+) -> String {
+    let urls = tavily_urls(enabled, &settings.tavily_api_key, transcript);
     if urls.is_empty() {
         return String::new();
     }
@@ -1083,6 +1094,7 @@ async fn summarize(
     settings: &crate::env_config::LlmSettings,
     transcript: &str,
     style_prefix: &str,
+    use_tavily: bool,
 ) -> Result<MeetingDraft, String> {
     let active_id = settings.active_provider_id.clone();
     let provider = settings
@@ -1099,7 +1111,7 @@ async fn summarize(
         settings.model.clone()
     };
     let timeout_secs = settings.request_timeout_secs.max(180) as u64;
-    let pages = named_page_context(settings, transcript).await;
+    let pages = named_page_context(settings, use_tavily, transcript).await;
     let user_text = transcript_for_notes(transcript, &pages);
     let prompt = notes_prompt(style_prefix, !pages.trim().is_empty());
     let (text, prompt_tokens, completion_tokens) = crate::llm::transform_text_with_prompt(
@@ -1141,15 +1153,12 @@ mod tests {
 
     #[test]
     fn tavily_runs_only_when_enabled_and_a_site_is_named() {
-        let mut settings = crate::env_config::LlmSettings::default();
         let said = "See https://example.com/docs and also https://example.com/docs.";
-        assert!(tavily_urls(&settings, said).is_empty());
+        assert!(tavily_urls(false, "tvly-test", said).is_empty());
         assert!(transcript_urls("no site here").is_empty());
-        settings.tavily_enabled = true;
-        assert!(tavily_urls(&settings, said).is_empty());
-        settings.tavily_api_key = "tvly-test".into();
-        assert_eq!(tavily_urls(&settings, said), vec!["https://example.com/docs".to_string()]);
-        assert!(tavily_urls(&settings, "talked about the launch").is_empty());
+        assert!(tavily_urls(true, "", said).is_empty());
+        assert_eq!(tavily_urls(true, "tvly-test", said), vec!["https://example.com/docs".to_string()]);
+        assert!(tavily_urls(true, "tvly-test", "talked about the launch").is_empty());
         assert_eq!(transcript_for_notes("hello", ""), "hello");
         assert!(transcript_for_notes("hello", "page").contains("Web pages named in the meeting"));
         let body = r#"{"results":[{"url":"https://example.com/docs","raw_content":"Setup guide"}],"failed_results":[]}"#;
@@ -1215,9 +1224,10 @@ mod tests {
     #[test]
     fn recovered_text_joins_the_meeting_and_rewrite_keeps_the_note() {
         let db = Database::new(":memory:").unwrap();
-        let session = db.create_session("en", 10, "brief", "Keep the summary to two sentences.").unwrap();
+        let session = db.create_session("en", 10, "brief", "Keep the summary to two sentences.", true).unwrap();
         assert_eq!(session.style_id, "brief");
         assert_eq!(session.style_prefix, "Keep the summary to two sentences.");
+        assert!(session.tavily_enabled);
         attach_recovered_text(&db, session.id, 0, 1200, "hello team").unwrap();
         let segments = db.segments_for(session.id).unwrap();
         assert_eq!(segments[0].text, "hello team");
