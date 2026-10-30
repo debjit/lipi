@@ -100,6 +100,8 @@ The transcript (polished by your active AI preset, if auto-transform is on) is p
 
 Beta. Open **Meetings** in the Lipi window to record a call. Lipi records your microphone and the audio this computer is playing, then writes a transcript, summary, decisions, and action items. The audio and the note stay on this computer. Open the saved note from the meeting when it finishes.
 
+Tavily lookup is off by default. Turn it on under **Settings → Meetings** and paste an API key. With it off, a meeting is Parakeet, then the notes LLM. With it on, Lipi calls [Tavily](https://www.tavily.com/) (`POST https://api.tavily.com/extract`) only when the transcript contains a site, then sends that page content to the notes LLM. If nobody names a site, there is no call and the note is written from the transcript alone. Dictation and other LLM polish never call Tavily.
+
 Tell the other people they are being recorded before you start. Stop dictation before starting a meeting. If a piece of the transcript fails, switch provider in Settings and retry it into the same meeting.
 
 ## Configuration

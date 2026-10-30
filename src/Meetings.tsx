@@ -641,7 +641,7 @@ export function Meetings({
                 }}
                 disabled={busy}
               >
-                {phase === "saving" ? (liveLines ? "Writing note…" : "Transcribing…") : "■ Stop"}
+                {phase === "saving" ? (chunkBusy ? "Transcribing…" : "Writing note…") : "■ Stop"}
               </button>
               <span className="record-elapsed-time">{formatClock(elapsed)}</span>
               {chunkBusy && <span className="live-wait" title="Transcribing the last pause" />}

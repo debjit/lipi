@@ -393,13 +393,6 @@ pub fn run_meeting(
         drop(call);
         drop(handle);
     }
-    let has_live_segments = db
-        .segments_for(session_id)
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
-    if has_live_segments {
-        return;
-    }
     if let Err(err) = rewrite_saved(&app, &db, &models_dir, &session_dir, session_id) {
         let _ = app.emit(
             "meeting_error",
@@ -463,13 +456,6 @@ fn run_call_only(
     if let Some(mut call) = call.take() {
         let _ = call.push(&app, &db, session_id, TrackId::Call, &[], true, &[]);
         drop(call);
-    }
-    let has_live_segments = db
-        .segments_for(session_id)
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
-    if has_live_segments {
-        return;
     }
     if let Err(err) = rewrite_saved(&app, &db, &models_dir, &session_dir, session_id) {
         let _ = app.emit(

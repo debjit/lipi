@@ -125,6 +125,11 @@ pub struct LlmSettings {
     pub presets: Vec<PromptPreset>,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u32,
+    /// Meeting notes only. Off until the user turns it on.
+    #[serde(default)]
+    pub tavily_enabled: bool,
+    #[serde(default)]
+    pub tavily_api_key: String,
 }
 
 impl Default for LlmSettings {
@@ -170,6 +175,8 @@ impl Default for LlmSettings {
             ],
             presets: default_prompt_presets(),
             request_timeout_secs: 180,
+            tavily_enabled: false,
+            tavily_api_key: String::new(),
         }
     }
 }
@@ -234,6 +241,12 @@ pub fn load_llm_settings(app_data_dir: &Path) -> LlmSettings {
         if let Ok(secs) = val.parse::<u32>() {
             settings.request_timeout_secs = secs.max(180);
         }
+    }
+    if let Some(val) = map.get("TAVILY_ENABLED") {
+        settings.tavily_enabled = val == "true" || val == "1";
+    }
+    if let Some(val) = map.get("TAVILY_API_KEY") {
+        settings.tavily_api_key = val.clone();
     }
 
     // Load individual provider blocks via LLM_PROVIDER_IDS
@@ -391,6 +404,8 @@ pub fn save_llm_settings(app_data_dir: &Path, settings: &LlmSettings) -> Result<
     out.push_str(&format!("LLM_CUSTOM_PROMPT=\"{}\"\n", escape_env_val(&settings.custom_prompt)));
     out.push_str(&format!("LLM_AUTO_MODE={}\n", settings.auto_mode));
     out.push_str(&format!("LLM_REQUEST_TIMEOUT_SECS={}\n", settings.request_timeout_secs.max(180)));
+    out.push_str(&format!("TAVILY_ENABLED={}\n", settings.tavily_enabled));
+    out.push_str(&format!("TAVILY_API_KEY=\"{}\"\n", escape_env_val(&settings.tavily_api_key)));
     out.push_str(&format!("LLM_PROVIDER_IDS={}\n", provider_ids.join(",")));
     out.push_str(&format!("LLM_PRESET_IDS={}\n\n", preset_ids.join(",")));
 
@@ -470,12 +485,16 @@ mod tests {
             },
         ];
         settings.request_timeout_secs = 240;
+        settings.tavily_enabled = true;
+        settings.tavily_api_key = "tvly-test".into();
 
         save_llm_settings(&temp_dir, &settings).unwrap();
 
         // Check file content has human-readable blocks
         let env_content = fs::read_to_string(temp_dir.join(".env")).unwrap();
         assert!(env_content.contains("LLM_REQUEST_TIMEOUT_SECS=240"));
+        assert!(env_content.contains("TAVILY_ENABLED=true"));
+        assert!(env_content.contains("TAVILY_API_KEY=\"tvly-test\""));
         assert!(env_content.contains("# --- START PROVIDER: CUSTOM_OLLAMA (My Local Ollama) ---"));
         assert!(env_content.contains("PROVIDER_CUSTOM_OLLAMA_BASE_URL=\"http://localhost:11434/v1\""));
         assert!(env_content.contains("# --- END PROVIDER: CUSTOM_OLLAMA ---"));
@@ -484,6 +503,8 @@ mod tests {
         let loaded = load_llm_settings(&temp_dir);
         assert!(loaded.enabled);
         assert_eq!(loaded.request_timeout_secs, 240);
+        assert!(loaded.tavily_enabled);
+        assert_eq!(loaded.tavily_api_key, "tvly-test");
         assert_eq!(loaded.active_provider_id, "CUSTOM_OLLAMA");
         assert_eq!(loaded.model, "llama3.2");
         assert_eq!(loaded.providers.len(), 2);
@@ -494,10 +515,13 @@ mod tests {
         let mut settings_removed = loaded.clone();
         settings_removed.providers.retain(|p| p.id != "CUSTOM_OLLAMA");
         settings_removed.active_provider_id = "CLOUDFLARE_DEFAULT".into();
+        settings_removed.tavily_enabled = false;
 
         save_llm_settings(&temp_dir, &settings_removed).unwrap();
         let env_content_removed = fs::read_to_string(temp_dir.join(".env")).unwrap();
         assert!(!env_content_removed.contains("CUSTOM_OLLAMA"));
+        assert!(env_content_removed.contains("TAVILY_ENABLED=false"));
+        assert!(!load_llm_settings(&temp_dir).tavily_enabled);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

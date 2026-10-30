@@ -960,6 +960,124 @@ pub async fn rewrite_if_settled(
     outcome
 }
 
+fn transcript_urls(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for raw in text.split_whitespace() {
+        let token = raw.trim_matches(|c: char| {
+            matches!(c, ',' | '.' | ')' | '(' | '"' | '\'' | ';' | ']' | '[' | '>' | '<' | '!')
+        });
+        if !(token.starts_with("https://") || token.starts_with("http://")) {
+            continue;
+        }
+        if token.len() <= "https://".len() {
+            continue;
+        }
+        if found.iter().any(|url: &String| url == token) {
+            continue;
+        }
+        found.push(token.to_string());
+        if found.len() == 3 {
+            break;
+        }
+    }
+    found
+}
+
+fn tavily_urls(settings: &crate::env_config::LlmSettings, transcript: &str) -> Vec<String> {
+    if !settings.tavily_enabled || settings.tavily_api_key.trim().is_empty() {
+        return Vec::new();
+    }
+    transcript_urls(transcript)
+}
+
+fn format_extract_context(body: &str) -> String {
+    let Ok(json) = serde_json::from_str::<Value>(body) else {
+        return String::new();
+    };
+    let Some(results) = json.get("results").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for item in results {
+        let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        let content = item
+            .get("raw_content")
+            .or_else(|| item.get("content"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if url.is_empty() && content.is_empty() {
+            continue;
+        }
+        let snippet: String = content.chars().take(1500).collect();
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(url);
+        if !snippet.is_empty() {
+            out.push('\n');
+            out.push_str(&snippet);
+        }
+        if out.chars().count() >= 4000 {
+            break;
+        }
+    }
+    out.chars().take(4000).collect()
+}
+
+fn transcript_for_notes(transcript: &str, pages: &str) -> String {
+    let pages = pages.trim();
+    if pages.is_empty() {
+        transcript.to_string()
+    } else {
+        format!("{transcript}\n\nWeb pages named in the meeting:\n{pages}")
+    }
+}
+
+fn notes_prompt(style_prefix: &str, has_pages: bool) -> String {
+    let base = crate::llm::meeting_style_prompt(style_prefix);
+    if !has_pages {
+        base
+    } else {
+        format!("{base}\n\nA block titled \"Web pages named in the meeting\" follows the transcript. Use it only to clarify sites that were actually named. Decisions and tasks still come only from what was said.")
+    }
+}
+
+async fn named_page_context(settings: &crate::env_config::LlmSettings, transcript: &str) -> String {
+    let urls = tavily_urls(settings, transcript);
+    if urls.is_empty() {
+        return String::new();
+    }
+    match tavily_extract(settings.tavily_api_key.trim(), &urls).await {
+        Ok(body) => format_extract_context(&body),
+        Err(e) => {
+            eprintln!("tavily extract failed: {e}");
+            String::new()
+        }
+    }
+}
+
+async fn tavily_extract(api_key: &str, urls: &[String]) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("Lipi/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| crate::llm::format_reqwest_error(&e))?;
+    let resp = client
+        .post("https://api.tavily.com/extract")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({ "urls": urls }))
+        .send()
+        .await
+        .map_err(|e| crate::llm::format_reqwest_error(&e))?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("HTTP {}: {body}", status.as_u16()));
+    }
+    Ok(body)
+}
+
 async fn summarize(
     db: &Database,
     settings: &crate::env_config::LlmSettings,
@@ -981,12 +1099,15 @@ async fn summarize(
         settings.model.clone()
     };
     let timeout_secs = settings.request_timeout_secs.max(180) as u64;
+    let pages = named_page_context(settings, transcript).await;
+    let user_text = transcript_for_notes(transcript, &pages);
+    let prompt = notes_prompt(style_prefix, !pages.trim().is_empty());
     let (text, prompt_tokens, completion_tokens) = crate::llm::transform_text_with_prompt(
         &base_url,
         &api_key,
         &model,
-        &crate::llm::meeting_style_prompt(style_prefix),
-        transcript,
+        &prompt,
+        &user_text,
         timeout_secs,
     )
     .await?;
@@ -1017,6 +1138,29 @@ pub fn notify_due(app: &AppHandle, db: &Database) {
 mod tests {
     use super::*;
     use crate::db::MeetingSegment;
+
+    #[test]
+    fn tavily_runs_only_when_enabled_and_a_site_is_named() {
+        let mut settings = crate::env_config::LlmSettings::default();
+        let said = "See https://example.com/docs and also https://example.com/docs.";
+        assert!(tavily_urls(&settings, said).is_empty());
+        assert!(transcript_urls("no site here").is_empty());
+        settings.tavily_enabled = true;
+        assert!(tavily_urls(&settings, said).is_empty());
+        settings.tavily_api_key = "tvly-test".into();
+        assert_eq!(tavily_urls(&settings, said), vec!["https://example.com/docs".to_string()]);
+        assert!(tavily_urls(&settings, "talked about the launch").is_empty());
+        assert_eq!(transcript_for_notes("hello", ""), "hello");
+        assert!(transcript_for_notes("hello", "page").contains("Web pages named in the meeting"));
+        let body = r#"{"results":[{"url":"https://example.com/docs","raw_content":"Setup guide"}],"failed_results":[]}"#;
+        let pages = format_extract_context(body);
+        assert!(pages.contains("https://example.com/docs"));
+        assert!(pages.contains("Setup guide"));
+        assert!(format_extract_context("not json").is_empty());
+        assert!(format_extract_context(r#"{"failed_results":[{"url":"https://example.com","error":"404"}]}"#).is_empty());
+        assert!(!notes_prompt("", false).contains("Web pages named"));
+        assert!(notes_prompt("", true).contains("only to clarify sites"));
+    }
 
     #[test]
     fn parses_meeting_json_and_due_dates() {

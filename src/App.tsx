@@ -84,6 +84,8 @@ interface LlmSettings {
   providers: LlmProvider[];
   presets: PromptPreset[];
   request_timeout_secs?: number;
+  tavily_enabled: boolean;
+  tavily_api_key: string;
 }
 
 interface ModelStatus {
@@ -431,6 +433,8 @@ export default function App() {
     ],
     presets: DEFAULT_PRESETS,
     request_timeout_secs: 180,
+    tavily_enabled: false,
+    tavily_api_key: "",
   });
   const llmSettingsRef = useRef(llmSettings);
   llmSettingsRef.current = llmSettings;
@@ -1065,6 +1069,8 @@ export default function App() {
         ...cfg,
         model: activeModel,
         presets: cfg.presets && cfg.presets.length > 0 ? cfg.presets : DEFAULT_PRESETS,
+        tavily_enabled: cfg.tavily_enabled === true,
+        tavily_api_key: cfg.tavily_api_key || "",
       };
       setLlmSettings(normalized);
       llmSettingsRef.current = normalized;
@@ -4305,6 +4311,37 @@ export default function App() {
                       </div>
                     </div>
                   )}
+                </div>
+
+                <div className="settings-section-card">
+                  <div className="settings-section-heading">
+                    <span>Site lookup (Tavily)</span>
+                  </div>
+                  <div className="form-group">
+                    <label className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        className="checkbox-input"
+                        checked={llmSettings.tavily_enabled}
+                        onChange={(e) => updateAndSaveLlmSettings({ tavily_enabled: e.target.checked })}
+                      />
+                      <span>Look up sites named in a meeting</span>
+                    </label>
+                    <span className="form-hint" style={{ marginLeft: "26px" }}>
+                      Off by default. Used only while writing meeting notes, and only when someone names a site. Dictation does not use this.
+                    </span>
+                  </div>
+                  <div className="form-group" style={{ marginTop: "12px" }}>
+                    <label className="form-label">Tavily API key</label>
+                    <input
+                      type="password"
+                      className="form-input"
+                      value={llmSettings.tavily_api_key}
+                      placeholder="tvly-..."
+                      onChange={(e) => updateAndSaveLlmSettings({ tavily_api_key: e.target.value })}
+                      autoComplete="off"
+                    />
+                  </div>
                 </div>
 
                 <div className="settings-section-card">
