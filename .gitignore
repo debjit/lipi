@@ -20,6 +20,9 @@ dist-ssr
 .env
 .env.*
 
+# Machine-local Cargo env (prebuilt transcribe-cpp). Not part of the app.
+/.cargo/config.toml
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

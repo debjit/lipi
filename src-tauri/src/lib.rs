@@ -4,6 +4,7 @@ mod db;
 mod parakeet;
 mod vad;
 mod engine;
+mod gguf_engine;
 mod env_config;
 mod languages;
 mod llm;
@@ -233,6 +234,7 @@ pub struct AppState {
     pub(crate) db: Arc<Database>,
     pub(crate) audio: Arc<AudioRecorder>,
     pub(crate) supervisor: Arc<engine::ModelSupervisor>,
+    pub(crate) gguf_engine: Arc<gguf_engine::GgufEngine>,
     pub(crate) app_data_dir: std::path::PathBuf,
     is_mini: std::sync::atomic::AtomicBool,
     paste_target: Arc<std::sync::Mutex<Option<paste::PasteTarget>>>,
@@ -269,7 +271,7 @@ fn start_recording(
 
     let live = settings.engine_mode == "local"
         && settings.live_dictation
-        && settings.local_engine != "parakeet";
+        && !offline_parakeet(&settings.local_engine);
     eprintln!(
         "[Dictation] Starting recording (mode: {}, local_engine: {}, live: {})",
         settings.engine_mode, settings.local_engine, live
@@ -501,6 +503,38 @@ async fn transcribe_bytes(
                     .into(),
             );
         }
+        if settings.local_engine == "parakeet_gguf" {
+            let models_dir = models::resolve_models_dir(&state.app_data_dir, models_folder(&settings));
+            let model_path = models::parakeet_gguf_path(&models_dir);
+            if !model_path.exists() {
+                return Err("Parakeet GGUF model not found. Please download it in Settings.".into());
+            }
+            let language = languages::for_asr(
+                &settings.engine_mode,
+                "parakeet",
+                settings.language.as_deref(),
+            )
+            .map(str::to_string);
+            let engine = state.gguf_engine.clone();
+            let text = tauri::async_runtime::spawn_blocking(move || {
+                let pcm = parakeet::wav_bytes_to_f32(&bytes)?;
+                engine.transcribe_pcm(&pcm, &model_path, language.as_deref())
+            })
+            .await
+            .map_err(|err| err.to_string())??;
+            eprintln!(
+                "[Dictation] Parakeet GGUF transcription completed in {}ms: {:?}",
+                t0.elapsed().as_millis(),
+                text
+            );
+            return Ok(OperationResult {
+                text,
+                cf_neurons: None,
+                cf_cost: None,
+                meeting_session_id: None,
+                duration_ms: Some(t0.elapsed().as_millis() as u64),
+            });
+        }
         if settings.local_engine == "parakeet" {
             let app_data_dir = state.app_data_dir.clone();
             let folder = settings.models_folder.clone();
@@ -642,15 +676,33 @@ fn save_settings(
     state: tauri::State<'_, AppState>,
     mut settings: AppSettings,
 ) -> Result<(), String> {
-    let model_id = if settings.engine_mode == "local" {
-        settings.local_model_size.clone()
-    } else {
+    let model_id = if settings.engine_mode != "local" {
         settings.model.clone()
+    } else if settings.local_engine == "parakeet" || settings.local_engine == "parakeet_gguf" {
+        "parakeet".to_string()
+    } else {
+        settings.local_model_size.clone()
     };
     if languages::for_asr(&settings.engine_mode, &model_id, settings.language.as_deref()).is_none() {
         settings.language = None;
     }
-    state.db.save_settings(&settings)
+    let previous = state.db.get_settings().ok();
+    state.db.save_settings(&settings)?;
+    if let Some(prev) = previous {
+        if prev.local_engine != settings.local_engine {
+            if settings.local_engine == "parakeet_gguf" {
+                state.supervisor.unload();
+            }
+            if prev.local_engine == "parakeet_gguf" {
+                state.gguf_engine.unload();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn offline_parakeet(engine: &str) -> bool {
+    engine == "parakeet" || engine == "parakeet_gguf"
 }
 
 fn save_current_window_state(db: &Database, window: &tauri::Window, is_mini: bool) {
@@ -776,12 +828,30 @@ fn write_to_clipboard(state: tauri::State<'_, AppState>, text: String) -> Result
 #[tauri::command]
 fn get_model_memory_status(state: tauri::State<'_, AppState>) -> Result<engine::ModelMemoryStatus, String> {
     let settings = state.db.get_settings().unwrap_or_default();
+    if let Some(resident) = state.gguf_engine.resident() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        return Ok(engine::ModelMemoryStatus {
+            is_loaded: true,
+            engine: Some("parakeet_gguf".into()),
+            model_size: Some(format!("Q8_0 ({})", resident.backend)),
+            loaded_at_timestamp: None,
+            last_active_timestamp: Some(now.saturating_sub(resident.idle_seconds)),
+            idle_seconds: resident.idle_seconds,
+            idle_timeout_mins: settings.model_idle_timeout_mins,
+            estimated_ram_mb: 740,
+            port: None,
+        });
+    }
     Ok(state.supervisor.get_status(settings.model_idle_timeout_mins))
 }
 
 #[tauri::command]
 fn unload_model_from_memory(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.supervisor.unload();
+    state.gguf_engine.unload();
     Ok(())
 }
 
@@ -800,6 +870,18 @@ async fn preload_model_to_memory(
             Some(settings.models_folder.as_str())
         }
     });
+    if engine == "parakeet_gguf" {
+        let models_dir = models::resolve_models_dir(&state.app_data_dir, folder);
+        let model_path = models::parakeet_gguf_path(&models_dir);
+        if !model_path.exists() {
+            return Err("Parakeet GGUF model not found. Please download it in Settings.".into());
+        }
+        let gguf = state.gguf_engine.clone();
+        return tauri::async_runtime::spawn_blocking(move || gguf.ensure_loaded(&model_path))
+            .await
+            .map_err(|err| err.to_string())?
+            .map(|()| 0);
+    }
     state
         .supervisor
         .ensure_loaded(&engine, &model_size, &state.app_data_dir, folder)
@@ -866,6 +948,9 @@ fn delete_model(
     custom_models_dir: Option<String>,
 ) -> Result<(), String> {
     state.supervisor.unload();
+    if engine == "parakeet_gguf" {
+        state.gguf_engine.unload();
+    }
     let settings = state.db.get_settings().unwrap_or_default();
     let folder = custom_models_dir.as_deref().or_else(|| {
         if settings.models_folder.trim().is_empty() {
@@ -1723,9 +1808,11 @@ pub fn run() {
             let db = Database::new(db_path).expect("Failed to initialize SQLite database");
             let db_arc = Arc::new(db);
             let supervisor_arc = Arc::new(engine::ModelSupervisor::new());
+            let gguf_engine = Arc::new(gguf_engine::GgufEngine::new());
 
             let watchdog_db = db_arc.clone();
             let watchdog_sup = supervisor_arc.clone();
+            let watchdog_gguf = gguf_engine.clone();
             std::thread::spawn(move || {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(10));
@@ -1734,6 +1821,7 @@ pub fn run() {
                         .map(|s| s.model_idle_timeout_mins)
                         .unwrap_or(0);
                     watchdog_sup.check_idle_timeout(timeout);
+                    watchdog_gguf.unload_if_idle(timeout);
                 }
             });
 
@@ -1795,6 +1883,7 @@ pub fn run() {
                         "quit" => {
                             if let Some(state) = app.try_state::<AppState>() {
                                 state.supervisor.unload();
+                                state.gguf_engine.unload();
                             }
                             app.exit(0);
                         }
@@ -1850,6 +1939,7 @@ pub fn run() {
                 db: db_arc,
                 audio: Arc::new(AudioRecorder::new()),
                 supervisor: supervisor_arc,
+                gguf_engine,
                 app_data_dir,
                 is_mini: std::sync::atomic::AtomicBool::new(false),
                 paste_target: Arc::new(std::sync::Mutex::new(None)),

@@ -1158,6 +1158,11 @@ mod tests {
         assert_eq!(loaded.live_dictation, true);
         assert_eq!(loaded.meeting_engine, "dictation");
         assert_eq!(default_settings.meeting_engine, "parakeet");
+
+        let mut gguf = loaded;
+        gguf.local_engine = "parakeet_gguf".into();
+        db.save_settings(&gguf).unwrap();
+        assert_eq!(db.get_settings().unwrap().local_engine, "parakeet_gguf");
         assert!(!default_settings.live_dictation);
     }
 
@@ -1191,6 +1196,15 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_settings_parakeet_gguf() {
+        let db = Database::new(":memory:").unwrap();
+        let mut settings = db.get_settings().unwrap();
+        settings.local_engine = "parakeet_gguf".into();
+        db.save_settings(&settings).unwrap();
+        assert_eq!(db.get_settings().unwrap().local_engine, "parakeet_gguf");
     }
 
     #[test]
