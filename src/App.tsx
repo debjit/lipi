@@ -27,7 +27,7 @@ interface AppSettings {
   auto_paste: boolean;
   always_on_top: boolean;
   engine_mode: "cloud" | "local";
-  local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan" | "parakeet";
+  local_engine: "whisper_cpu" | "faster_whisper" | "whisper_vulkan" | "parakeet" | "parakeet_gguf";
   local_model_size: "tiny" | "base" | "small" | "medium" | "turbo_q8";
   models_folder?: string;
   model_idle_timeout_mins?: number;
@@ -180,9 +180,15 @@ function maskAccountId(id: string): string {
   return "*".repeat(trimmed.length - 6) + trimmed.slice(-6);
 }
 
+function isOfflineParakeet(engine: string): boolean {
+  return engine === "parakeet" || engine === "parakeet_gguf";
+}
+
 function getDisplayModelName(settings: AppSettings): string {
   if (settings.engine_mode === "local") {
-    // Strictly zero-cost / local offline
+    if (settings.local_engine === "parakeet_gguf") {
+      return "Parakeet TDT v3 (GGUF)";
+    }
     if (settings.local_engine === "parakeet") {
       return "Parakeet (NVIDIA NeMo)";
     }
@@ -337,7 +343,9 @@ export default function App() {
     message: string;
     confirmLabel?: string;
     danger?: boolean;
-    onConfirm: () => void;
+    choices?: { id: string; label: string }[];
+    choice?: string;
+    onConfirm: (choice?: string) => void;
   } | null>(null);
 
   const [settings, setSettings] = useState<AppSettings>({
@@ -769,7 +777,7 @@ export default function App() {
       if (
         settingsRef.current.live_dictation &&
         settingsRef.current.engine_mode === "local" &&
-        settingsRef.current.local_engine !== "parakeet"
+        !isOfflineParakeet(settingsRef.current.local_engine)
       ) {
         await downloadVadModel();
       }
@@ -803,6 +811,90 @@ export default function App() {
     } catch (err: any) {
       setErrorMsg(String(err));
     }
+  }
+
+  const WHISPER_MODEL_CHOICES = [
+    { id: "tiny", label: "Tiny (~75 MB)" },
+    { id: "base", label: "Base (~142 MB)" },
+    { id: "small", label: "Small (~466 MB)" },
+    { id: "turbo_q8", label: "Turbo Q8 (~850 MB)" },
+    { id: "medium", label: "Medium (~1.5 GB)" },
+  ];
+
+  async function fetchModelStatus(engine: string, size: string): Promise<ModelStatus | null> {
+    try {
+      return await invoke<ModelStatus>("get_model_status", {
+        engine,
+        modelSize: size,
+        customModelsDir: settingsRef.current.models_folder || undefined,
+      });
+    } catch (e) {
+      console.error("Failed to check model status:", e);
+      return null;
+    }
+  }
+
+  function askDownloadModel(engine: AppSettings["local_engine"]) {
+    if (engine === "parakeet" || engine === "parakeet_gguf") {
+      const label = engine === "parakeet_gguf" ? "Parakeet TDT v3 Q8_0 (~740 MB)" : "NVIDIA Parakeet (EOU + TDT)";
+      setConfirmModal({
+        title: "Download speech model",
+        message: `${label} is not on this computer yet.`,
+        confirmLabel: "Download",
+        onConfirm: () => {
+          void handleDownloadModel();
+        },
+      });
+      return;
+    }
+    setConfirmModal({
+      title: "Download speech model",
+      message: "This engine has no model yet. Pick one to download.",
+      confirmLabel: "Download",
+      choices: WHISPER_MODEL_CHOICES,
+      choice: settingsRef.current.local_model_size,
+      onConfirm: (choice) => {
+        const size = (choice || settingsRef.current.local_model_size) as AppSettings["local_model_size"];
+        void (async () => {
+          await updateAndSaveSettings({ local_model_size: size });
+          await refreshModelStatus(engine, size);
+          await handleDownloadModel();
+        })();
+      },
+    });
+  }
+
+  async function onLocalEngineChange(engine: AppSettings["local_engine"]) {
+    await updateAndSaveSettings({ local_engine: engine });
+    refreshMemoryStatus();
+    let status = await fetchModelStatus(engine, settingsRef.current.local_model_size);
+    if (status) setModelStatus(status);
+    if (!isOfflineParakeet(engine) && status && !status.binary_available) {
+      setIsInstallingDeps(true);
+      setErrorMsg(null);
+      const isFW = engine === "faster_whisper";
+      const isVulkan = engine === "whisper_vulkan";
+      showToast(
+        isFW
+          ? "Setting up faster-whisper…"
+          : isVulkan
+          ? "Downloading the Vulkan GPU backend…"
+          : "Downloading the whisper.cpp runner…"
+      );
+      try {
+        const res: string = await invoke("prepare_engine", { engine });
+        showToast(res || "Runner ready");
+        status = await fetchModelStatus(engine, settingsRef.current.local_model_size);
+        if (status) setModelStatus(status);
+      } catch (err: unknown) {
+        setErrorMsg(String(err));
+        return;
+      } finally {
+        setIsInstallingDeps(false);
+      }
+    }
+    if (settingsRef.current.local_engine !== engine) return;
+    if (status && !status.installed) askDownloadModel(engine);
   }
 
   async function handlePrepareRunner() {
@@ -1843,7 +1935,7 @@ export default function App() {
         const live =
           settingsRef.current.engine_mode === "local" &&
           !!settingsRef.current.live_dictation &&
-          settingsRef.current.local_engine !== "parakeet";
+          !isOfflineParakeet(settingsRef.current.local_engine);
         liveActiveRef.current = live;
         liveSeqRef.current = 0;
         setLiveChunkBusy(false);
@@ -3205,10 +3297,7 @@ export default function App() {
                       className="form-input form-select"
                       value={settings.local_engine}
                       onChange={(e) => {
-                        const eng = e.target.value as any;
-                        updateAndSaveSettings({ local_engine: eng });
-                        refreshModelStatus(eng, settingsRef.current.local_model_size);
-                        refreshMemoryStatus();
+                        void onLocalEngineChange(e.target.value as AppSettings["local_engine"]);
                       }}
                     >
                       <option value="whisper_cpu">
@@ -3223,6 +3312,9 @@ export default function App() {
                       <option value="parakeet">
                         NVIDIA Parakeet (EOU 120M + TDT 0.6B v3) — High-speed FastConformer with built-in ONNX Runtime
                       </option>
+                      <option value="parakeet_gguf">
+                        Parakeet TDT v3 (GGUF, in-process)
+                      </option>
                     </select>
                   </div>
                   <div className="form-group">
@@ -3230,8 +3322,8 @@ export default function App() {
                       <input
                         type="checkbox"
                         className="checkbox-input"
-                        checked={settings.local_engine === "parakeet" ? false : !!settings.live_dictation}
-                        disabled={settings.local_engine === "parakeet"}
+                        checked={isOfflineParakeet(settings.local_engine) ? false : !!settings.live_dictation}
+                        disabled={isOfflineParakeet(settings.local_engine)}
                         onChange={(e) => {
                           const on = e.target.checked;
                           if (!on) {
@@ -3260,8 +3352,8 @@ export default function App() {
                       </span>
                     </label>
                     <span className="form-hint" style={{ marginLeft: "26px" }}>
-                      {settings.local_engine === "parakeet"
-                        ? "Parakeet writes each meeting line as you talk, then replaces the saved transcript when you stop. Dictation runs once when you stop. Live dictation stays on the Whisper engines."
+                      {isOfflineParakeet(settings.local_engine)
+                        ? "Parakeet dictation runs once when you stop. Live dictation stays on the Whisper engines. Meetings keep the ONNX Parakeet pipeline."
                         : `${settings.live_dictation ? "On. " : "Off. "}${liveCpuNote(settings.local_model_size)} API transcription stays one shot after you stop. We are still working on live dictation, so results can be rough.`}
                     </span>
                     {vadDownloadProgress !== null && (
@@ -3288,14 +3380,16 @@ export default function App() {
                   <div className="runner-card">
                     <div className="runner-info">
                       <div className="runner-status">
-                        {settings.local_engine === "parakeet" || modelStatus?.binary_available ? (
+                        {isOfflineParakeet(settings.local_engine) || modelStatus?.binary_available ? (
                           <span className="text-success">✓ Runner environment ready</span>
                         ) : (
                           <span className="text-warning">⚠ Runner binary/runtime missing</span>
                         )}
                       </div>
                       <div className="runner-path" title={modelStatus?.binary_path || ""}>
-                        {settings.local_engine === "parakeet"
+                        {settings.local_engine === "parakeet_gguf"
+                          ? "GGUF runtime is built in"
+                          : settings.local_engine === "parakeet"
                           ? "ONNX Runtime is built in"
                           : modelStatus?.binary_available
                           ? modelStatus.binary_path
@@ -3307,7 +3401,7 @@ export default function App() {
                       </div>
                     </div>
                     <div style={{ display: "flex", gap: "8px" }}>
-                      {settings.local_engine !== "parakeet" && !modelStatus?.binary_available ? (
+                      {!isOfflineParakeet(settings.local_engine) && !modelStatus?.binary_available ? (
                         <button
                           type="button"
                           className="btn btn-secondary btn-sm"
@@ -3323,7 +3417,7 @@ export default function App() {
                             : "⬇ Download Runner Binary"}
                         </button>
                       ) : (
-                        settings.local_engine !== "faster_whisper" && settings.local_engine !== "parakeet" && (
+                        settings.local_engine !== "faster_whisper" && !isOfflineParakeet(settings.local_engine) && (
                           <button
                             type="button"
                             className="btn btn-secondary btn-sm"
@@ -3387,7 +3481,7 @@ export default function App() {
                     </span>
                   </div>
 
-                  {settings.local_engine !== "parakeet" && (
+                  {!isOfflineParakeet(settings.local_engine) && (
                   <div className="form-group">
                     <label className="form-label">Model Size</label>
                     <select
@@ -3412,7 +3506,9 @@ export default function App() {
                     <div className="model-status-header">
                       <div className="model-status-title">
                         <span className="model-name">
-                          {settings.local_engine === "parakeet"
+                          {settings.local_engine === "parakeet_gguf"
+                            ? "Parakeet TDT v3 Q8_0 (GGUF)"
+                            : settings.local_engine === "parakeet"
                             ? "NVIDIA Parakeet (EOU 120M + TDT 0.6B v3)"
                             : modelStatus?.file_path
                             ? modelStatus.file_path.replace(/\\/g, "/").split("/").pop()
@@ -3425,6 +3521,8 @@ export default function App() {
                             ? "CPU"
                             : settings.local_engine === "faster_whisper"
                             ? "CTranslate2"
+                            : settings.local_engine === "parakeet_gguf"
+                            ? "in-process GGUF"
                             : settings.local_engine === "parakeet"
                             ? "NVIDIA NeMo • FastConformer"
                             : "Vulkan GPU"}
@@ -3440,6 +3538,12 @@ export default function App() {
                           : "Not Downloaded"}
                       </span>
                     </div>
+
+                    {settings.local_engine === "parakeet_gguf" && (
+                      <div style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: "1.5", marginTop: "4px" }}>
+                        Offline Parakeet TDT 0.6B v3, Q8_0, about 740 MB. Dictation stays in-process. Meetings keep using ONNX Parakeet.
+                      </div>
+                    )}
 
                     {settings.local_engine === "parakeet" && (
                       <div style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "12px", color: "var(--text-secondary)", lineHeight: "1.5", marginTop: "4px" }}>
@@ -3484,6 +3588,8 @@ export default function App() {
                         >
                           {isDownloading
                             ? "Downloading..."
+                            : settings.local_engine === "parakeet_gguf"
+                            ? "⬇ Download Parakeet GGUF"
                             : settings.local_engine === "parakeet"
                             ? "⬇ Download Parakeet"
                             : `⬇ Download ${settings.local_model_size} Model`}
@@ -3554,12 +3660,14 @@ export default function App() {
                             {memoryStatus.engine} ({memoryStatus.model_size})
                           </span>
                         </div>
+                        {memoryStatus.port != null && (
                         <div className="memory-stat-item">
                           <span className="memory-stat-label">Daemon Port</span>
                           <span className="memory-stat-value">
                             127.0.0.1:{memoryStatus.port}
                           </span>
                         </div>
+                        )}
                         <div className="memory-stat-item">
                           <span className="memory-stat-label">Idle Duration</span>
                           <span className="memory-stat-value">
@@ -3635,7 +3743,7 @@ export default function App() {
                 modelId={
                   settings.engine_mode !== "local"
                     ? settings.model || ""
-                    : settings.local_engine === "parakeet"
+                    : isOfflineParakeet(settings.local_engine)
                     ? "parakeet"
                     : settings.local_model_size
                 }
@@ -5297,6 +5405,21 @@ export default function App() {
           >
             <div className="confirm-modal-title">{confirmModal.title}</div>
             <div className="confirm-modal-message">{confirmModal.message}</div>
+            {confirmModal.choices && confirmModal.choices.length > 0 && (
+              <select
+                className="form-input form-select"
+                value={confirmModal.choice || confirmModal.choices[0].id}
+                onChange={(e) =>
+                  setConfirmModal({ ...confirmModal, choice: e.target.value })
+                }
+              >
+                {confirmModal.choices.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            )}
             <div className="confirm-modal-actions">
               <button
                 type="button"
@@ -5310,8 +5433,9 @@ export default function App() {
                 className={`btn ${confirmModal.danger ? "btn-danger" : "btn-primary"}`}
                 onClick={() => {
                   const cb = confirmModal.onConfirm;
+                  const choice = confirmModal.choice;
                   setConfirmModal(null);
-                  cb();
+                  cb(choice);
                 }}
               >
                 {confirmModal.confirmLabel || "Confirm"}

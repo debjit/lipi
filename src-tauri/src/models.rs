@@ -1,8 +1,18 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tauri::Emitter;
+
+pub const PARAKEET_GGUF_NAME: &str = "parakeet-tdt-0.6b-v3-Q8_0.gguf";
+const PARAKEET_GGUF_URL: &str = "https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf/resolve/main/parakeet-tdt-0.6b-v3-Q8_0.gguf";
+pub const PARAKEET_GGUF_SIZE: u64 = 739_508_576;
+const PARAKEET_GGUF_SHA256: &str = "5859f77944efcd8eafa23a6350731960b2b55b2203df51f319665c807d802cc7";
+
+pub fn parakeet_gguf_path(models_dir: &Path) -> PathBuf {
+    models_dir.join(PARAKEET_GGUF_NAME)
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModelStatus {
@@ -379,6 +389,9 @@ pub fn check_model_status(
     let models_dir = resolve_models_dir(app_data_dir, custom_dir);
     if engine == "parakeet" {
         return Ok(parakeet_status(&models_dir));
+    }
+    if engine == "parakeet_gguf" {
+        return Ok(parakeet_gguf_status(&models_dir));
     }
     let filename = get_model_filename(engine, model_size);
     let target_path = models_dir.join(&filename);
@@ -828,6 +841,21 @@ async fn download_faster_whisper_weights(
     Ok(model_folder.to_string_lossy().to_string())
 }
 
+fn parakeet_gguf_status(models_dir: &Path) -> ModelStatus {
+    let path = parakeet_gguf_path(models_dir);
+    let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    ModelStatus {
+        engine: "parakeet_gguf".into(),
+        model_size: "Q8_0".into(),
+        installed: size == PARAKEET_GGUF_SIZE,
+        file_path: path.to_string_lossy().to_string(),
+        file_size_bytes: size,
+        binary_available: true,
+        binary_path: "in-process".into(),
+        models_dir: models_dir.to_string_lossy().to_string(),
+    }
+}
+
 fn parakeet_status(models_dir: &Path) -> ModelStatus {
     let installed = crate::parakeet::eou_ready(models_dir) && crate::parakeet::tdt_ready(models_dir);
     let mut size = 0u64;
@@ -998,6 +1026,108 @@ fn emit_parakeet_progress(app: &tauri::AppHandle, downloaded: u64, total: u64, e
     );
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    out
+}
+
+async fn download_parakeet_gguf(app_handle: &tauri::AppHandle, models_dir: &Path) -> Result<String, String> {
+    let target_path = parakeet_gguf_path(models_dir);
+    let temp_path = models_dir.join(format!("{PARAKEET_GGUF_NAME}.part"));
+    let client = reqwest::Client::builder()
+        .user_agent("lipi")
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(3600))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let mut response = client
+        .get(PARAKEET_GGUF_URL)
+        .send()
+        .await
+        .map_err(|e| format!("Download request failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Download failed with status: {}", response.status()));
+    }
+
+    let total_size = response.content_length().unwrap_or(PARAKEET_GGUF_SIZE);
+    let mut file = File::create(&temp_path).map_err(|e| format!("Failed to create temporary file: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut downloaded: u64 = 0;
+    let mut last_emit_percent: i64 = -1;
+    let start_time = std::time::Instant::now();
+
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        remove_part(&temp_path);
+        format!("Failed reading chunk: {e}")
+    })? {
+        file.write_all(&chunk).map_err(|e| {
+            remove_part(&temp_path);
+            format!("Failed writing chunk: {e}")
+        })?;
+        hasher.update(&chunk);
+        downloaded += chunk.len() as u64;
+        let percent = if total_size > 0 {
+            ((downloaded as f64 / total_size as f64) * 100.0) as i64
+        } else {
+            0
+        };
+        if percent != last_emit_percent {
+            last_emit_percent = percent;
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let speed_bps = if elapsed > 0.4 { downloaded as f64 / elapsed } else { 0.0 };
+            let eta_secs = if speed_bps > 1000.0 && total_size > downloaded {
+                (total_size - downloaded) as f64 / speed_bps
+            } else {
+                0.0
+            };
+            let _ = app_handle.emit(
+                "model-download-progress",
+                serde_json::json!({
+                    "engine": "parakeet_gguf",
+                    "model_size": "Q8_0",
+                    "downloaded": downloaded,
+                    "total": total_size,
+                    "percentage": percent,
+                    "speed_bps": speed_bps,
+                    "eta_secs": eta_secs
+                }),
+            );
+        }
+    }
+    file.flush().map_err(|e| format!("Failed to flush file: {e}"))?;
+    drop(file);
+
+    let digest = hex_encode(&hasher.finalize());
+    if downloaded != PARAKEET_GGUF_SIZE || digest != PARAKEET_GGUF_SHA256 {
+        remove_part(&temp_path);
+        return Err(format!(
+            "Parakeet GGUF checksum failed (got {downloaded} bytes, sha256 {digest})"
+        ));
+    }
+    if target_path.exists() {
+        let _ = fs::remove_file(&target_path);
+    }
+    fs::rename(&temp_path, &target_path).map_err(|e| format!("Failed to finalize model file: {e}"))?;
+    let _ = app_handle.emit(
+        "model-download-progress",
+        serde_json::json!({
+            "engine": "parakeet_gguf",
+            "model_size": "Q8_0",
+            "downloaded": downloaded,
+            "total": PARAKEET_GGUF_SIZE,
+            "percentage": 100,
+            "speed_bps": 0.0,
+            "eta_secs": 0.0
+        }),
+    );
+    Ok(target_path.to_string_lossy().to_string())
+}
+
 pub async fn download_model_weights(
     app_handle: &tauri::AppHandle,
     app_data_dir: &Path,
@@ -1010,6 +1140,9 @@ pub async fn download_model_weights(
 
     if engine == "parakeet" {
         return download_parakeet_weights(app_handle, &models_dir).await;
+    }
+    if engine == "parakeet_gguf" {
+        return download_parakeet_gguf(app_handle, &models_dir).await;
     }
 
     if engine == "faster_whisper" {
@@ -1125,6 +1258,13 @@ pub fn delete_model(
     model_size: &str,
 ) -> Result<(), String> {
     let models_dir = resolve_models_dir(app_data_dir, custom_dir);
+    if engine == "parakeet_gguf" {
+        let path = parakeet_gguf_path(&models_dir);
+        if path.is_file() {
+            fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
     if engine == "parakeet" {
         for name in ["parakeet-eou", "parakeet-tdt"] {
             let path = models_dir.join(name);
@@ -1253,6 +1393,26 @@ mod tests {
         assert!(get_ggml_download_url("medium").unwrap().contains("ggml-medium.bin"));
         assert!(get_ggml_download_url("turbo_q8").unwrap().contains("ggml-large-v3-turbo-q8_0.bin"));
         assert!(get_ggml_download_url("unknown").is_err());
+        assert_eq!(
+            hex_encode(&Sha256::digest(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(PARAKEET_GGUF_SHA256.len(), 64);
+        assert!(parakeet_gguf_path(Path::new("/models"))
+            .ends_with(PARAKEET_GGUF_NAME));
+    }
+
+    #[test]
+    fn test_parakeet_gguf_status_missing() {
+        let temp_dir = std::env::temp_dir().join(format!("lipi_gguf_status_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let status = check_model_status(&temp_dir, Some(temp_dir.to_str().unwrap()), "parakeet_gguf", "Q8_0").unwrap();
+        assert!(!status.installed);
+        assert!(status.binary_available);
+        assert_eq!(status.binary_path, "in-process");
+        assert!(status.file_path.ends_with(PARAKEET_GGUF_NAME));
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

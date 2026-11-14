@@ -232,7 +232,7 @@ pub fn transcribe_wav_bytes(app_data_dir: &Path, models_folder: Option<&str>, wa
     Ok(text)
 }
 
-fn wav_bytes_to_f32(bytes: &[u8]) -> Result<Vec<f32>, String> {
+pub(crate) fn wav_bytes_to_f32(bytes: &[u8]) -> Result<Vec<f32>, String> {
     let cursor = std::io::Cursor::new(bytes);
     let mut reader = hound::WavReader::new(cursor).map_err(|err| format!("Could not read WAV: {err}"))?;
     decode_wav(&mut reader)
